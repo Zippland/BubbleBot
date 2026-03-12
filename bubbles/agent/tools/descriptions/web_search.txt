@@ -1,0 +1,6 @@
+Search the web using Tavily Search API. Returns titles, URLs and snippets.
+
+Usage:
+- Provide a clear, specific query for best results
+- Returns up to 5 results by default
+- Results include title, URL, and a brief snippet of content

@@ -1,0 +1,7 @@
+Lists files and directories in a given path. Returns directory contents with file/folder indicators.
+
+**Path handling**:
+- `~` refers to session_dir (NOT the system $HOME)
+- Relative paths are resolved relative to session_dir
+- All paths must be within session_dir; listing directories outside will return an error
+- To list the session_dir itself, use `~` or `.`

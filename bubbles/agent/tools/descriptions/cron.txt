@@ -1,0 +1,13 @@
+Schedule reminders and recurring tasks.
+
+Actions:
+- add: Create a new scheduled job
+- list: List all scheduled jobs
+- remove: Remove a job by ID
+
+Schedule types:
+- every_seconds: Run every N seconds (e.g., every_seconds=3600 for hourly)
+- cron_expr: Cron expression (e.g., "0 9 * * 1-5" for weekdays at 9am)
+- at: One-time execution at ISO datetime (e.g., "2026-03-11T10:30:00")
+
+Use `tz` parameter with cron_expr to specify IANA timezone (e.g., "Asia/Shanghai").

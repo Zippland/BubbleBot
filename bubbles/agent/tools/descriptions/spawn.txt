@@ -1,0 +1,6 @@
+Spawn a subagent to handle a task in the background. Used for complex or time-consuming tasks that can run independently. The subagent will complete the task and report back when finished.
+
+Usage:
+- Provide a clear task description for the subagent
+- The subagent runs asynchronously and reports results when done
+- Use for tasks that don't require immediate response

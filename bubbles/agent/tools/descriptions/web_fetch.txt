@@ -1,0 +1,6 @@
+Fetch and extract readable content from a URL (HTML to markdown/text).
+
+Usage:
+- Supports multiple extract modes: markdown, text
+- Automatically follows redirects
+- Content is truncated if too large

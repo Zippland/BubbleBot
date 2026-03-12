@@ -1,0 +1,6 @@
+Send a message to a specific channel and chat. Defaults to replying to the current channel/chat from the runtime context. Can specify a different channel (telegram, feishu, wechat, discord, slack, etc.) and chat_id to send cross-channel messages.
+
+Usage:
+- Use this tool when you need to send a message to a specific destination
+- For simple replies, just respond normally without using this tool
+- Supports media attachments via the media parameter
