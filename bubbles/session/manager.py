@@ -134,6 +134,85 @@ class Session:
         self.messages = []
         self.updated_at = datetime.now()
 
+    # ---- Task 操作方法 (Claude Code style) ----
+
+    def _next_task_id(self) -> str:
+        """生成下一个任务 ID（包括已删除的，确保 ID 不复用）。"""
+        all_tasks = self.metadata.get("tasks", [])
+        if not all_tasks:
+            return "1"
+        max_id = max(int(t.get("id", 0)) for t in all_tasks)
+        return str(max_id + 1)
+
+    def get_tasks(self) -> list[dict[str, Any]]:
+        """获取所有任务（排除已删除的）。"""
+        tasks = self.metadata.get("tasks", [])
+        return [t for t in tasks if t.get("status") != "deleted"]
+
+    def get_task(self, task_id: str) -> dict[str, Any] | None:
+        """根据 ID 获取单个任务。"""
+        for t in self.get_tasks():
+            if t.get("id") == task_id:
+                return t
+        return None
+
+    def create_task(
+        self,
+        subject: str,
+        description: str,
+        active_form: str | None = None,
+    ) -> dict[str, Any]:
+        """创建新任务。"""
+        task = {
+            "id": self._next_task_id(),
+            "subject": subject,
+            "description": description,
+            "status": "pending",
+            "active_form": active_form or "",
+            "blocks": [],
+            "blocked_by": [],
+        }
+        tasks = self.metadata.get("tasks", [])
+        tasks.append(task)
+        self.metadata["tasks"] = tasks
+        self.updated_at = datetime.now()
+        return task
+
+    def update_task(
+        self,
+        task_id: str,
+        status: str | None = None,
+        subject: str | None = None,
+        description: str | None = None,
+        active_form: str | None = None,
+        add_blocks: list[str] | None = None,
+        add_blocked_by: list[str] | None = None,
+    ) -> dict[str, Any] | None:
+        """更新任务。"""
+        tasks = self.metadata.get("tasks", [])
+        for task in tasks:
+            if task.get("id") == task_id:
+                if status is not None:
+                    task["status"] = status
+                if subject is not None:
+                    task["subject"] = subject
+                if description is not None:
+                    task["description"] = description
+                if active_form is not None:
+                    task["active_form"] = active_form
+                if add_blocks:
+                    existing = set(task.get("blocks", []))
+                    existing.update(add_blocks)
+                    task["blocks"] = list(existing)
+                if add_blocked_by:
+                    existing = set(task.get("blocked_by", []))
+                    existing.update(add_blocked_by)
+                    task["blocked_by"] = list(existing)
+                self.metadata["tasks"] = tasks
+                self.updated_at = datetime.now()
+                return task
+        return None
+
 
 class SessionManager:
     """
