@@ -249,6 +249,17 @@ class LiteLLMProvider(LLMProvider):
                 content = msg.get("content")
                 if isinstance(content, list):
                     logger.info("Final message content is LIST with {} items", len(content))
+                    # Print each item's structure (truncate image data)
+                    for i, item in enumerate(content):
+                        if isinstance(item, dict):
+                            item_type = item.get("type")
+                            if item_type == "image_url":
+                                url = item.get("image_url", {}).get("url", "")
+                                logger.info("  [{}] type=image_url, url_len={}, starts_with={}",
+                                           i, len(url), url[:60] if url else "EMPTY")
+                            else:
+                                logger.info("  [{}] type={}, text_len={}", i, item_type,
+                                           len(item.get("text", "")))
                 else:
                     logger.info("Final message content is STRING: {}", type(content))
                 break

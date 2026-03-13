@@ -249,6 +249,8 @@ def gateway(
     from bubbles.cron.types import CronJob
     if verbose:
         logger.enable("bubbles")
+        import os
+        os.environ["LITELLM_LOG"] = "DEBUG"
     else:
         logger.disable("bubbles")
     
