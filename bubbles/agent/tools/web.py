@@ -151,7 +151,7 @@ class WebFetchTool(Tool):
                 r.raise_for_status()
             
             ctype = r.headers.get("content-type", "")
-            
+
             # JSON
             if "application/json" in ctype:
                 text, extractor = json.dumps(r.json(), indent=2, ensure_ascii=False), "json"

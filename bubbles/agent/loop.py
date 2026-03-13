@@ -20,6 +20,7 @@ from bubbles.agent.tools.message import MessageTool
 from bubbles.agent.tools.registry import ToolRegistry
 from bubbles.agent.tools.shell import ExecTool
 from bubbles.agent.tools.spawn import SpawnTool
+from bubbles.agent.tools.task import TaskListTool, TaskGetTool, TaskCreateTool, TaskUpdateTool
 from bubbles.agent.tools.web import WebFetchTool, WebSearchTool
 from bubbles.bus.events import InboundMessage, OutboundMessage
 from bubbles.bus.queue import MessageBus
@@ -132,6 +133,9 @@ class AgentLoop:
         self.tools.register(SpawnTool(manager=self.subagents))
         if self.cron_service:
             self.tools.register(CronTool(self.cron_service))
+        # Task tools: session is set dynamically via _set_tool_context()
+        for cls in (TaskListTool, TaskGetTool, TaskCreateTool, TaskUpdateTool):
+            self.tools.register(cls())
 
     def _get_context(self, session: Session) -> ContextBuilder:
         """Get ContextBuilder for a session (cached per session key)."""
@@ -239,7 +243,8 @@ class AgentLoop:
 
     def _set_tool_context(
         self, channel: str, chat_id: str, message_id: str | None = None,
-        session_dir: Path | None = None, session_key: str | None = None
+        session_dir: Path | None = None, session_key: str | None = None,
+        session: Session | None = None,
     ) -> None:
         """Update context for all tools that need routing info."""
         for name in ("message", "spawn", "cron"):
@@ -257,6 +262,13 @@ class AgentLoop:
             if tool := self.tools.get(tool_name):
                 if hasattr(tool, "set_session_dir"):
                     tool.set_session_dir(session_dir)
+
+        # Set session for task tools
+        if session:
+            for tool_name in ("task_list", "task_get", "task_create", "task_update"):
+                if tool := self.tools.get(tool_name):
+                    if hasattr(tool, "set_session"):
+                        tool.set_session(session)
 
     @staticmethod
     def _strip_think(text: str | None) -> str | None:
@@ -469,7 +481,7 @@ class AgentLoop:
             key = f"{channel}:{chat_id}"
             session = self.sessions.get_or_create(key)
             context = self._get_context(session)
-            self._set_tool_context(channel, chat_id, msg.metadata.get("message_id"), session.directory, key)
+            self._set_tool_context(channel, chat_id, msg.metadata.get("message_id"), session.directory, key, session)
             history = session.get_history(max_messages=self.memory_window)
             messages = context.build_messages(
                 history=history,
@@ -619,7 +631,7 @@ class AgentLoop:
         # Move media files to correct session directory if needed (handles session binding)
         media = self._relocate_media_to_session(msg.media, session) if msg.media else None
 
-        self._set_tool_context(msg.channel, msg.chat_id, msg.metadata.get("message_id"), session.directory, key)
+        self._set_tool_context(msg.channel, msg.chat_id, msg.metadata.get("message_id"), session.directory, key, session)
         if message_tool := self.tools.get("message"):
             if isinstance(message_tool, MessageTool):
                 message_tool.start_turn()
