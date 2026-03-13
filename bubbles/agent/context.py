@@ -80,7 +80,6 @@ All file operations are restricted to this session directory.
 
 Reply directly with text for conversations. Only use the 'message' tool to send to a specific channel.
 
-
 # INSTRUCTIONS
 
 # File Management
@@ -107,9 +106,6 @@ Write important facts immediately using `edit_file` or `write_file`:
 - Project context ("The API uses OAuth2")
 - Relationships ("Alice is the project lead")
 Keep it concise — only facts you'll need to recall later."""
-
-    # Channels that don't support markdown formatting
-    NO_MARKDOWN_CHANNELS = {"wechat", "qq", "mochat", "feishu"}
 
     @staticmethod
     def _inject_runtime_context(
@@ -183,14 +179,9 @@ Keep it concise — only facts you'll need to recall later."""
         # System prompt
         system_prompt = self.build_system_prompt(skill_names)
 
-        # Add session bindings info with markdown support indication
+        # Add session bindings info
         if session_bindings:
-            lines = []
-            for b in session_bindings:
-                ch = b.split(":")[0] if ":" in b else b
-                md_note = "(plain text only)" if ch in self.NO_MARKDOWN_CHANNELS else "(supports markdown)"
-                lines.append(f"- `{b}` {md_note}")
-            bindings_list = "\n".join(lines)
+            bindings_list = "\n".join(f"- {b}" for b in session_bindings)
             system_prompt += f"\n\n## Connected Channels\n\nThis session is connected to the following channels. You can send messages to any of them using the `message` tool:\n\n{bindings_list}"
 
         if system_prompt_extra:

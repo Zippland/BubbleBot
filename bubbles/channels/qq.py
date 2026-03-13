@@ -49,7 +49,6 @@ class QQChannel(BaseChannel):
     """QQ channel using botpy SDK with WebSocket connection."""
 
     name = "qq"
-    supports_markdown = False
 
     def __init__(self, config: QQConfig, bus: MessageBus, session_mode: str = "channel"):
         super().__init__(config, bus, session_mode)

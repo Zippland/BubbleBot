@@ -216,7 +216,6 @@ class MochatChannel(BaseChannel):
     """Mochat channel using socket.io with fallback polling workers."""
 
     name = "mochat"
-    supports_markdown = False
 
     def __init__(self, config: MochatConfig, bus: MessageBus, session_mode: str = "channel"):
         super().__init__(config, bus, session_mode)

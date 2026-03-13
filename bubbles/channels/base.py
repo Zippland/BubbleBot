@@ -21,7 +21,6 @@ class BaseChannel(ABC):
     """
 
     name: str = "base"
-    supports_markdown: bool = True  # Override to False for channels that don't support markdown
 
     def __init__(self, config: Any, bus: MessageBus, session_mode: str = "channel"):
         """
