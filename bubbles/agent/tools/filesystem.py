@@ -52,7 +52,9 @@ def _with_line_numbers(content: str, *, start_line: int = 1) -> str:
 
 
 class ReadFileTool(Tool):
-    """Tool to read file contents."""
+    """Tool to read file contents. Automatically handles images and text files."""
+
+    _IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".gif", ".bmp", ".webp", ".ico", ".tiff", ".tif"}
 
     def __init__(self):
         self._session_dir: Path | None = None
@@ -80,16 +82,19 @@ class ReadFileTool(Tool):
         return {
             "type": "object",
             "properties": {
-                "path": {"type": "string", "description": "The file path to read"},
-                "start_line": {"type": "integer", "description": "Start line number (1-based), inclusive"},
-                "end_line": {"type": "integer", "description": "End line number (1-based), inclusive"},
+                "path": {"type": "string", "description": "The file path to read (supports text files and images)"},
+                "start_line": {"type": "integer", "description": "Start line number (1-based), for text files only"},
+                "end_line": {"type": "integer", "description": "End line number (1-based), for text files only"},
             },
             "required": ["path"],
         }
 
     async def execute(
         self, path: str, start_line: int | None = None, end_line: int | None = None, **kwargs: Any
-    ) -> str:
+    ) -> str | list[dict[str, Any]]:
+        import base64
+        import mimetypes
+
         try:
             file_path = _resolve_path(path, self._base_dir, restrict_to_base=self._restrict)
             if not file_path.exists():
@@ -97,6 +102,21 @@ class ReadFileTool(Tool):
             if not file_path.is_file():
                 return f"Error: Not a file: {path}"
 
+            ext = file_path.suffix.lower()
+
+            # Handle image files - return as image_url for model to see
+            if ext in self._IMAGE_EXTENSIONS:
+                image_data = file_path.read_bytes()
+                b64 = base64.b64encode(image_data).decode()
+                mime, _ = mimetypes.guess_type(str(file_path))
+                if not mime:
+                    mime = "image/jpeg"
+                return [
+                    {"type": "image_url", "image_url": {"url": f"data:{mime};base64,{b64}"}},
+                    {"type": "text", "text": f"[Image: {path}]"},
+                ]
+
+            # Handle text files
             content = file_path.read_text(encoding="utf-8")
             lines = content.splitlines()
 
@@ -117,83 +137,6 @@ class ReadFileTool(Tool):
             return f"Error: {e}"
         except Exception as e:
             return f"Error reading file: {str(e)}"
-
-
-class ViewImageTool(Tool):
-    """Tool to view/analyze image files. Returns image content for model to see."""
-
-    _IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".gif", ".bmp", ".webp", ".ico", ".tiff", ".tif"}
-
-    def __init__(self):
-        self._session_dir: Path | None = None
-
-    def set_session_dir(self, session_dir: Path | None) -> None:
-        """Set session directory for file operations."""
-        self._session_dir = session_dir
-
-    @property
-    def _base_dir(self) -> Path | None:
-        """Get base directory (session dir)."""
-        return self._session_dir
-
-    @property
-    def _restrict(self) -> bool:
-        """Whether to restrict paths to session directory."""
-        return self._session_dir is not None
-
-    @property
-    def name(self) -> str:
-        return "view_image"
-
-    @property
-    def description(self) -> str:
-        return "View/analyze an image file. Use this to see images that were previously saved."
-
-    @property
-    def parameters(self) -> dict[str, Any]:
-        return {
-            "type": "object",
-            "properties": {
-                "path": {"type": "string", "description": "Path to the image file (e.g., data/image.jpg)"},
-            },
-            "required": ["path"],
-        }
-
-    async def execute(self, path: str, **kwargs: Any) -> str | list[dict[str, Any]]:
-        import base64
-        import mimetypes
-
-        try:
-            file_path = _resolve_path(path, self._base_dir, restrict_to_base=self._restrict)
-            if not file_path.exists():
-                return f"Error: Image not found: {path}"
-            if not file_path.is_file():
-                return f"Error: Not a file: {path}"
-
-            # Check if it's an image
-            ext = file_path.suffix.lower()
-            if ext not in self._IMAGE_EXTENSIONS:
-                return f"Error: Not an image file (unsupported extension: {ext})"
-
-            # Read and encode image
-            image_data = file_path.read_bytes()
-            b64 = base64.b64encode(image_data).decode()
-
-            # Get MIME type
-            mime, _ = mimetypes.guess_type(str(file_path))
-            if not mime:
-                mime = "image/jpeg"  # Default fallback
-
-            # Return as image_url content for model to see
-            return [
-                {"type": "image_url", "image_url": {"url": f"data:{mime};base64,{b64}"}},
-                {"type": "text", "text": f"[Image: {path}]"},
-            ]
-
-        except PermissionError as e:
-            return f"Error: {e}"
-        except Exception as e:
-            return f"Error viewing image: {str(e)}"
 
 
 class WriteFileTool(Tool):

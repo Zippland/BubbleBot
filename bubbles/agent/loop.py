@@ -15,7 +15,7 @@ from bubbles.agent.compaction import compact_session, CompactionResult, TokenTra
 from bubbles.agent.context import ContextBuilder
 from bubbles.agent.subagent import SubagentManager
 from bubbles.agent.tools.cron import CronTool
-from bubbles.agent.tools.filesystem import EditFileTool, ListDirTool, ReadFileTool, ViewImageTool, WriteFileTool
+from bubbles.agent.tools.filesystem import EditFileTool, ListDirTool, ReadFileTool, WriteFileTool
 from bubbles.agent.tools.message import MessageTool
 from bubbles.agent.tools.registry import ToolRegistry
 from bubbles.agent.tools.shell import ExecTool
@@ -119,7 +119,7 @@ class AgentLoop:
     def _register_default_tools(self) -> None:
         """Register the default set of tools."""
         # File tools: session_dir is set dynamically via set_session_dir()
-        for cls in (ReadFileTool, WriteFileTool, EditFileTool, ListDirTool, ViewImageTool):
+        for cls in (ReadFileTool, WriteFileTool, EditFileTool, ListDirTool):
             self.tools.register(cls())
         # Exec tool: working_dir is set per session via set_session_dir()
         self.tools.register(ExecTool(
