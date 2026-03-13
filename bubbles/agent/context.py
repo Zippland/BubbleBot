@@ -235,9 +235,13 @@ Keep it concise — only facts you'll need to recall later."""
     
     def add_tool_result(
         self, messages: list[dict[str, Any]],
-        tool_call_id: str, tool_name: str, result: str,
+        tool_call_id: str, tool_name: str, result: str | list[dict[str, Any]],
     ) -> list[dict[str, Any]]:
-        """Add a tool result to the message list."""
+        """Add a tool result to the message list.
+
+        Args:
+            result: Can be a string or a list containing text/image_url elements
+        """
         messages.append({"role": "tool", "tool_call_id": tool_call_id, "name": tool_name, "content": result})
         return messages
     

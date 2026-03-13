@@ -15,7 +15,7 @@ from bubbles.agent.compaction import compact_session, CompactionResult, TokenTra
 from bubbles.agent.context import ContextBuilder
 from bubbles.agent.subagent import SubagentManager
 from bubbles.agent.tools.cron import CronTool
-from bubbles.agent.tools.filesystem import EditFileTool, ListDirTool, ReadFileTool, WriteFileTool
+from bubbles.agent.tools.filesystem import EditFileTool, ListDirTool, ReadFileTool, ViewImageTool, WriteFileTool
 from bubbles.agent.tools.message import MessageTool
 from bubbles.agent.tools.registry import ToolRegistry
 from bubbles.agent.tools.shell import ExecTool
@@ -119,7 +119,7 @@ class AgentLoop:
     def _register_default_tools(self) -> None:
         """Register the default set of tools."""
         # File tools: session_dir is set dynamically via set_session_dir()
-        for cls in (ReadFileTool, WriteFileTool, EditFileTool, ListDirTool):
+        for cls in (ReadFileTool, WriteFileTool, EditFileTool, ListDirTool, ViewImageTool):
             self.tools.register(cls())
         # Exec tool: working_dir is set per session via set_session_dir()
         self.tools.register(ExecTool(
@@ -595,13 +595,20 @@ class AgentLoop:
 
         # If not responding, just save the message to history and return
         if not should_respond:
-            context = self._get_context(session)
+            # Move media files to session directory if present
+            media = self._relocate_media_to_session(msg.media, session) if msg.media else None
+
             # Save as a simple user message to session history
             from datetime import datetime
             sender_name = msg.metadata.get("sender_name") or msg.sender_id
+            content = f"[{sender_name}]: {msg.content}"
+            # Append media paths to content if present
+            if media:
+                media_desc = ", ".join(f"<work_dir>/data/{Path(p).name}" for p in media)
+                content = f"{content}\n[媒体文件: {media_desc}]"
             entry = {
                 "role": "user",
-                "content": f"[{sender_name}]: {msg.content}",
+                "content": content,
                 "timestamp": datetime.now().isoformat(),
             }
             session.messages.append(entry)
@@ -767,18 +774,28 @@ class AgentLoop:
         from datetime import datetime
         for m in messages[skip:]:
             entry = {k: v for k, v in m.items() if k != "reasoning_content"}
-            if entry.get("role") == "tool" and isinstance(entry.get("content"), str):
-                content = entry["content"]
-                if len(content) > self._TOOL_RESULT_MAX_CHARS:
-                    entry["content"] = content[:self._TOOL_RESULT_MAX_CHARS] + "\n... (truncated)"
+            if entry.get("role") == "tool":
+                content = entry.get("content")
+                if isinstance(content, str):
+                    if len(content) > self._TOOL_RESULT_MAX_CHARS:
+                        entry["content"] = content[:self._TOOL_RESULT_MAX_CHARS] + "\n... (truncated)"
+                elif isinstance(content, list):
+                    # Tool returned image content (e.g., view_image), strip base64
+                    text_parts = [c for c in content if c.get("type") == "text"]
+                    entry["content"] = text_parts[0].get("text", "[image viewed]") if text_parts else "[image viewed]"
             if entry.get("role") == "user" and isinstance(entry.get("content"), list):
-                entry["content"] = [
-                    {"type": "text", "text": "[image]"} if (
-                        c.get("type") == "image_url"
-                        and c.get("image_url", {}).get("url", "").startswith("data:image/")
-                    ) else c
-                    for c in entry["content"]
+                # Remove base64 images, keep text (which contains path descriptions)
+                text_parts = [
+                    c for c in entry["content"]
+                    if c.get("type") == "text"
                 ]
+                # Simplify to string if only text remains
+                if len(text_parts) == 1:
+                    entry["content"] = text_parts[0].get("text", "")
+                elif text_parts:
+                    entry["content"] = text_parts
+                else:
+                    entry["content"] = "[media]"
             entry.setdefault("timestamp", datetime.now().isoformat())
             session.messages.append(entry)
         session.updated_at = datetime.now()
