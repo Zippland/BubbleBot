@@ -242,6 +242,16 @@ class LiteLLMProvider(LLMProvider):
                     logger.debug("LLM user content: str, len={}", len(content) if content else 0)
                 break  # Only log the last (current) user message
 
+        # Debug: print last user message content structure
+        for msg in reversed(kwargs["messages"]):
+            if msg.get("role") == "user":
+                content = msg.get("content")
+                if isinstance(content, list):
+                    logger.info("Final message content is LIST with {} items", len(content))
+                else:
+                    logger.info("Final message content is STRING: {}", type(content))
+                break
+
         try:
             response = await acompletion(**kwargs)
             return self._parse_response(response)
