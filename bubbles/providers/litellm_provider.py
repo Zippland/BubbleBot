@@ -223,6 +223,7 @@ class LiteLLMProvider(LLMProvider):
 
         # Debug: log user message content structure for multimodal debugging
         from loguru import logger
+        logger.debug("LLM request: model={}, original={}", model, original_model)
         for msg in kwargs["messages"]:
             if msg.get("role") == "user":
                 content = msg.get("content")
