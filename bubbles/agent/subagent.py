@@ -192,7 +192,9 @@ class SubagentManager:
 
 ## Result:
 
-{result}"""
+{result}
+
+[The above content is invisible to your human and can only be conveyed by you]"""
 
         # Use session_key if available (respects session binding), otherwise fallback to origin
         target_key = session_key or f"{origin['channel']}:{origin['chat_id']}"
