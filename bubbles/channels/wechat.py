@@ -194,10 +194,12 @@ class WeChatChannel(BaseChannel):
 
         elif msg.type == MSG_TYPE_APP:
             # Handle app messages (files, links, quotes, etc.)
-            text, media_paths = await self._process_app_msg(msg, chat_id, is_group)
-            # For quoted messages in groups, check if user @mentioned
-            if is_group and text:
-                if self._is_at_in_text(text):
+            text, media_paths, is_reply_to_me = await self._process_app_msg(msg, chat_id)
+            # For quoted messages in groups, check if replying to bot or @mentioned
+            if is_group:
+                if is_reply_to_me:
+                    is_at_me = True
+                elif text and self._is_at_in_text(text):
                     is_at_me = True
                     text = self._strip_at_mention(text)
 
@@ -306,21 +308,19 @@ class WeChatChannel(BaseChannel):
         self,
         msg: WxMsg,
         chat_id: str,
-        is_group: bool,
-    ) -> tuple[str, list[str]]:
+    ) -> tuple[str, list[str], bool]:
         """
         Process APP type messages (type=49): files, links, quotes, etc.
 
         Returns:
-            (text, media_paths)
+            (text, media_paths, is_reply_to_me)
         """
         content = msg.content
-        media_paths: list[str] = []
 
         # Detect appmsg type
         appmsg_type_match = re.search(r'<type>(\d+)</type>', content)
         if not appmsg_type_match:
-            return "", []
+            return "", [], False
 
         appmsg_type = appmsg_type_match.group(1)
 
@@ -334,7 +334,7 @@ class WeChatChannel(BaseChannel):
             filename = title_match.group(1) if title_match else "file"
             # Note: File download requires additional handling via download_attach
             # For now, just indicate file was received
-            return f"[文件: {filename}]", []
+            return f"[文件: {filename}]", [], False
 
         # Type 5: Link
         if appmsg_type == "5":
@@ -343,40 +343,41 @@ class WeChatChannel(BaseChannel):
             title = html.unescape(title_match.group(1)) if title_match else ""
             url = html.unescape(url_match.group(1)) if url_match else ""
             if title and url:
-                return f"[链接: {title}]\n{url}", []
+                return f"[链接: {title}]\n{url}", [], False
             elif title:
-                return f"[链接: {title}]", []
-            return "[链接]", []
+                return f"[链接: {title}]", [], False
+            return "[链接]", [], False
 
         # Type 33/36: Mini Program
         if appmsg_type in ("33", "36"):
             title_match = re.search(r'<title>(.*?)</title>', content)
             title = html.unescape(title_match.group(1)) if title_match else "小程序"
-            return f"[小程序: {title}]", []
+            return f"[小程序: {title}]", [], False
 
         # Type 19: Chat record forward
         if appmsg_type == "19":
             title_match = re.search(r'<title>(.*?)</title>', content)
             title = html.unescape(title_match.group(1)) if title_match else "聊天记录"
-            return f"[聊天记录: {title}]", []
+            return f"[聊天记录: {title}]", [], False
 
         # Other types: try to extract title
         title_match = re.search(r'<title>(.*?)</title>', content)
         if title_match:
             title = html.unescape(title_match.group(1))
-            return f"[消息: {title}]", []
+            return f"[消息: {title}]", [], False
 
-        return "[未知消息类型]", []
+        return "[未知消息类型]", [], False
 
-    async def _parse_quote_msg(self, content: str, chat_id: str) -> tuple[str, list[str]]:
+    async def _parse_quote_msg(self, content: str, chat_id: str) -> tuple[str, list[str], bool]:
         """
         Parse quoted/reply message (appmsg type=57).
 
         Returns:
-            (text, media_paths)
+            (text, media_paths, is_reply_to_me)
         """
         result_parts = []
         media_paths: list[str] = []
+        is_reply_to_me = False
 
         # Extract user's new message from <title>
         title_match = re.search(r'<title>(.*?)</title>', content)
@@ -390,7 +391,15 @@ class WeChatChannel(BaseChannel):
         if refermsg_match:
             refermsg = refermsg_match.group(1)
 
-            # Get quoted sender
+            # Get quoted sender wxid (chatusr field)
+            chatusr_match = re.search(r'<chatusr>(.*?)</chatusr>', refermsg)
+            quoted_wxid = chatusr_match.group(1) if chatusr_match else ""
+
+            # Check if replying to bot's message
+            if quoted_wxid and quoted_wxid == self.wxid:
+                is_reply_to_me = True
+
+            # Get quoted sender display name
             displayname_match = re.search(r'<displayname>(.*?)</displayname>', refermsg)
             quoted_sender = html.unescape(displayname_match.group(1)) if displayname_match else ""
 
@@ -438,7 +447,7 @@ class WeChatChannel(BaseChannel):
             elif quoted_text:
                 result_parts.append(f"[引用: {quoted_text}]")
 
-        return "\n".join(result_parts), media_paths
+        return "\n".join(result_parts), media_paths, is_reply_to_me
 
     async def _download_quoted_image(
         self, msg_id: str | None, content_xml: str, chat_id: str
