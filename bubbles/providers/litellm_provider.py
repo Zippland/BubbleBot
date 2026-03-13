@@ -154,13 +154,18 @@ class LiteLLMProvider(LLMProvider):
 
     @staticmethod
     def _sanitize_messages(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
-        """Strip non-standard keys and ensure assistant messages have a content key."""
+        """Strip non-standard keys and ensure assistant messages have required fields."""
         sanitized = []
         for msg in messages:
             clean = {k: v for k, v in msg.items() if k in _ALLOWED_MSG_KEYS}
-            # Strict providers require "content" even when assistant only has tool_calls
-            if clean.get("role") == "assistant" and "content" not in clean:
-                clean["content"] = None
+            if clean.get("role") == "assistant":
+                # Strict providers require "content" even when assistant only has tool_calls
+                if "content" not in clean:
+                    clean["content"] = None
+                # Moonshot Kimi requires reasoning_content for assistant messages with tool_calls
+                # when thinking mode is enabled. Provide empty string if missing.
+                if clean.get("tool_calls") and "reasoning_content" not in clean:
+                    clean["reasoning_content"] = ""
             sanitized.append(clean)
         return sanitized
 
