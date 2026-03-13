@@ -313,17 +313,17 @@ class WeChatChannel(BaseChannel):
         Search for a file in WeChat's FileStorage directory.
 
         WeChat stores auto-downloaded files at:
-        {home}/FileStorage/File/{year-month}/{filename}
+        {home}/{wxid}/FileStorage/File/{year-month}/{filename}
 
         Returns the full path if found, None otherwise.
         """
         from datetime import datetime
         from pathlib import Path
 
-        if not self._wechat_home:
+        if not self._wechat_home or not self.wxid:
             return None
 
-        base_path = Path(self._wechat_home) / "FileStorage" / "File"
+        base_path = Path(self._wechat_home) / self.wxid / "FileStorage" / "File"
         if not base_path.exists():
             return None
 
@@ -461,8 +461,8 @@ class WeChatChannel(BaseChannel):
 
             # For large files (PDF, xlsx), they need manual accept in WeChat
             # Return a message indicating this
-            logger.info("File '{}' not found in WeChat storage: {}/FileStorage/File/",
-                       filename, self._wechat_home)
+            logger.info("File '{}' not found in WeChat storage: {}/{}/FileStorage/File/",
+                       filename, self._wechat_home, self.wxid)
             return None, f"[文件: {filename}] (请在微信中点击接收后重新发送)"
 
         except Exception as e:
