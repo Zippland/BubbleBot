@@ -186,12 +186,13 @@ class SubagentManager:
 
         announce_content = f"""[Subagent '{label}' {status_text}]
 
-Task: {task}
+## Task: 
 
-Result:
-{result}
+{task}
 
-Summarize this naturally for the user. Keep it brief (1-2 sentences). Do not mention technical details like "subagent" or task IDs."""
+## Result:
+
+{result}"""
 
         # Use session_key if available (respects session binding), otherwise fallback to origin
         target_key = session_key or f"{origin['channel']}:{origin['chat_id']}"
