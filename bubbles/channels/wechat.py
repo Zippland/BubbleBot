@@ -326,7 +326,7 @@ class WeChatChannel(BaseChannel):
 
         # Type 57: Quote/Reply message
         if appmsg_type == "57":
-            return self._parse_quote_msg(content)
+            return await self._parse_quote_msg(content, chat_id)
 
         # Type 6: File
         if appmsg_type == "6":
@@ -368,7 +368,7 @@ class WeChatChannel(BaseChannel):
 
         return "[未知消息类型]", []
 
-    def _parse_quote_msg(self, content: str) -> tuple[str, list[str]]:
+    async def _parse_quote_msg(self, content: str, chat_id: str) -> tuple[str, list[str]]:
         """
         Parse quoted/reply message (appmsg type=57).
 
@@ -376,6 +376,7 @@ class WeChatChannel(BaseChannel):
             (text, media_paths)
         """
         result_parts = []
+        media_paths: list[str] = []
 
         # Extract user's new message from <title>
         title_match = re.search(r'<title>(.*?)</title>', content)
@@ -397,41 +398,92 @@ class WeChatChannel(BaseChannel):
             type_match = re.search(r'<type>(\d+)</type>', refermsg)
             quoted_type = type_match.group(1) if type_match else "1"
 
+            # Get quoted message ID (svrid)
+            svrid_match = re.search(r'<svrid>(\d+)</svrid>', refermsg)
+            quoted_msg_id = svrid_match.group(1) if svrid_match else None
+
             # Get quoted content
             content_match = re.search(r'<content>(.*?)</content>', refermsg, re.DOTALL)
-            if content_match:
-                quoted_raw = content_match.group(1)
-                # Decode HTML entities (content may be double-encoded)
-                quoted_decoded = html.unescape(quoted_raw)
+            quoted_raw = content_match.group(1) if content_match else ""
+            quoted_decoded = html.unescape(quoted_raw)
 
-                # Type 3 = image
-                if quoted_type == "3":
-                    quoted_text = "[图片]"
-                # Type 34 = voice
-                elif quoted_type == "34":
-                    quoted_text = "[语音]"
-                # Type 43 = video
-                elif quoted_type == "43":
-                    quoted_text = "[视频]"
-                # Type 49 = app message (file, link, etc.)
-                elif quoted_type == "49":
-                    # Try to extract title from the quoted app message
-                    inner_title = re.search(r'<title>(.*?)</title>', quoted_decoded)
-                    if inner_title:
-                        quoted_text = f"[{html.unescape(inner_title.group(1))}]"
-                    else:
-                        quoted_text = "[消息]"
+            # Type 3 = image - try to download
+            if quoted_type == "3":
+                file_path, quoted_text = await self._download_quoted_image(
+                    quoted_msg_id, quoted_decoded, chat_id
+                )
+                if file_path:
+                    media_paths.append(file_path)
+            # Type 34 = voice
+            elif quoted_type == "34":
+                quoted_text = "[语音]"
+            # Type 43 = video
+            elif quoted_type == "43":
+                quoted_text = "[视频]"
+            # Type 49 = app message (file, link, etc.)
+            elif quoted_type == "49":
+                # Try to extract title from the quoted app message
+                inner_title = re.search(r'<title>(.*?)</title>', quoted_decoded)
+                if inner_title:
+                    quoted_text = f"[{html.unescape(inner_title.group(1))}]"
                 else:
-                    # Text or other
-                    quoted_text = re.sub(r'<.*?>', '', quoted_decoded).strip()
-                    quoted_text = re.sub(r'\s+', ' ', quoted_text)
+                    quoted_text = "[消息]"
+            else:
+                # Text or other
+                quoted_text = re.sub(r'<.*?>', '', quoted_decoded).strip()
+                quoted_text = re.sub(r'\s+', ' ', quoted_text)
 
-                if quoted_sender and quoted_text:
-                    result_parts.append(f"[引用 {quoted_sender}: {quoted_text}]")
-                elif quoted_text:
-                    result_parts.append(f"[引用: {quoted_text}]")
+            if quoted_sender and quoted_text:
+                result_parts.append(f"[引用 {quoted_sender}: {quoted_text}]")
+            elif quoted_text:
+                result_parts.append(f"[引用: {quoted_text}]")
 
-        return "\n".join(result_parts), []
+        return "\n".join(result_parts), media_paths
+
+    async def _download_quoted_image(
+        self, msg_id: str | None, content_xml: str, chat_id: str
+    ) -> tuple[str | None, str]:
+        """
+        Download a quoted image message.
+
+        Args:
+            msg_id: The svrid of the quoted message
+            content_xml: The decoded content XML of the quoted image
+            chat_id: Chat ID for session binding
+
+        Returns:
+            (file_path, content_text)
+        """
+        if not msg_id or not self.wcf:
+            return None, "[图片]"
+
+        # Check session binding
+        media_dir = self._get_media_dir(chat_id)
+        if media_dir is None:
+            return None, "[图片: 请先使用 /session <name> 绑定工作区]"
+
+        # Extract image extra path from content XML
+        # Format: <img ... cdnbigimgurl="..." />
+        extra_match = re.search(r'cdnbigimgurl="([^"]+)"', content_xml)
+        if not extra_match:
+            # Try alternative format
+            extra_match = re.search(r'cdnmidimgurl="([^"]+)"', content_xml)
+        extra = extra_match.group(1) if extra_match else ""
+
+        try:
+            loop = asyncio.get_running_loop()
+            file_path = await loop.run_in_executor(
+                None,
+                lambda: self.wcf.download_image(int(msg_id), extra, str(media_dir), timeout=30)
+            )
+            if file_path and os.path.exists(file_path):
+                filename = os.path.basename(file_path)
+                logger.debug("Downloaded quoted image to {}", file_path)
+                return file_path, f"[图片: <work_dir>/data/{filename}]"
+        except Exception as e:
+            logger.warning("Failed to download quoted image {}: {}", msg_id, e)
+
+        return None, "[图片]"
 
     _IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".gif", ".bmp", ".webp"}
 
