@@ -449,26 +449,28 @@ def agent(
             return
         if ch and not tool_hint and not ch.send_progress:
             return
-        console.print(f"  [dim]↳ {content}[/dim]")
+        from prompt_toolkit import print_formatted_text
+        print_formatted_text(f"  ↳ {content}")
 
     async def _debug_tool_call(name: str, args: dict, result: str | None) -> None:
         """Debug callback for tool calls."""
         import json
+        from prompt_toolkit import print_formatted_text
         if result is None:
             # Tool call start
             args_str = json.dumps(args, ensure_ascii=False, indent=2)
-            console.print(f"\n[bold cyan]┌─ {name}[/bold cyan]")
+            print_formatted_text(f"\n┌─ {name}")
             for line in args_str.split("\n"):
-                console.print(f"[cyan]│[/cyan] {line}")
+                print_formatted_text(f"│ {line}")
         else:
             # Tool call result
             result_preview = result[:500] + "..." if len(result) > 500 else result
-            console.print(f"[cyan]├─ Result:[/cyan]")
+            print_formatted_text("├─ Result:")
             for line in result_preview.split("\n")[:20]:
-                console.print(f"[cyan]│[/cyan] [dim]{line}[/dim]")
+                print_formatted_text(f"│ {line}")
             if len(result) > 500 or result.count("\n") > 20:
-                console.print(f"[cyan]│[/cyan] [dim]... ({len(result)} chars total)[/dim]")
-            console.print(f"[cyan]└─[/cyan]")
+                print_formatted_text(f"│ ... ({len(result)} chars total)")
+            print_formatted_text("└─")
 
     if message:
         # Single message mode — direct call, no bus needed
@@ -542,14 +544,18 @@ def agent(
                             elif ch and not is_tool_hint and not ch.send_progress:
                                 pass
                             else:
-                                console.print(f"  [dim]↳ {msg.content}[/dim]")
+                                # Use print_formatted_text for async output (compatible with prompt_toolkit)
+                                from prompt_toolkit import print_formatted_text
+                                from prompt_toolkit.formatted_text import HTML
+                                print_formatted_text(HTML(f"  <style fg='gray'>↳ {msg.content}</style>"))
                         elif not turn_done.is_set():
                             if msg.content:
                                 turn_response.append(msg.content)
                             turn_done.set()
                         elif msg.content:
-                            console.print()
-                            _print_agent_response(msg.content, render_markdown=markdown)
+                            # Async notification (e.g., subagent done) - use plain text
+                            from prompt_toolkit import print_formatted_text
+                            print_formatted_text(f"\n{__logo__} bubbles\n{msg.content}\n")
                     except asyncio.TimeoutError:
                         continue
                     except asyncio.CancelledError:
