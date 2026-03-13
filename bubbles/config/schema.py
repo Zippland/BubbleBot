@@ -217,7 +217,7 @@ class AgentDefaults(Base):
     model: str = "anthropic/claude-opus-4-5"
     provider: str = "auto"  # Provider name (e.g. "anthropic", "openrouter") or "auto" for auto-detection
     max_tokens: int = 8192
-    context_limit: int = 200000  # Model context window (e.g. 200K for Claude, 128K for GPT-4)
+    context_limit: int = 128000  # Model context window size
     temperature: float = 1.0
     max_tool_iterations: int = 40
     memory_window: int = 100
