@@ -56,7 +56,7 @@ class SubagentManager:
         origin = {"channel": origin_channel, "chat_id": origin_chat_id}
 
         bg_task = asyncio.create_task(
-            self._run_subagent(task_id, task, display_label, origin, session_dir)
+            self._run_subagent(task_id, task, display_label, origin, session_dir, session_key)
         )
         self._running_tasks[task_id] = bg_task
         if session_key:
@@ -81,6 +81,7 @@ class SubagentManager:
         label: str,
         origin: dict[str, str],
         session_dir: Path | None = None,
+        session_key: str | None = None,
     ) -> None:
         """Execute the subagent task and announce the result."""
         logger.info("Subagent [{}] starting task: {}", task_id, label)
@@ -163,12 +164,12 @@ class SubagentManager:
                 final_result = "Task completed but no final response was generated."
             
             logger.info("Subagent [{}] completed successfully", task_id)
-            await self._announce_result(task_id, label, task, final_result, origin, "ok")
-            
+            await self._announce_result(task_id, label, task, final_result, origin, session_key, "ok")
+
         except Exception as e:
             error_msg = f"Error: {str(e)}"
             logger.error("Subagent [{}] failed: {}", task_id, e)
-            await self._announce_result(task_id, label, task, error_msg, origin, "error")
+            await self._announce_result(task_id, label, task, error_msg, origin, session_key, "error")
     
     async def _announce_result(
         self,
@@ -177,11 +178,12 @@ class SubagentManager:
         task: str,
         result: str,
         origin: dict[str, str],
+        session_key: str | None,
         status: str,
     ) -> None:
         """Announce the subagent result to the main agent via the message bus."""
         status_text = "completed successfully" if status == "ok" else "failed"
-        
+
         announce_content = f"""[Subagent '{label}' {status_text}]
 
 Task: {task}
@@ -190,17 +192,20 @@ Result:
 {result}
 
 Summarize this naturally for the user. Keep it brief (1-2 sentences). Do not mention technical details like "subagent" or task IDs."""
-        
+
+        # Use session_key if available (respects session binding), otherwise fallback to origin
+        target_key = session_key or f"{origin['channel']}:{origin['chat_id']}"
+
         # Inject as system message to trigger main agent
         msg = InboundMessage(
             channel="system",
             sender_id="subagent",
-            chat_id=f"{origin['channel']}:{origin['chat_id']}",
+            chat_id=target_key,
             content=announce_content,
         )
-        
+
         await self.bus.publish_inbound(msg)
-        logger.debug("Subagent [{}] announced result to {}:{}", task_id, origin['channel'], origin['chat_id'])
+        logger.debug("Subagent [{}] announced result to {}", task_id, target_key)
     
     def _build_subagent_prompt(self, task: str, session_dir: Path | None = None) -> str:
         """Build a focused system prompt for the subagent."""
