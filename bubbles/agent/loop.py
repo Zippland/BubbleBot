@@ -482,7 +482,15 @@ class AgentLoop:
             else:
                 # Direct session key (from subagent with session binding)
                 key = msg.chat_id
-                channel, chat_id = "system", key
+                # Find the original channel:chat_id that bound to this session
+                bindings = self._get_bindings_for_session(key)
+                if bindings:
+                    # Use the first binding as reply target
+                    channel, chat_id = bindings[0].split(":", 1)
+                else:
+                    # No binding found, cannot reply
+                    logger.warning("No binding found for session {}, cannot route reply", key)
+                    return None
             logger.info("Processing system message from {} to session {}", msg.sender_id, key)
             session = self.sessions.get_or_create(key)
             context = self._get_context(session)
