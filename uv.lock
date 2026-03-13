@@ -271,7 +271,7 @@ requires-dist = [
     { name = "httpx", specifier = ">=0.28.0,<1.0.0" },
     { name = "json-repair", specifier = ">=0.57.0,<1.0.0" },
     { name = "lark-oapi", specifier = ">=1.5.0,<2.0.0" },
-    { name = "litellm", specifier = ">=1.81.5,<2.0.0" },
+    { name = "litellm", specifier = ">=1.82.1,<2.0.0" },
     { name = "loguru", specifier = ">=0.7.3,<1.0.0" },
     { name = "matrix-nio", extras = ["e2e"], marker = "extra == 'matrix'", specifier = ">=0.25.2" },
     { name = "mcp", specifier = ">=1.26.0,<2.0.0" },
