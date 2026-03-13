@@ -457,7 +457,7 @@ class WeChatChannel(BaseChannel):
 
         Args:
             msg_id: The svrid of the quoted message
-            content_xml: The decoded content XML of the quoted image
+            content_xml: The decoded content XML of the quoted image (raw_content)
             chat_id: Chat ID for session binding
 
         Returns:
@@ -471,13 +471,10 @@ class WeChatChannel(BaseChannel):
         if media_dir is None:
             return None, "[图片: 请先使用 /session <name> 绑定工作区]"
 
-        # Extract image extra path from content XML
-        # Format: <img ... cdnbigimgurl="..." />
-        extra_match = re.search(r'cdnbigimgurl="([^"]+)"', content_xml)
-        if not extra_match:
-            # Try alternative format
-            extra_match = re.search(r'cdnmidimgurl="([^"]+)"', content_xml)
-        extra = extra_match.group(1) if extra_match else ""
+        # Use the decoded content XML directly as extra parameter
+        # wcferry's download_attach can parse this XML to get the image
+        extra = content_xml
+        logger.debug("Attempting to download quoted image: msg_id={}, extra_len={}", msg_id, len(extra))
 
         try:
             loop = asyncio.get_running_loop()
@@ -489,6 +486,8 @@ class WeChatChannel(BaseChannel):
                 filename = os.path.basename(file_path)
                 logger.debug("Downloaded quoted image to {}", file_path)
                 return file_path, f"[图片: <work_dir>/data/{filename}]"
+            else:
+                logger.warning("download_image returned empty or non-existent path for msg_id={}", msg_id)
         except Exception as e:
             logger.warning("Failed to download quoted image {}: {}", msg_id, e)
 
