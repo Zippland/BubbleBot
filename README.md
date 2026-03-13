@@ -1,12 +1,12 @@
 <div align="center">
-  <h1>Bubbles: Personal AI Assistant</h1>
+  <h1>🫧 Bubbles</h1>
   <p>
     <img src="https://img.shields.io/badge/python-≥3.11-blue" alt="Python">
     <img src="https://img.shields.io/badge/license-MIT-green" alt="License">
   </p>
 </div>
 
-🫧 **Bubbles** is a lightweight personal AI assistant framework.
+🫧 **Bubbles** is a lightweight personal AI assistant.
 
 > ✉️ 致来访者
 >
@@ -172,7 +172,7 @@ bubbles/
 
 ## Acknowledgments
 
-This project is built upon [nanobot](https://github.com/HKUDS/nanobot), an ultra-lightweight personal AI assistant. Thanks to the nanobot team for the solid foundation.
+Thanks to the [nanobot](https://github.com/HKUDS/nanobot) team for the solid foundation.
 
 ## License
 
