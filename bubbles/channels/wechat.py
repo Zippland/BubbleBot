@@ -56,6 +56,7 @@ class WeChatChannel(BaseChannel):
         self.config: WeChatConfig = config
         self.wcf: Wcf | None = None
         self.wxid: str = ""
+        self._wechat_home: str = ""  # WeChat file storage base directory
         self._recv_thread: Thread | None = None
         self._loop: asyncio.AbstractEventLoop | None = None
         self._contacts: dict[str, str] = {}  # wxid -> nickname cache
@@ -72,7 +73,10 @@ class WeChatChannel(BaseChannel):
         try:
             self.wcf = Wcf()
             self.wxid = self.wcf.get_self_wxid()
-            logger.info("WeChat connected as {}", self.wxid)
+            # Get user info including home directory for file downloads
+            user_info = self.wcf.get_user_info()
+            self._wechat_home = user_info.get("home", "")
+            logger.info("WeChat connected as {} (home: {})", self.wxid, self._wechat_home)
             # Load all contacts
             self._load_contacts()
         except Exception as e:
@@ -304,6 +308,45 @@ class WeChatChannel(BaseChannel):
 
         return None, f"[{media_type}: download failed]"
 
+    def _find_file_in_wechat_storage(self, filename: str) -> str | None:
+        """
+        Search for a file in WeChat's FileStorage directory.
+
+        WeChat stores auto-downloaded files at:
+        {home}/FileStorage/File/{year-month}/{filename}
+
+        Returns the full path if found, None otherwise.
+        """
+        from datetime import datetime
+        from pathlib import Path
+
+        if not self._wechat_home:
+            return None
+
+        base_path = Path(self._wechat_home) / "FileStorage" / "File"
+        if not base_path.exists():
+            return None
+
+        # Current month directory (most likely location)
+        current_month = datetime.now().strftime("%Y-%m")
+        current_dir = base_path / current_month
+        if current_dir.exists():
+            file_path = current_dir / filename
+            if file_path.exists():
+                return str(file_path)
+
+        # Search in all month directories (descending order, recent first)
+        try:
+            for month_dir in sorted(base_path.iterdir(), reverse=True):
+                if month_dir.is_dir():
+                    file_path = month_dir / filename
+                    if file_path.exists():
+                        return str(file_path)
+        except Exception as e:
+            logger.debug("Error searching WeChat storage: {}", e)
+
+        return None
+
     async def _download_file(
         self,
         msg: WxMsg,
@@ -336,8 +379,24 @@ class WeChatChannel(BaseChannel):
         extra = msg.extra or ""
         thumb = msg.thumb or ""
 
-        logger.debug("Attempting to download file '{}': id={}, thumb='{}', extra='{}'",
-                     filename, msg.id, thumb[:80], extra[:80])
+        # Log full message info for debugging
+        logger.debug("File message details: id={}, thumb='{}', extra='{}', xml_len={}, content_len={}",
+                     msg.id, thumb[:80], extra[:80], len(msg.xml or ""), len(msg.content or ""))
+
+        # For file messages, try to extract attach info from XML content
+        # File XML format: <appattach><totallen>...</totallen><attachid>...</attachid>...</appattach>
+        if not extra and msg.content:
+            # Try to find file path in content XML
+            attachid_match = re.search(r'<attachid>(.*?)</attachid>', msg.content)
+            cdnurl_match = re.search(r'<cdnattachurl>(.*?)</cdnattachurl>', msg.content)
+            if attachid_match:
+                logger.debug("Found attachid in XML: {}", attachid_match.group(1)[:50])
+            if cdnurl_match:
+                logger.debug("Found cdnattachurl in XML: {}", cdnurl_match.group(1)[:80])
+            # Use content XML as extra for download_attach
+            extra = msg.content
+
+        logger.debug("Attempting to download file '{}': id={}", filename, msg.id)
 
         # If extra already points to an existing file, use it directly
         if extra and os.path.exists(extra):
@@ -346,8 +405,21 @@ class WeChatChannel(BaseChannel):
             logger.debug("File already exists, copied to {}", dest_path)
             return str(dest_path), f"[文件: <work_dir>/data/{filename}]"
 
+        # For auto-downloaded files (like PDF/xlsx with auto-download enabled),
+        # check WeChat's FileStorage directory
+        wechat_file = self._find_file_in_wechat_storage(filename)
+        if wechat_file:
+            dest_path = media_dir / filename
+            shutil.copy2(wechat_file, dest_path)
+            logger.debug("Found file in WeChat storage, copied to {}", dest_path)
+            return str(dest_path), f"[文件: <work_dir>/data/{filename}]"
+
         try:
             loop = asyncio.get_running_loop()
+
+            # For PDF/xlsx etc., WeChat needs the user to "accept" the file first
+            # msg.extra will be empty until the file is accepted in WeChat client
+            original_extra = msg.extra or ""
 
             # Trigger the download
             ret = await loop.run_in_executor(
@@ -356,22 +428,42 @@ class WeChatChannel(BaseChannel):
             )
 
             if ret != 0:
-                logger.warning("download_attach returned {}", ret)
-                # Continue anyway, file might still download
+                logger.warning("download_attach returned {} (file may need manual accept in WeChat)", ret)
 
             # Wait for file to be available
-            await asyncio.sleep(1)  # Initial wait for data to be indexed
+            await asyncio.sleep(2)  # Wait for download to complete
 
-            for _ in range(timeout):
-                if extra and os.path.exists(extra):
-                    dest_path = media_dir / filename
-                    shutil.copy2(extra, dest_path)
-                    logger.debug("Downloaded file to {}", dest_path)
-                    return str(dest_path), f"[文件: <work_dir>/data/{filename}]"
-                await asyncio.sleep(1)
+            # Check WeChat storage again after triggering download
+            wechat_file = self._find_file_in_wechat_storage(filename)
+            if wechat_file:
+                dest_path = media_dir / filename
+                shutil.copy2(wechat_file, dest_path)
+                logger.debug("Found file in WeChat storage after download, copied to {}", dest_path)
+                return str(dest_path), f"[文件: <work_dir>/data/{filename}]"
 
-            logger.warning("File download timeout. extra='{}' does not exist", extra)
-            return None, f"[文件: {filename}] (下载超时)"
+            # Check if original extra path exists (for small files that auto-download)
+            if original_extra:
+                for _ in range(timeout):
+                    if os.path.exists(original_extra):
+                        dest_path = media_dir / filename
+                        shutil.copy2(original_extra, dest_path)
+                        logger.debug("Downloaded file to {}", dest_path)
+                        return str(dest_path), f"[文件: <work_dir>/data/{filename}]"
+                    await asyncio.sleep(1)
+
+            # Final check in WeChat storage
+            wechat_file = self._find_file_in_wechat_storage(filename)
+            if wechat_file:
+                dest_path = media_dir / filename
+                shutil.copy2(wechat_file, dest_path)
+                logger.debug("Found file in WeChat storage (final check), copied to {}", dest_path)
+                return str(dest_path), f"[文件: <work_dir>/data/{filename}]"
+
+            # For large files (PDF, xlsx), they need manual accept in WeChat
+            # Return a message indicating this
+            logger.info("File '{}' not found in WeChat storage: {}/FileStorage/File/",
+                       filename, self._wechat_home)
+            return None, f"[文件: {filename}] (请在微信中点击接收后重新发送)"
 
         except Exception as e:
             logger.error("Error downloading file '{}': {}", filename, e)
