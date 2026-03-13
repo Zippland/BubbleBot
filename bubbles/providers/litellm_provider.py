@@ -50,8 +50,9 @@ class LiteLLMProvider(LLMProvider):
         if api_base:
             litellm.api_base = api_base
         
-        # Disable LiteLLM logging noise
-        litellm.suppress_debug_info = True
+        # Enable LiteLLM debug for troubleshooting
+        # litellm.suppress_debug_info = True
+        litellm.set_verbose = True
         # Drop unsupported parameters for providers (e.g., gpt-5 rejects some params)
         litellm.drop_params = True
     
