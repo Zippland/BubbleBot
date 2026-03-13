@@ -52,9 +52,9 @@ class AgentLoop:
         model: str | None = None,
         max_iterations: int = 40,
         temperature: float = 0.1,
-        max_tokens: int = 4096,
-        memory_window: int = 100,
-        context_limit: int = 128000,  # Model context window size
+        max_tokens: int,
+        memory_window: int,
+        context_limit: int,
         tavily_api_key: str | None = None,
         exec_config: ExecToolConfig | None = None,
         cron_service: CronService | None = None,
