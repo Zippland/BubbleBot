@@ -336,11 +336,16 @@ class WeChatChannel(BaseChannel):
         extra = msg.extra or ""
         thumb = msg.thumb or ""
 
-        logger.debug("Attempting to download file '{}': id={}, thumb='{}', extra='{}'",
-                     filename, msg.id, thumb[:80], extra[:80])
+        # For file messages (appmsg type=6), extra might be empty
+        # Use msg.content (XML) as extra, similar to quoted image handling
+        if not extra and msg.content:
+            extra = msg.content
+
+        logger.debug("Attempting to download file '{}': id={}, extra_len={}",
+                     filename, msg.id, len(extra))
 
         # If extra already points to an existing file, use it directly
-        if extra and os.path.exists(extra):
+        if extra and not extra.startswith("<") and os.path.exists(extra):
             dest_path = media_dir / filename
             shutil.copy2(extra, dest_path)
             logger.debug("File already exists, copied to {}", dest_path)
@@ -349,7 +354,7 @@ class WeChatChannel(BaseChannel):
         try:
             loop = asyncio.get_running_loop()
 
-            # Trigger the download
+            # Trigger the download with msg.content as extra (contains attachment info)
             ret = await loop.run_in_executor(
                 None,
                 lambda: self.wcf.download_attach(msg.id, thumb, extra)
@@ -357,21 +362,24 @@ class WeChatChannel(BaseChannel):
 
             if ret != 0:
                 logger.warning("download_attach returned {}", ret)
-                # Continue anyway, file might still download
 
             # Wait for file to be available
-            await asyncio.sleep(1)  # Initial wait for data to be indexed
+            # File will be downloaded to WeChat's file directory
+            # We need to find it by searching for the filename
+            await asyncio.sleep(2)  # Initial wait for download to start
 
+            # Try to find downloaded file in common WeChat directories
             for _ in range(timeout):
-                if extra and os.path.exists(extra):
+                # Check if msg.extra got updated (some versions update it)
+                if msg.extra and os.path.exists(msg.extra):
                     dest_path = media_dir / filename
-                    shutil.copy2(extra, dest_path)
+                    shutil.copy2(msg.extra, dest_path)
                     logger.debug("Downloaded file to {}", dest_path)
                     return str(dest_path), f"[文件: <work_dir>/data/{filename}]"
                 await asyncio.sleep(1)
 
-            logger.warning("File download timeout. extra='{}' does not exist", extra)
-            return None, f"[文件: {filename}] (下载超时)"
+            logger.warning("File download timeout for '{}'", filename)
+            return None, f"[文件: {filename}] (下载超时，请在微信中点击文件后重试)"
 
         except Exception as e:
             logger.error("Error downloading file '{}': {}", filename, e)
