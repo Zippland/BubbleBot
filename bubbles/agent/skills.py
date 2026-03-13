@@ -76,7 +76,7 @@ class SkillsLoader:
             name = escape_attr(s["name"])
             desc = escape_xml(s["description"]) if s["description"] else name
             path = f"skills/{s['name']}/SKILL.md"
-            lines.append(f'  <skill name="{name}" path="{path}">')
+            lines.append(f'  <skill name="{name}" path="<work_dir>/{path}">')
             lines.append(f"    {desc}")
             lines.append(f"  </skill>")
         lines.append("</skills>")
