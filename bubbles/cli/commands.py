@@ -1175,5 +1175,77 @@ def _login_github_copilot() -> None:
         raise typer.Exit(1)
 
 
+# ============================================================================
+# Sync Skills
+# ============================================================================
+
+
+@app.command("sync-skills")
+def sync_skills(
+    session: str = typer.Option(None, "--session", "-s", help="Only sync to a specific session"),
+    dry_run: bool = typer.Option(False, "--dry-run", "-n", help="Show what would be done"),
+):
+    """Sync skills from template to all session workspaces."""
+    import shutil
+    from bubbles.utils.helpers import get_sessions_path
+
+    # Find template skills directory
+    template_dir = Path(__file__).parent.parent / "templates" / "session" / "skills"
+    sessions_dir = get_sessions_path()
+
+    if not template_dir.exists():
+        console.print(f"[red]Template not found: {template_dir}[/red]")
+        raise typer.Exit(1)
+
+    if not sessions_dir.exists():
+        console.print(f"[red]Sessions directory not found: {sessions_dir}[/red]")
+        raise typer.Exit(1)
+
+    # Get sessions to update
+    if session:
+        session_dirs = [sessions_dir / session]
+        if not session_dirs[0].exists():
+            console.print(f"[red]Session not found: {session}[/red]")
+            raise typer.Exit(1)
+    else:
+        session_dirs = [d for d in sessions_dir.iterdir() if d.is_dir()]
+
+    if not session_dirs:
+        console.print("No sessions found")
+        return
+
+    # Get template skills
+    template_skills = [d for d in template_dir.iterdir() if d.is_dir() and (d / "SKILL.md").exists()]
+    if not template_skills:
+        console.print("No skills in template")
+        return
+
+    console.print(f"Skills: {', '.join(s.name for s in template_skills)}")
+    console.print(f"Sessions: {', '.join(d.name for d in session_dirs)}\n")
+
+    for session_dir in session_dirs:
+        skills_dir = session_dir / "skills"
+
+        if not skills_dir.exists():
+            if dry_run:
+                console.print(f"  [dim]Would create {skills_dir}[/dim]")
+            else:
+                skills_dir.mkdir(parents=True)
+
+        for skill in template_skills:
+            dest = skills_dir / skill.name
+            action = "update" if dest.exists() else "add"
+
+            if dry_run:
+                console.print(f"  [dim]Would {action}: {session_dir.name}/skills/{skill.name}[/dim]")
+            else:
+                if dest.exists():
+                    shutil.rmtree(dest)
+                shutil.copytree(skill, dest)
+                console.print(f"  [green]✓[/green] {action}: {session_dir.name}/skills/{skill.name}")
+
+    console.print("\n[green]Done![/green]")
+
+
 if __name__ == "__main__":
     app()
