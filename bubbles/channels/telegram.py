@@ -367,40 +367,37 @@ class TelegramChannel(BaseChannel):
         
         # Download media if present
         if media_file and self._app:
-            try:
-                file = await self._app.bot.get_file(media_file.file_id)
-                ext = self._get_extension(media_type, getattr(media_file, 'mime_type', None))
+            # Check session binding first
+            media_dir = self._get_media_dir(str(chat_id))
+            if media_dir is None:
+                content_parts.append(f"[{media_type}: 请先使用 /session <name> 绑定工作区]")
+            else:
+                try:
+                    file = await self._app.bot.get_file(media_file.file_id)
+                    ext = self._get_extension(media_type, getattr(media_file, 'mime_type', None))
 
-                # Save to session's data directory
-                from pathlib import Path
-                from bubbles.utils.helpers import get_sessions_path, safe_filename
-                session_key = self._compute_session_key(sender_id, str(chat_id))
-                safe_key = safe_filename(session_key.replace(":", "_"))
-                media_dir = get_sessions_path() / safe_key / "data"
-                media_dir.mkdir(parents=True, exist_ok=True)
+                    file_path = media_dir / f"{media_file.file_id[:16]}{ext}"
+                    await file.download_to_drive(str(file_path))
 
-                file_path = media_dir / f"{media_file.file_id[:16]}{ext}"
-                await file.download_to_drive(str(file_path))
-                
-                media_paths.append(str(file_path))
-                
-                # Handle voice transcription
-                if media_type == "voice" or media_type == "audio":
-                    from bubbles.providers.transcription import GroqTranscriptionProvider
-                    transcriber = GroqTranscriptionProvider(api_key=self.groq_api_key)
-                    transcription = await transcriber.transcribe(file_path)
-                    if transcription:
-                        logger.info("Transcribed {}: {}...", media_type, transcription[:50])
-                        content_parts.append(f"[transcription: {transcription}]")
+                    media_paths.append(str(file_path))
+
+                    # Handle voice transcription
+                    if media_type == "voice" or media_type == "audio":
+                        from bubbles.providers.transcription import GroqTranscriptionProvider
+                        transcriber = GroqTranscriptionProvider(api_key=self.groq_api_key)
+                        transcription = await transcriber.transcribe(file_path)
+                        if transcription:
+                            logger.info("Transcribed {}: {}...", media_type, transcription[:50])
+                            content_parts.append(f"[transcription: {transcription}]")
+                        else:
+                            content_parts.append(f"[{media_type}: {file_path}]")
                     else:
                         content_parts.append(f"[{media_type}: {file_path}]")
-                else:
-                    content_parts.append(f"[{media_type}: {file_path}]")
-                    
-                logger.debug("Downloaded {} to {}", media_type, file_path)
-            except Exception as e:
-                logger.error("Failed to download media: {}", e)
-                content_parts.append(f"[{media_type}: download failed]")
+
+                    logger.debug("Downloaded {} to {}", media_type, file_path)
+                except Exception as e:
+                    logger.error("Failed to download media: {}", e)
+                    content_parts.append(f"[{media_type}: download failed]")
         
         content = "\n".join(content_parts) if content_parts else "[empty message]"
         

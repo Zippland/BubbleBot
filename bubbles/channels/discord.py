@@ -237,11 +237,8 @@ class DiscordChannel(BaseChannel):
         content_parts = [content] if content else []
         media_paths: list[str] = []
 
-        # Compute session key and media directory
-        from bubbles.utils.helpers import get_sessions_path, safe_filename
-        session_key = self._compute_session_key(sender_id, channel_id)
-        safe_key = safe_filename(session_key.replace(":", "_"))
-        media_dir = get_sessions_path() / safe_key / "data"
+        # Get media directory (respects session binding)
+        media_dir = self._get_media_dir(channel_id)
 
         for attachment in payload.get("attachments") or []:
             url = attachment.get("url")
@@ -249,11 +246,13 @@ class DiscordChannel(BaseChannel):
             size = attachment.get("size") or 0
             if not url or not self._http:
                 continue
+            if media_dir is None:
+                content_parts.append(f"[attachment: {filename} - 请先使用 /session <name> 绑定工作区]")
+                continue
             if size and size > MAX_ATTACHMENT_BYTES:
                 content_parts.append(f"[attachment: {filename} - too large]")
                 continue
             try:
-                media_dir.mkdir(parents=True, exist_ok=True)
                 file_path = media_dir / f"{attachment.get('id', 'file')}_{filename.replace('/', '_')}"
                 resp = await self._http.get(url)
                 resp.raise_for_status()

@@ -553,7 +553,7 @@ class FeishuChannel(BaseChannel):
         msg_type: str,
         content_json: dict,
         message_id: str | None = None,
-        session_key: str | None = None,
+        chat_id: str | None = None,
     ) -> tuple[str | None, str]:
         """
         Download media from Feishu and save to session's data directory.
@@ -561,17 +561,12 @@ class FeishuChannel(BaseChannel):
         Returns:
             (file_path, content_text) - file_path is None if download failed
         """
-        from bubbles.utils.helpers import get_sessions_path, safe_filename
+        # Check session binding first
+        media_dir = self._get_media_dir(chat_id) if chat_id else None
+        if media_dir is None:
+            return None, f"[{msg_type}: 请先使用 /session <name> 绑定工作区]"
 
         loop = asyncio.get_running_loop()
-
-        # Save to session's data directory if session_key provided
-        if session_key:
-            safe_key = safe_filename(session_key.replace(":", "_"))
-            media_dir = get_sessions_path() / safe_key / "data"
-        else:
-            media_dir = Path.home() / ".bubbles" / "media"
-        media_dir.mkdir(parents=True, exist_ok=True)
 
         data, filename = None, None
 
@@ -702,9 +697,8 @@ class FeishuChannel(BaseChannel):
             chat_type = message.chat_type
             msg_type = message.message_type
 
-            # Compute session key and reply target early for media download
+            # Compute reply target for session binding lookup
             reply_to = chat_id if chat_type == "group" else sender_id
-            session_key = self._compute_session_key(sender_id, reply_to)
 
             # Add random reaction
             reactions = ["GLANCE", "THUMBSUP", "OnIt", "THINKING", "FISTBUMP", "StatusFlashOfInspiration", "OneSecond", "VRHeadset"]
@@ -731,14 +725,14 @@ class FeishuChannel(BaseChannel):
                 # Download images embedded in post
                 for img_key in image_keys:
                     file_path, content_text = await self._download_and_save_media(
-                        "image", {"image_key": img_key}, message_id, session_key
+                        "image", {"image_key": img_key}, message_id, reply_to
                     )
                     if file_path:
                         media_paths.append(file_path)
                     content_parts.append(content_text)
 
             elif msg_type in ("image", "audio", "file", "media"):
-                file_path, content_text = await self._download_and_save_media(msg_type, content_json, message_id, session_key)
+                file_path, content_text = await self._download_and_save_media(msg_type, content_json, message_id, reply_to)
                 if file_path:
                     media_paths.append(file_path)
                 content_parts.append(content_text)

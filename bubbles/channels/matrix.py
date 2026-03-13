@@ -474,14 +474,11 @@ class MatrixChannel(BaseChannel):
             return self._is_bot_mentioned(event)
         return False
 
-    def _media_dir(self, session_key: str | None = None) -> Path:
-        if session_key:
-            safe_key = safe_filename(session_key.replace(":", "_"))
-            d = get_sessions_path() / safe_key / "data"
-        else:
-            d = get_data_dir() / "media" / "matrix"
-        d.mkdir(parents=True, exist_ok=True)
-        return d
+    def _media_dir(self, chat_id: str | None = None) -> Path | None:
+        if chat_id:
+            # Use _get_media_dir which respects session bindings (returns None if no binding)
+            return self._get_media_dir(chat_id)
+        return None
 
     @staticmethod
     def _event_source_content(event: RoomMessage) -> dict[str, Any]:
@@ -549,7 +546,10 @@ class MatrixChannel(BaseChannel):
         return _DEFAULT_ATTACH_NAME if attachment_type == "file" else attachment_type
 
     def _build_attachment_path(self, event: MatrixMediaEvent, attachment_type: str,
-                               filename: str, mime: str | None, session_key: str | None = None) -> Path:
+                               filename: str, mime: str | None, chat_id: str | None = None) -> Path | None:
+        media_dir = self._media_dir(chat_id)
+        if media_dir is None:
+            return None
         safe_name = safe_filename(Path(filename).name) or _DEFAULT_ATTACH_NAME
         suffix = Path(safe_name).suffix
         if not suffix and mime:
@@ -559,7 +559,7 @@ class MatrixChannel(BaseChannel):
         suffix = suffix[:16]
         event_id = safe_filename(str(getattr(event, "event_id", "") or "evt").lstrip("$"))
         event_prefix = (event_id[:24] or "evt").strip("_")
-        return self._media_dir(session_key) / f"{event_prefix}_{stem}{suffix}"
+        return media_dir / f"{event_prefix}_{stem}{suffix}"
 
     async def _download_media_bytes(self, mxc_url: str) -> bytes | None:
         if not self.client:
@@ -625,9 +625,10 @@ class MatrixChannel(BaseChannel):
         if len(data) > limit_bytes:
             return None, _ATTACH_TOO_LARGE.format(filename)
 
-        # Compute session key for media directory
-        session_key = self._compute_session_key(event.sender, room.room_id)
-        path = self._build_attachment_path(event, atype, filename, mime, session_key)
+        # Use room_id for media directory (respects session binding)
+        path = self._build_attachment_path(event, atype, filename, mime, room.room_id)
+        if path is None:
+            return None, f"[{atype}: 请先使用 /session <name> 绑定工作区]"
         try:
             path.write_bytes(data)
         except OSError:

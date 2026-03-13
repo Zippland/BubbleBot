@@ -1,12 +1,15 @@
 """Base channel interface for chat platforms."""
 
+import json
 from abc import ABC, abstractmethod
+from pathlib import Path
 from typing import Any
 
 from loguru import logger
 
 from bubbles.bus.events import InboundMessage, OutboundMessage
 from bubbles.bus.queue import MessageBus
+from bubbles.utils.helpers import get_data_path, get_sessions_path
 
 
 class BaseChannel(ABC):
@@ -153,3 +156,29 @@ class BaseChannel(ABC):
     def is_running(self) -> bool:
         """Check if the channel is running."""
         return self._running
+
+    def _get_session_binding(self, chat_id: str) -> str | None:
+        """Get the bound session key for this channel:chat_id, if any."""
+        bindings_path = get_data_path() / "session_bindings.json"
+        if not bindings_path.exists():
+            return None
+        try:
+            with open(bindings_path, encoding="utf-8") as f:
+                bindings = json.load(f)
+            return bindings.get(f"{self.name}:{chat_id}")
+        except Exception:
+            return None
+
+    def _get_media_dir(self, chat_id: str) -> Path | None:
+        """Get the media directory for this chat, respecting session bindings.
+
+        Returns None if no session binding exists (media should not be saved).
+        """
+        bound_key = self._get_session_binding(chat_id)
+        if not bound_key:
+            return None
+
+        safe_key = bound_key.replace(":", "_").replace("/", "_")
+        media_dir = get_sessions_path() / safe_key / "data"
+        media_dir.mkdir(parents=True, exist_ok=True)
+        return media_dir
