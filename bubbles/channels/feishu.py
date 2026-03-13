@@ -259,7 +259,6 @@ class FeishuChannel(BaseChannel):
     """
     
     name = "feishu"
-    supports_markdown = False  # Text messages don't render markdown
 
     def __init__(self, config: FeishuConfig, bus: MessageBus, session_mode: str = "channel"):
         super().__init__(config, bus, session_mode)

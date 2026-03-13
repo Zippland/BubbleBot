@@ -75,7 +75,7 @@ class MessageTool(Tool):
             "properties": {
                 "content": {
                     "type": "string",
-                    "description": "The message content to send"
+                    "description": "The message content to send. MUST be plain text only - no Markdown formatting (**, #, -, ```, etc.) as chat apps don't render it."
                 },
                 "channel": {
                     "type": "string",

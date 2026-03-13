@@ -43,7 +43,6 @@ class WeChatChannel(BaseChannel):
     """
 
     name = "wechat"
-    supports_markdown = False
 
     def __init__(
         self,
