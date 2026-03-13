@@ -2,6 +2,7 @@
 
 import html
 import json
+import logging
 import os
 import re
 from typing import Any
@@ -10,6 +11,9 @@ from urllib.parse import urlparse
 import httpx
 
 from bubbles.agent.tools.base import Tool
+
+# Silence readability's noisy logging
+logging.getLogger("readability").setLevel(logging.CRITICAL)
 
 # Shared constants
 USER_AGENT = "Mozilla/5.0 (Macintosh; Intel Mac OS X 14_7_2) AppleWebKit/537.36"
