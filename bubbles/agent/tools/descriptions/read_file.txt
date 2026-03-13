@@ -1,15 +1,16 @@
-Reads a file from the filesystem.
+Reads a file from the filesystem. Automatically handles both files and images.
+
+**Supported file types**:
+- **files**: Returns content with line numbers (cat -n format)
+- **Image files** (.jpg, .jpeg, .png, .gif, .bmp, .webp, .tiff): Returns image content that you can directly see and analyze
 
 **Path handling**:
 - `~` refers to session_dir (NOT the system $HOME)
 - Relative paths are resolved relative to session_dir
 - All paths must be within session_dir; accessing files outside will return an error
 
-Usage:
-- The path parameter must be an absolute path, not a relative path
-- By default, it reads up to 2000 lines starting from the beginning of the file
-- You can optionally specify a line offset and limit (especially handy for long files), but it's recommended to read the whole file by not providing these parameters
-- Any lines longer than 2000 characters will be truncated
-- Results are returned using cat -n format, with line numbers starting at 1
-- You have the capability to call multiple tools in a single response. It is always better to speculatively read multiple files as a batch that are potentially useful.
-- If you read a file that exists but has empty contents you will receive a system reminder warning in place of file contents.
+**Usage**:
+- For text files: optionally specify start_line/end_line for large files
+- For images: just provide the path, the image will be displayed for you to analyze
+- Images saved from chat messages are stored in `data/` directory (e.g., `data/image.jpg`)
+- You can call multiple tools in a single response to read multiple files at once
