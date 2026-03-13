@@ -295,7 +295,7 @@ requires-dist = [
     { name = "slackify-markdown", specifier = ">=0.2.0,<1.0.0" },
     { name = "socksio", specifier = ">=1.0.0,<2.0.0" },
     { name = "typer", specifier = ">=0.20.0,<1.0.0" },
-    { name = "wcferry", specifier = ">=39.4.1.2,<40.0.0" },
+    { name = "wcferry", specifier = "==39.5.1.0" },
     { name = "websocket-client", specifier = ">=1.9.0,<2.0.0" },
     { name = "websockets", specifier = ">=16.0,<17.0" },
 ]
@@ -2968,7 +2968,7 @@ wheels = [
 
 [[package]]
 name = "wcferry"
-version = "39.5.2.0"
+version = "39.5.1.0"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "grpcio-tools" },
@@ -2976,9 +2976,9 @@ dependencies = [
     { name = "requests" },
     { name = "setuptools" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/87/c8/4ff24f3aaae89ec2d8ed4624ebfde6f106a6ace78c05b409ae52d8ccbb72/wcferry-39.5.2.0.tar.gz", hash = "sha256:780d190b9492e53033ee0c0a995982385927a20aa4a7c7aa5f5fdd34242bfdb9", size = 1822998, upload-time = "2025-04-29T16:37:11.277Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/38/ee/5bce2a12c7727bc007135ac6a7614eb94f2f3971f39563b65a60997c1110/wcferry-39.5.1.0.tar.gz", hash = "sha256:8d7cc21d0ed8727e568c59c2c50ccd7cffb504d2a9c705d4eda45044bc361ea8", size = 1668508, upload-time = "2025-04-19T23:50:08.173Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/fb/e1/dc82fa60e34705e1ea46e064d1d85897caaa0f692c0f81107fff9a659c1c/wcferry-39.5.2.0-py3-none-any.whl", hash = "sha256:aefd5a493b52c07915b2a2d44d90a39d51a275bde885d2373c759f1d6488cf2a", size = 1828702, upload-time = "2025-04-29T16:37:05.245Z" },
+    { url = "https://files.pythonhosted.org/packages/c6/1c/0c261837a0264a208fce66d13bab4cd3e3ca4c2b74da0032056eab943478/wcferry-39.5.1.0-py3-none-any.whl", hash = "sha256:f12d67c40692d8570ec3057794a30e1981db52299437c6c7cc091827895ce76d", size = 1673204, upload-time = "2025-04-19T23:49:34.515Z" },
 ]
 
 [[package]]
