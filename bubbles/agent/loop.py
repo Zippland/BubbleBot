@@ -252,7 +252,7 @@ class AgentLoop:
                 if hasattr(tool, "set_context"):
                     if name == "message":
                         tool.set_context(channel, chat_id, message_id)
-                    elif name == "cron":
+                    elif name in ("cron", "spawn"):
                         tool.set_context(channel, chat_id, session_key or f"{channel}:{chat_id}")
                     else:
                         tool.set_context(channel, chat_id)
@@ -473,12 +473,17 @@ class AgentLoop:
         on_tool_call: Callable[[str, dict, str | None], Awaitable[None]] | None = None,
     ) -> OutboundMessage | None:
         """Process a single inbound message and return the response."""
-        # System messages: parse origin from chat_id ("channel:chat_id")
+        # System messages: chat_id may be a session key directly or "channel:chat_id"
         if msg.channel == "system":
-            channel, chat_id = (msg.chat_id.split(":", 1) if ":" in msg.chat_id
-                                else ("cli", msg.chat_id))
-            logger.info("Processing system message from {}", msg.sender_id)
-            key = f"{channel}:{chat_id}"
+            if ":" in msg.chat_id:
+                # Standard format: "channel:chat_id"
+                channel, chat_id = msg.chat_id.split(":", 1)
+                key = f"{channel}:{chat_id}"
+            else:
+                # Direct session key (from subagent with session binding)
+                key = msg.chat_id
+                channel, chat_id = "system", key
+            logger.info("Processing system message from {} to session {}", msg.sender_id, key)
             session = self.sessions.get_or_create(key)
             context = self._get_context(session)
             self._set_tool_context(channel, chat_id, msg.metadata.get("message_id"), session.directory, key, session)

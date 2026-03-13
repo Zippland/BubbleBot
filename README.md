@@ -170,10 +170,6 @@ bubbles/
 └── cli/            # Commands
 ```
 
-## Acknowledgments
-
-Thanks to the [nanobot](https://github.com/HKUDS/nanobot) team for the solid foundation.
-
 ## License
 
 [MIT](LICENSE)

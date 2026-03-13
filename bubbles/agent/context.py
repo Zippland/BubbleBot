@@ -80,9 +80,11 @@ class ContextBuilder:
 
 **<work_dir> is the only place you and your human can visit, edit, create or delete files.**
 
+---
+
 # INSTRUCTIONS
 
-# File Management
+## File Management
 - All file operations must be performed within <work_dir>/data. Do not create or download files anywhere else.
 - If the /data directory does not exist, create it before use.
 - Temporary and one-off intermediate files must be deleted immediately after use. Keep the /data directory clean.
@@ -90,7 +92,9 @@ class ContextBuilder:
 
 ## Message Context
 Reply directly with text for conversations. Only use the 'message' tool to send to a specific channel.
-Each user message includes a [Runtime Context] block at the end with:
+MUST be plain text only - no Markdown formatting (**, #, -, ```, etc.) as chat apps don't render it.
+
+PS. Each user message includes a [Runtime Context] block at the end with:
 - Current time and timezone
 - Channel and chat ID
 - Sender information (name and ID when available)
@@ -193,11 +197,15 @@ Keep it concise — only facts you'll need to recall later."""
         messages.extend(history)
 
         # Current message (with optional image attachments)
-        user_content = self._build_user_content(current_message, media)
-        user_content = self._inject_runtime_context(
-            user_content, channel, chat_id, sender_id, sender_name
-        )
-        messages.append({"role": "user", "content": user_content})
+        # Subagent results are system messages, not user messages
+        if sender_id == "subagent":
+            messages.append({"role": "system", "content": current_message})
+        else:
+            user_content = self._build_user_content(current_message, media)
+            user_content = self._inject_runtime_context(
+                user_content, channel, chat_id, sender_id, sender_name
+            )
+            messages.append({"role": "user", "content": user_content})
 
         return messages
 
