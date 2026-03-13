@@ -223,15 +223,24 @@ class LiteLLMProvider(LLMProvider):
 
         # Debug: log user message content structure for multimodal debugging
         from loguru import logger
-        logger.debug("LLM request: model={}, original={}", model, original_model)
-        for msg in kwargs["messages"]:
+        logger.info("LLM request: model={}", model)
+        # Only log the LAST user message (current message)
+        for msg in reversed(kwargs["messages"]):
             if msg.get("role") == "user":
                 content = msg.get("content")
                 if isinstance(content, list):
-                    types = [item.get("type") for item in content if isinstance(item, dict)]
-                    logger.debug("LLM user message content types: {}", types)
+                    for item in content:
+                        if isinstance(item, dict):
+                            item_type = item.get("type")
+                            if item_type == "image_url":
+                                url = item.get("image_url", {}).get("url", "")
+                                logger.info("LLM image_url: prefix={}, len={}", url[:50], len(url))
+                            else:
+                                text = item.get("text", "")
+                                logger.debug("LLM text item: len={}", len(text))
                 else:
-                    logger.debug("LLM user message content type: str, len={}", len(content) if content else 0)
+                    logger.debug("LLM user content: str, len={}", len(content) if content else 0)
+                break  # Only log the last (current) user message
 
         try:
             response = await acompletion(**kwargs)
