@@ -215,35 +215,20 @@ Keep it concise — only facts you'll need to recall later."""
 
     def _build_user_content(self, text: str, media: list[str] | None) -> str | list[dict[str, Any]]:
         """Build user message content with optional base64-encoded images."""
-        from loguru import logger
-
         if not media:
             return text
 
         images = []
         for path in media:
             p = Path(path)
-            is_file = p.is_file()
+            if not p.is_file():
+                continue
             mime, _ = mimetypes.guess_type(path)
-            logger.debug(
-                "Processing media: path={}, exists={}, is_file={}, mime={}",
-                path, p.exists(), is_file, mime
-            )
-            if not is_file:
-                logger.warning("Media file not found or not a file: {}", path)
-                continue
             if not mime or not mime.startswith("image/"):
-                logger.debug("Skipping non-image media: path={}, mime={}", path, mime)
                 continue
-            file_bytes = p.read_bytes()
-            b64 = base64.b64encode(file_bytes).decode()
-            logger.debug(
-                "Added image to content: path={}, file_size={}, b64_len={}, b64_prefix={}",
-                path, len(file_bytes), len(b64), b64[:50]
-            )
+            b64 = base64.b64encode(p.read_bytes()).decode()
             images.append({"type": "image_url", "image_url": {"url": f"data:{mime};base64,{b64}"}})
 
-        logger.debug("Built user content: text_len={}, images_count={}", len(text), len(images))
         if not images:
             return text
         return images + [{"type": "text", "text": text}]

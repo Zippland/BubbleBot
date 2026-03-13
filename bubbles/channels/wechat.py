@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import asyncio
 import os
-from pathlib import Path
 from queue import Empty
 from threading import Thread
 
@@ -14,7 +13,6 @@ from bubbles.bus.events import OutboundMessage
 from bubbles.bus.queue import MessageBus
 from bubbles.channels.base import BaseChannel
 from bubbles.config.schema import WeChatConfig
-from bubbles.utils.helpers import get_sessions_path, safe_filename
 
 try:
     from wcferry import Wcf, WxMsg
@@ -25,9 +23,6 @@ except ImportError:
 
 # WeChat message types
 MSG_TYPE_TEXT = 1
-MSG_TYPE_IMAGE = 3
-MSG_TYPE_VOICE = 34
-MSG_TYPE_FILE = 49  # Also used for links, mini-programs, etc.
 
 
 class WeChatChannel(BaseChannel):
@@ -36,6 +31,8 @@ class WeChatChannel(BaseChannel):
 
     - Private chats: Direct reply
     - Group chats: Only reply when @mentioned
+
+    Note: Image/voice/file receiving is not supported due to platform limitations.
     """
 
     name = "wechat"
@@ -46,7 +43,7 @@ class WeChatChannel(BaseChannel):
         config: WeChatConfig,
         bus: MessageBus,
         session_mode: str = "channel",
-        groq_api_key: str | None = None,
+        groq_api_key: str | None = None,  # kept for compatibility, not used
     ):
         super().__init__(config, bus, session_mode)
         self.config: WeChatConfig = config
@@ -55,7 +52,6 @@ class WeChatChannel(BaseChannel):
         self._recv_thread: Thread | None = None
         self._loop: asyncio.AbstractEventLoop | None = None
         self._contacts: dict[str, str] = {}  # wxid -> nickname cache
-        self.groq_api_key = groq_api_key
 
     async def start(self) -> None:
         """Start WeChat client and begin listening for messages."""
@@ -138,8 +134,8 @@ class WeChatChannel(BaseChannel):
         if msg.from_self():
             return
 
-        # Only handle supported message types
-        if msg.type not in (MSG_TYPE_TEXT, MSG_TYPE_IMAGE, MSG_TYPE_VOICE, MSG_TYPE_FILE):
+        # Only handle text messages
+        if msg.type != MSG_TYPE_TEXT:
             logger.debug("Skipping unsupported message type: {}", msg.type)
             return
 
@@ -160,64 +156,23 @@ class WeChatChannel(BaseChannel):
             room_id = None
             is_at_me = True  # Always respond to private chat
 
-        # Compute session key and media directory
-        session_key = self._compute_session_key(sender_id, chat_id)
-        safe_key = safe_filename(session_key.replace(":", "_"))
-        media_dir = get_sessions_path() / safe_key / "data"
-        media_dir.mkdir(parents=True, exist_ok=True)
+        # Process text content
+        text = self._strip_at_mention(msg.content) if is_at_me and is_group else msg.content
 
-        # Process message content and media
-        content_parts = []
-        media_paths = []
-
-        if msg.type == MSG_TYPE_TEXT:
-            text = self._strip_at_mention(msg.content) if is_at_me and is_group else msg.content
-            if text:
-                content_parts.append(text)
-
-        elif msg.type == MSG_TYPE_IMAGE:
-            file_path, content_text = await self._download_image(msg, media_dir)
-            if file_path:
-                media_paths.append(file_path)
-            content_parts.append(content_text)
-            is_at_me = True  # Always respond to images
-
-        elif msg.type == MSG_TYPE_VOICE:
-            file_path, content_text = await self._download_voice(msg, media_dir)
-            if file_path:
-                media_paths.append(file_path)
-                # Transcribe voice to text
-                transcription = await self._transcribe_voice(file_path)
-                if transcription:
-                    content_parts.append(f"[transcription: {transcription}]")
-                else:
-                    content_parts.append(content_text)
-            else:
-                content_parts.append(content_text)
-            is_at_me = True  # Always respond to voice
-
-        elif msg.type == MSG_TYPE_FILE:
-            # Type 49 can be file, link, or mini-program
-            # For now just note it in content
-            content_parts.append("[file or link message]")
-
-        content = "\n".join(content_parts) if content_parts else ""
-
-        if not content and not media_paths:
+        if not text:
             return
 
         # Get sender name (group alias or contact nickname)
         sender_name = self._get_sender_name(sender_id, room_id)
 
         logger.debug("WeChat message from {} ({}) in {}: {}{}",
-                     sender_name or sender_id, sender_id, chat_id, content[:50],
+                     sender_name or sender_id, sender_id, chat_id, text[:50],
                      " [@me]" if is_at_me else "")
 
         await self._handle_message(
             sender_id=sender_id,
             chat_id=chat_id,
-            content=content,
-            media=media_paths,
+            content=text,
             metadata={
                 "is_group": is_group,
                 "sender_name": sender_name,
@@ -231,69 +186,6 @@ class WeChatChannel(BaseChannel):
         # WeChat @mention format: @nickname followed by space or text
         # Pattern: @xxx followed by space or end
         return re.sub(r"@\S+\s*", "", content).strip()
-
-    async def _download_image(self, msg: WxMsg, media_dir: Path) -> tuple[str | None, str]:
-        """Download image from WeChat message."""
-        if not self.wcf:
-            return None, "[image: download failed]"
-
-        try:
-            # wcf.download_image runs synchronously, use executor
-            loop = asyncio.get_running_loop()
-            file_path = await loop.run_in_executor(
-                None,
-                lambda: self.wcf.download_image(msg.id, msg.extra, str(media_dir), timeout=30)
-            )
-
-            if file_path and os.path.isfile(file_path):
-                logger.debug("Downloaded image to {}", file_path)
-                return file_path, f"[image: {os.path.basename(file_path)}]"
-            else:
-                logger.warning("Failed to download image for msg {}", msg.id)
-                return None, "[image: download failed]"
-        except Exception as e:
-            logger.error("Error downloading image: {}", e)
-            return None, "[image: download failed]"
-
-    async def _download_voice(self, msg: WxMsg, media_dir: Path) -> tuple[str | None, str]:
-        """Download voice message and convert to MP3."""
-        if not self.wcf:
-            return None, "[voice: download failed]"
-
-        try:
-            # wcf.get_audio_msg runs synchronously, use executor
-            loop = asyncio.get_running_loop()
-            file_path = await loop.run_in_executor(
-                None,
-                lambda: self.wcf.get_audio_msg(msg.id, str(media_dir), timeout=30)
-            )
-
-            if file_path and os.path.isfile(file_path):
-                logger.debug("Downloaded voice to {}", file_path)
-                return file_path, f"[voice: {os.path.basename(file_path)}]"
-            else:
-                logger.warning("Failed to download voice for msg {}", msg.id)
-                return None, "[voice: download failed]"
-        except Exception as e:
-            logger.error("Error downloading voice: {}", e)
-            return None, "[voice: download failed]"
-
-    async def _transcribe_voice(self, file_path: str) -> str | None:
-        """Transcribe voice file to text using Groq Whisper."""
-        if not self.groq_api_key:
-            logger.debug("No Groq API key configured, skipping transcription")
-            return None
-
-        try:
-            from bubbles.providers.transcription import GroqTranscriptionProvider
-            transcriber = GroqTranscriptionProvider(api_key=self.groq_api_key)
-            transcription = await transcriber.transcribe(file_path)
-            if transcription:
-                logger.info("Transcribed voice: {}...", transcription[:50])
-            return transcription
-        except Exception as e:
-            logger.error("Error transcribing voice: {}", e)
-            return None
 
     _IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".gif", ".bmp", ".webp"}
 
