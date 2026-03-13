@@ -304,6 +304,79 @@ class WeChatChannel(BaseChannel):
 
         return None, f"[{media_type}: download failed]"
 
+    async def _download_file(
+        self,
+        msg: WxMsg,
+        filename: str,
+        chat_id: str,
+        timeout: int = 30,
+    ) -> tuple[str | None, str]:
+        """
+        Download a file attachment from WeChat.
+
+        Args:
+            msg: The WeChat message object
+            filename: The filename from XML
+            chat_id: Chat ID for session binding
+            timeout: Download timeout in seconds
+
+        Returns:
+            (file_path, content_text)
+        """
+        import shutil
+
+        # Check session binding first
+        media_dir = self._get_media_dir(chat_id)
+        if media_dir is None:
+            return None, f"[文件: {filename}] (请先使用 /session <name> 绑定工作区)"
+
+        if not self.wcf:
+            return None, f"[文件: {filename}]"
+
+        extra = msg.extra or ""
+        thumb = msg.thumb or ""
+
+        logger.debug("Attempting to download file '{}': id={}, thumb='{}', extra='{}'",
+                     filename, msg.id, thumb[:80], extra[:80])
+
+        # If extra already points to an existing file, use it directly
+        if extra and os.path.exists(extra):
+            dest_path = media_dir / filename
+            shutil.copy2(extra, dest_path)
+            logger.debug("File already exists, copied to {}", dest_path)
+            return str(dest_path), f"[文件: <work_dir>/data/{filename}]"
+
+        try:
+            loop = asyncio.get_running_loop()
+
+            # Trigger the download
+            ret = await loop.run_in_executor(
+                None,
+                lambda: self.wcf.download_attach(msg.id, thumb, extra)
+            )
+
+            if ret != 0:
+                logger.warning("download_attach returned {}", ret)
+                # Continue anyway, file might still download
+
+            # Wait for file to be available
+            await asyncio.sleep(1)  # Initial wait for data to be indexed
+
+            for _ in range(timeout):
+                if extra and os.path.exists(extra):
+                    dest_path = media_dir / filename
+                    shutil.copy2(extra, dest_path)
+                    logger.debug("Downloaded file to {}", dest_path)
+                    return str(dest_path), f"[文件: <work_dir>/data/{filename}]"
+                await asyncio.sleep(1)
+
+            logger.warning("File download timeout. extra='{}' does not exist", extra)
+            return None, f"[文件: {filename}] (下载超时)"
+
+        except Exception as e:
+            logger.error("Error downloading file '{}': {}", filename, e)
+            return None, f"[文件: {filename}] (下载失败)"
+
     async def _process_app_msg(
         self,
         msg: WxMsg,
@@ -332,9 +405,10 @@ class WeChatChannel(BaseChannel):
         if appmsg_type == "6":
             title_match = re.search(r'<title>(.*?)</title>', content)
             filename = title_match.group(1) if title_match else "file"
-            # Note: File download requires additional handling via download_attach
-            # For now, just indicate file was received
-            return f"[文件: {filename}]", [], False
+            file_path, content_text = await self._download_file(msg, filename, chat_id)
+            if file_path:
+                return content_text, [file_path], False
+            return content_text, [], False
 
         # Type 5: Link
         if appmsg_type == "5":
