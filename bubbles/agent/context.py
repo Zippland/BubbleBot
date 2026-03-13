@@ -70,10 +70,11 @@ class ContextBuilder:
 {runtime}
 
 ## Session Workspace
-**work_dir**: {session_path}
-- Long-term memory: **work_dir**/MEMORY.md（editable）
-- All Message history: **work_dir**/session.jsonl (grep-searchable)
-- Custom skills: **work_dir**/skills/{{skill-name}}/SKILL.md
+<work_dir>: {session_path}
+- Long-term memory: <work_dir>/MEMORY.md（editable）
+- All Message history: <work_dir>/session.jsonl (grep-searchable)
+- Data Storage: <work_dir>/data/ (editable)
+- Custom skills: <work_dir>/skills/{{skill-name}}/SKILL.md
 
 All file operations are restricted to this session directory.
 
