@@ -19,7 +19,7 @@
 > 3. 已经足够好、功能足够多、边际效应低，我没有超过这个项目的痛点
 > 4. Vibe coding 只需要用最好的模型，用次优解会导致代码难以维护
 > 
-> 然后诞生了 Bubblebot
+> 然后诞生了 Bubblebot，本质上只是把 bubbles 的内核换成了 coding agent。
 >
 > 玩得开心，
 >
@@ -29,7 +29,6 @@
 ## 📦 Install
 
 ```bash
-git clone https://github.com/Zippland/BubbleBot.git
 cd BubbleBot
 pip install -e .
 ```
@@ -59,7 +58,7 @@ bubbles onboard
 }
 ```
 
-**3. Chat**
+**3. CLI Chat**
 
 ```bash
 bubbles agent
@@ -79,7 +78,7 @@ Connect Bubbles to your favorite chat platform.
 | **Slack** | Bot token + App-Level token |
 | **Email** | IMAP/SMTP credentials |
 | **QQ** | App ID + App Secret |
-| **WeChat** | wcferry (Windows only) |
+| **WeChat** | wcferry (**Windows only**) |
 
 ### Telegram Example
 
@@ -117,13 +116,39 @@ bubbles gateway
 
 ## CLI Reference
 
+### Core Commands
+
 | Command | Description |
 |---------|-------------|
 | `bubbles onboard` | Initialize config & workspace |
-| `bubbles agent -m "..."` | Chat with the agent |
 | `bubbles agent` | Interactive chat mode |
-| `bubbles gateway` | Start the gateway |
+| `bubbles agent -m "..." -s <session>` | Single message mode |
+| `bubbles gateway` | Start the gateway (all channels) |
 | `bubbles status` | Show status |
+| `bubbles sync-skills` | Sync skills to all sessions |
+
+### Channel Commands
+
+| Command | Description |
+|---------|-------------|
+| `bubbles channels status` | Show channel status |
+| `bubbles channels login` | Link WhatsApp via QR code |
+
+### Cron Commands
+
+| Command | Description |
+|---------|-------------|
+| `bubbles cron list` | List scheduled jobs |
+| `bubbles cron add` | Add a scheduled job |
+| `bubbles cron remove <id>` | Remove a job |
+| `bubbles cron enable <id>` | Enable/disable a job |
+| `bubbles cron run <id>` | Manually run a job |
+
+### Provider Commands
+
+| Command | Description |
+|---------|-------------|
+| `bubbles provider login <name>` | OAuth login (e.g. `openai-codex`) |
 
 ## 🐳 Docker
 
@@ -145,6 +170,10 @@ bubbles/
 └── cli/            # Commands
 ```
 
+## Acknowledgments
+
+This project is built upon [nanobot](https://github.com/HKUDS/nanobot), an ultra-lightweight personal AI assistant. Thanks to the nanobot team for the solid foundation.
+
 ## License
 
-MIT
+[MIT](LICENSE)
