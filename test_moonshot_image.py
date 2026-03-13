@@ -12,9 +12,12 @@ import httpx
 
 async def test_moonshot_image(image_path: str):
     """Test sending an image to Moonshot API directly."""
-    api_key = os.environ.get("MOONSHOT_API_KEY")
+    # Load API key from bubbles config
+    from bubbles.config.loader import load_config
+    config = load_config()
+    api_key = config.providers.moonshot.api_key if config.providers.moonshot else None
     if not api_key:
-        print("ERROR: MOONSHOT_API_KEY not set")
+        print("ERROR: Moonshot API key not configured in config.toml")
         return
 
     # Read and encode image
