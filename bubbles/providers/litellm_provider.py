@@ -163,8 +163,8 @@ class LiteLLMProvider(LLMProvider):
                 if "content" not in clean:
                     clean["content"] = None
                 # Moonshot Kimi requires reasoning_content for assistant messages with tool_calls
-                # when thinking mode is enabled. Provide empty string if missing.
-                if clean.get("tool_calls") and "reasoning_content" not in clean:
+                # when thinking mode is enabled. Provide empty string if missing or None.
+                if clean.get("tool_calls") and not clean.get("reasoning_content"):
                     clean["reasoning_content"] = ""
             sanitized.append(clean)
         return sanitized
