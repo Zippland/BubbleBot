@@ -11,7 +11,7 @@ from typing import TYPE_CHECKING, Any, Awaitable, Callable
 
 from loguru import logger
 
-from bubbles.agent.compaction import compact_session, CompactionResult, TokenTracker
+from bubbles.agent.compaction import compact_session, CompactionResult, estimate_messages_tokens
 from bubbles.agent.context import ContextBuilder
 from bubbles.agent.subagent import SubagentManager
 from bubbles.agent.tools.cron import CronTool
@@ -83,14 +83,10 @@ class AgentLoop:
         self.exec_config = exec_config or ExecToolConfig()
         self.cron_service = cron_service
 
-        # Auto-compaction: use max_tokens as output reserve
+        # Auto-compaction settings
         self.compact_threshold = compact_threshold
         self.compact_keep_recent = compact_keep_recent
         self.compact_min_messages = compact_min_messages
-        self.token_tracker = TokenTracker(
-            context_limit=context_limit,
-            output_reserve=max_tokens,  # Reserve space for output
-        )
 
         self._context_cache: dict[str, ContextBuilder] = {}  # session_key -> ContextBuilder
         self.sessions = session_manager or SessionManager()
@@ -320,8 +316,8 @@ class AgentLoop:
                 logger.warning("External stop signal received, ending agent loop")
                 break
 
-            # Auto-compaction: check if context is overflowing
-            if self.token_tracker.is_overflow(threshold=self.compact_threshold):
+            # Auto-compaction: check if context is overflowing (pre-call estimation)
+            if self._should_compact(messages):
                 messages = await self._mid_loop_compact(session, messages, on_progress)
 
             response = await self.provider.chat(
@@ -331,10 +327,6 @@ class AgentLoop:
                 temperature=temperature,
                 max_tokens=max_tokens,
             )
-
-            # Update token tracker from response usage
-            if hasattr(response, "usage") and response.usage:
-                self.token_tracker.update(response.usage)
 
             if response.has_tool_calls:
                 if on_progress:
@@ -662,6 +654,24 @@ class AgentLoop:
             session_bindings=self._get_bindings_for_session(session.key),
         )
 
+        # Entry compaction: check if context is overflowing before entering loop
+        if self._should_compact(initial_messages):
+            logger.info("Entry compaction triggered for session {}", session.key)
+            await self._do_compact(session)
+            self.sessions.save(session)
+            # Rebuild messages with compacted history
+            history = session.get_history(max_messages=self.memory_window)
+            initial_messages = context.build_messages(
+                history=history,
+                current_message=msg.content,
+                media=media,
+                channel=msg.channel, chat_id=msg.chat_id,
+                sender_id=msg.sender_id,
+                sender_name=msg.metadata.get("sender_name"),
+                system_prompt_extra=session.config.system_prompt,
+                session_bindings=self._get_bindings_for_session(session.key),
+            )
+
         # Track progress messages to detect loops
         _sent_progress: set[str] = set()
         _progress_loop_detected = False
@@ -825,6 +835,12 @@ class AgentLoop:
             session.messages.append(entry)
         session.updated_at = datetime.now()
 
+    def _should_compact(self, messages: list[dict[str, Any]]) -> bool:
+        """Check if messages exceed compact threshold based on token estimation."""
+        estimated = estimate_messages_tokens(messages)
+        usable = self.context_limit - self.max_tokens
+        return estimated > usable * self.compact_threshold
+
     async def _do_compact(self, session: Session) -> CompactionResult:
         """Compact session history using LLM-powered summarization."""
         return await compact_session(
@@ -891,9 +907,6 @@ class AgentLoop:
             channel="cli",
             chat_id="direct",
         )
-
-        # Reset token tracker (compaction reduces token count)
-        self.token_tracker.last_prompt_tokens = 0
 
         return rebuilt
 
