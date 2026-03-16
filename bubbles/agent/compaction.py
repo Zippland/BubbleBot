@@ -35,15 +35,7 @@ Keep the summary concise but complete. Use bullet points for clarity.
 {conversation}
 """
 
-MERGE_SUMMARIES_PROMPT = """Merge these partial summaries into a single cohesive summary.
-Preserve key decisions, pending tasks, and important context.
-
-## Partial summaries:
-{summaries}
-"""
-
 # Constants
-MAX_CHUNK_TOKENS = 8000
 SUMMARY_MAX_TOKENS = 1024
 FALLBACK_SUMMARY_TEMPLATE = """[Auto-compacted due to context overflow]
 
@@ -67,22 +59,24 @@ def estimate_tokens(text: str, with_margin: bool = False) -> int:
     return max(0, round(base))
 
 
+def estimate_message_tokens(msg: dict[str, Any]) -> int:
+    """Estimate tokens for a single message, including images."""
+    content = msg.get("content", "")
+    if isinstance(content, list):
+        total = 0
+        for block in content:
+            if isinstance(block, dict):
+                if block.get("type") == "image_url":
+                    total += TOKENS_PER_IMAGE
+                elif block.get("type") == "text":
+                    total += estimate_tokens(block.get("text", ""))
+        return total
+    return estimate_tokens(str(content))
+
+
 def estimate_messages_tokens(messages: list[dict[str, Any]]) -> int:
     """Estimate tokens for a list of messages, including images."""
-    total = 0
-    for m in messages:
-        content = m.get("content", "")
-        if isinstance(content, list):
-            for block in content:
-                if isinstance(block, dict):
-                    if block.get("type") == "image_url":
-                        # Image tokens based on resolution, use fixed estimate
-                        total += TOKENS_PER_IMAGE
-                    elif block.get("type") == "text":
-                        total += estimate_tokens(block.get("text", ""))
-        else:
-            total += estimate_tokens(str(content))
-    return total
+    return sum(estimate_message_tokens(m) for m in messages)
 
 
 @dataclass
@@ -160,51 +154,12 @@ def format_messages_for_summary(messages: list[dict[str, Any]]) -> str:
     return "\n\n".join(lines)
 
 
-def split_messages_into_chunks(
-    messages: list[dict[str, Any]],
-    max_chunk_tokens: int = MAX_CHUNK_TOKENS,
-) -> list[list[dict[str, Any]]]:
-    """Split messages into chunks that fit within token budget."""
-    if not messages:
-        return []
-
-    chunks: list[list[dict[str, Any]]] = []
-    current_chunk: list[dict[str, Any]] = []
-    current_tokens = 0
-
-    for msg in messages:
-        msg_text = format_message_for_summary(msg) or ""
-        msg_tokens = estimate_tokens(msg_text)
-
-        if msg_tokens >= max_chunk_tokens:
-            if current_chunk:
-                chunks.append(current_chunk)
-                current_chunk = []
-                current_tokens = 0
-            chunks.append([msg])
-            continue
-
-        if current_tokens + msg_tokens > max_chunk_tokens:
-            if current_chunk:
-                chunks.append(current_chunk)
-            current_chunk = [msg]
-            current_tokens = msg_tokens
-        else:
-            current_chunk.append(msg)
-            current_tokens += msg_tokens
-
-    if current_chunk:
-        chunks.append(current_chunk)
-
-    return chunks
-
-
-async def summarize_chunk(
+async def summarize_messages(
     messages: list[dict[str, Any]],
     provider: LLMProvider,
     model: str,
 ) -> str | None:
-    """Summarize a single chunk of messages."""
+    """Summarize messages into a concise summary."""
     conversation_text = format_messages_for_summary(messages)
     if not conversation_text.strip():
         return None
@@ -221,66 +176,68 @@ async def summarize_chunk(
         )
         return response.content or None
     except Exception as e:
-        logger.warning("Failed to summarize chunk: {}", e)
+        logger.warning("Failed to summarize messages: {}", e)
         return None
 
 
-async def merge_summaries(
-    summaries: list[str],
-    provider: LLMProvider,
-    model: str,
-) -> str | None:
-    """Merge multiple partial summaries into one."""
-    if not summaries:
-        return None
-    if len(summaries) == 1:
-        return summaries[0]
+def truncate_messages_to_token_limit(
+    messages: list[dict[str, Any]],
+    max_tokens: int,
+) -> list[dict[str, Any]]:
+    """Truncate messages from the front to fit within token limit.
 
-    combined = "\n\n---\n\n".join(f"Part {i+1}:\n{s}" for i, s in enumerate(summaries))
+    Scans from newest to oldest, stopping when:
+    - Token limit is reached, OR
+    - A compaction marker is encountered (don't cross previous compaction boundary)
+    """
+    if not messages:
+        return []
 
-    try:
-        response = await provider.chat(
-            messages=[
-                {"role": "system", "content": COMPACTION_SYSTEM_PROMPT},
-                {"role": "user", "content": MERGE_SUMMARIES_PROMPT.format(summaries=combined)},
-            ],
-            model=model,
-            max_tokens=SUMMARY_MAX_TOKENS,
-            temperature=0.3,
-        )
-        return response.content or None
-    except Exception as e:
-        logger.warning("Failed to merge summaries: {}", e)
-        return "\n\n".join(summaries)
+    result: list[dict[str, Any]] = []
+    total_tokens = 0
+
+    # Scan from newest to oldest
+    for msg in reversed(messages):
+        # Stop at compaction marker (don't cross previous boundary)
+        if is_compaction_marker(msg):
+            break
+
+        msg_tokens = estimate_message_tokens(msg)
+
+        if total_tokens + msg_tokens > max_tokens:
+            break
+
+        result.append(msg)
+        total_tokens += msg_tokens
+
+    # Reverse to restore chronological order
+    result.reverse()
+    return result
 
 
-async def summarize_in_stages(
+async def summarize_with_truncation(
     messages: list[dict[str, Any]],
     provider: LLMProvider,
     model: str,
-    max_chunk_tokens: int = MAX_CHUNK_TOKENS,
+    context_limit: int,
 ) -> str | None:
-    """Summarize messages in stages if they're too large."""
+    """Summarize messages, truncating older ones if exceeding context_limit.
+
+    Scans from newest to oldest, keeps messages within context_limit,
+    then summarizes in one LLM call.
+    """
     total_tokens = estimate_messages_tokens(messages)
 
-    if total_tokens <= max_chunk_tokens:
-        return await summarize_chunk(messages, provider, model)
+    # Truncate if too large (only summarize recent portion within context_limit)
+    if total_tokens > context_limit:
+        original_count = len(messages)
+        messages = truncate_messages_to_token_limit(messages, context_limit)
+        logger.info(
+            "Truncated {} messages to {} for summarization (context_limit: {})",
+            original_count, len(messages), context_limit
+        )
 
-    chunks = split_messages_into_chunks(messages, max_chunk_tokens)
-    logger.info("Splitting {} messages into {} chunks for staged summarization", len(messages), len(chunks))
-
-    partial_summaries: list[str] = []
-    for i, chunk in enumerate(chunks):
-        summary = await summarize_chunk(chunk, provider, model)
-        if summary:
-            partial_summaries.append(summary)
-        else:
-            partial_summaries.append(f"(Part {i+1}: {len(chunk)} messages, summarization failed)")
-
-    if not partial_summaries:
-        return None
-
-    return await merge_summaries(partial_summaries, provider, model)
+    return await summarize_messages(messages, provider, model)
 
 
 def create_fallback_summary(
@@ -298,7 +255,8 @@ async def compact_session(
     session: Session,
     provider: LLMProvider,
     model: str,
-    keep_recent: int = 10,
+    context_limit: int,
+    keep_recent: int,
     min_messages_to_compact: int = 5,
     use_fallback_on_failure: bool = True,
 ) -> CompactionResult:
@@ -308,6 +266,7 @@ async def compact_session(
         session: The session to compact
         provider: LLM provider for generating summary
         model: Model to use for summarization
+        context_limit: Max tokens to process (older messages truncated)
         keep_recent: Number of recent messages to keep (not summarize)
         min_messages_to_compact: Minimum messages required to trigger compaction
         use_fallback_on_failure: If True, use fallback summary when LLM fails
@@ -348,7 +307,7 @@ async def compact_session(
     used_fallback = False
 
     try:
-        summary = await summarize_in_stages(to_summarize, provider, model)
+        summary = await summarize_with_truncation(to_summarize, provider, model, context_limit)
     except Exception as e:
         logger.exception("Staged summarization failed: {}", e)
 

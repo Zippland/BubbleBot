@@ -118,21 +118,31 @@ class ReadFileTool(Tool):
 
             # Handle text files
             content = file_path.read_text(encoding="utf-8")
-            lines = content.splitlines()
+            all_lines = content.splitlines()
+            total_lines = len(all_lines)
 
-            # Apply line range if specified
-            actual_start = 1
-            if start_line is not None or end_line is not None:
-                start_idx = (start_line or 1) - 1
-                end_idx = end_line or len(lines)
-                lines = lines[start_idx:end_idx]
-                actual_start = (start_line or 1)
+            # Apply line range
+            actual_start = start_line or 1
+            actual_end = end_line or total_lines
+            start_idx = actual_start - 1
+            end_idx = min(actual_end, total_lines)
+            selected_lines = all_lines[start_idx:end_idx]
 
-            content = "\n".join(lines)
-            if len(content) >= 100000:
-                return "File content is too large. Please use start_line/end_line to read in chunks."
+            # Check size limit, truncate if needed
+            max_chars = 100000
+            result_lines = []
+            char_count = 0
+            for line in selected_lines:
+                line_len = len(line) + 1  # +1 for newline
+                if char_count + line_len > max_chars:
+                    break
+                result_lines.append(line)
+                char_count += line_len
 
-            return _with_line_numbers(content, start_line=actual_start)
+            content = _with_line_numbers("\n".join(result_lines), start_line=actual_start)
+            if len(result_lines) < len(selected_lines):
+                content += f"\n\n[Truncated. File has {total_lines} lines total]"
+            return content
         except PermissionError as e:
             return f"Error: {e}"
         except Exception as e:
