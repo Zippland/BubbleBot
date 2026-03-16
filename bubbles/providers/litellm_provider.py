@@ -1,12 +1,13 @@
 """LiteLLM provider implementation for multi-provider support."""
 
-import json
 import json_repair
 import os
 from typing import Any
 
+import httpx
 import litellm
 from litellm import acompletion
+from loguru import logger
 
 from bubbles.providers.base import LLMProvider, LLMResponse, ToolCallRequest
 from bubbles.providers.registry import find_by_model, find_gateway
@@ -278,3 +279,60 @@ class LiteLLMProvider(LLMProvider):
     def get_default_model(self) -> str:
         """Get the default model."""
         return self.default_model
+
+    async def estimate_tokens(
+        self,
+        messages: list[dict[str, Any]],
+        model: str | None = None,
+    ) -> int:
+        """Estimate token count, using provider API if available.
+
+        Uses provider-specific token estimation API (e.g. Kimi's endpoint)
+        when available, falls back to local estimation otherwise.
+        """
+        model = model or self.default_model
+        spec = self._gateway or find_by_model(model)
+
+        # Use provider API if available
+        if spec and spec.token_estimate_url:
+            try:
+                return await self._api_estimate_tokens(
+                    messages, model, spec.token_estimate_url
+                )
+            except Exception as e:
+                logger.warning("Token estimation API failed, using local: {}", e)
+
+        # Fallback to local estimation
+        return self._local_estimate_tokens(messages)
+
+    async def _api_estimate_tokens(
+        self,
+        messages: list[dict[str, Any]],
+        model: str,
+        url: str,
+    ) -> int:
+        """Call provider's token estimation API.
+
+        Supports Kimi-style API: POST with {model, messages} body.
+        Kimi API is fully OpenAI-compatible, supporting all roles including tool.
+        """
+        # Strip provider prefix for API call (e.g., "moonshot/kimi-k2.5" → "kimi-k2.5")
+        if "/" in model:
+            model = model.split("/", 1)[1]
+
+        # Sanitize messages for API (remove non-standard fields like timestamps)
+        sanitized = self._sanitize_messages(self._sanitize_empty_content(messages))
+
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            response = await client.post(
+                url,
+                headers={
+                    "Authorization": f"Bearer {self.api_key}",
+                    "Content-Type": "application/json",
+                },
+                json={"model": model, "messages": sanitized},
+            )
+            response.raise_for_status()
+            data = response.json()
+            # Kimi returns {"data": {"total_tokens": N}}
+            return data.get("data", {}).get("total_tokens", 0)
