@@ -805,7 +805,7 @@ class AgentLoop:
         )
 
     def _save_turn(self, session: Session, messages: list[dict], skip: int) -> None:
-        """Save new-turn messages into session, truncating large tool results."""
+        """Save new-turn messages into session, preserving images for context."""
         from datetime import datetime
         for m in messages[skip:]:
             entry = {k: v for k, v in m.items() if k != "reasoning_content"}
@@ -814,23 +814,8 @@ class AgentLoop:
                 if isinstance(content, str):
                     if len(content) > self._TOOL_RESULT_MAX_CHARS:
                         entry["content"] = content[:self._TOOL_RESULT_MAX_CHARS] + "\n... (truncated)"
-                elif isinstance(content, list):
-                    # Tool returned image content (e.g., view_image), strip base64
-                    text_parts = [c for c in content if c.get("type") == "text"]
-                    entry["content"] = text_parts[0].get("text", "[image viewed]") if text_parts else "[image viewed]"
-            if entry.get("role") == "user" and isinstance(entry.get("content"), list):
-                # Remove base64 images, keep text (which contains path descriptions)
-                text_parts = [
-                    c for c in entry["content"]
-                    if c.get("type") == "text"
-                ]
-                # Simplify to string if only text remains
-                if len(text_parts) == 1:
-                    entry["content"] = text_parts[0].get("text", "")
-                elif text_parts:
-                    entry["content"] = text_parts
-                else:
-                    entry["content"] = "[media]"
+                # 保留 tool 返回的图片（机器人主动看的图）
+            # 保留 user 消息中的图片（用户发给机器人的图）
             entry.setdefault("timestamp", datetime.now().isoformat())
             session.messages.append(entry)
         session.updated_at = datetime.now()
