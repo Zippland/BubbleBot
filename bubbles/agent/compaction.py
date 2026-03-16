@@ -46,16 +46,47 @@ If you need information from earlier in the conversation, please ask the user to
 """
 
 
-CHARS_PER_TOKEN = 0.5  # 1 char ≈ 2 tokens (conservative for CJK)
 SAFETY_MARGIN = 1.2  # 20% buffer for estimation inaccuracy
 TOKENS_PER_IMAGE = 1000  # Approximate tokens per image (medium resolution)
 
+# Token estimation ratios based on empirical testing with GPT-4/Claude tokenizers
+CJK_TOKENS_PER_CHAR = 1.5  # CJK characters: ~1.5 tokens per char
+OTHER_TOKENS_PER_CHAR = 0.25  # ASCII/Latin: ~4 chars per token
+
+
+def _is_cjk_char(char: str) -> bool:
+    """Check if a character is CJK (Chinese, Japanese, Korean)."""
+    code = ord(char)
+    return (
+        0x4E00 <= code <= 0x9FFF       # CJK Unified Ideographs
+        or 0x3400 <= code <= 0x4DBF    # CJK Extension A
+        or 0x3000 <= code <= 0x303F    # CJK Punctuation
+        or 0xFF00 <= code <= 0xFFEF    # Fullwidth Forms
+        or 0x3040 <= code <= 0x309F    # Hiragana
+        or 0x30A0 <= code <= 0x30FF    # Katakana
+        or 0xAC00 <= code <= 0xD7AF    # Korean Hangul
+    )
+
 
 def estimate_tokens(text: str, with_margin: bool = False) -> int:
-    """Estimate token count from text. Conservative: 1 char = 2 tokens."""
-    base = len(text or "") / CHARS_PER_TOKEN
+    """
+    Estimate token count from text with CJK-aware calculation.
+
+    Uses different ratios for CJK vs ASCII/Latin characters:
+    - CJK: ~1.5 tokens per character (multi-byte encoding)
+    - ASCII/Latin: ~0.25 tokens per character (4 chars = 1 token)
+    """
+    if not text:
+        return 0
+
+    cjk_count = sum(1 for c in text if _is_cjk_char(c))
+    other_count = len(text) - cjk_count
+
+    base = cjk_count * CJK_TOKENS_PER_CHAR + other_count * OTHER_TOKENS_PER_CHAR
+
     if with_margin:
         base *= SAFETY_MARGIN
+
     return max(0, round(base))
 
 
