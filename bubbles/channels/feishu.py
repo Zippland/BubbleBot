@@ -806,6 +806,9 @@ class FeishuChannel(BaseChannel):
                         if file_path:
                             media_paths.append(file_path)
                             content_parts.append(content_text)
+                # Rebuild content with quoted media descriptions
+                content = "\n".join(content_parts) if content_parts else ""
+                content = re.sub(r"@_\w+\s*", "", content).strip()
 
             if not content and not media_paths:
                 return
