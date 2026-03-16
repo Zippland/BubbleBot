@@ -596,14 +596,26 @@ class AgentLoop:
                 content=f"Nothing to compact: {result.error or 'not enough messages'}"
             )
         if cmd == "/help":
-            return OutboundMessage(channel=msg.channel, chat_id=msg.chat_id,
-                                  content="🫧 bubbles commands:\n"
-                                          "/new — Start a new conversation\n"
-                                          "/compact — Compress conversation history\n"
-                                          "/stop — Stop the current task\n"
-                                          "/session — View/switch session\n"
-                                          "/config — View/modify session config\n"
-                                          "/help — Show available commands")
+            help_text = """🫧 Bubbles Commands
+
+[会话管理]
+/new              清空对话历史，开始新会话
+/compact          压缩对话历史（生成摘要）
+/stop             停止当前正在执行的任务
+/session          查看当前绑定的 session
+/session [id]     绑定到指定 session
+/session unbind   解绑 session
+
+[Session 配置]
+/config                        查看当前配置
+/config reset                  重置为默认值
+/config model [name]           设置模型
+/config temperature [0-1]      设置温度
+/config max_tokens [n]         设置最大 token
+/config system_prompt [text]   设置自定义提示词
+
+留空 value 可重置单项，如 /config model"""
+            return OutboundMessage(channel=msg.channel, chat_id=msg.chat_id, content=help_text)
 
         # Check if we should respond (default True for backward compatibility)
         should_respond = msg.metadata.get("respond", True)
@@ -724,22 +736,27 @@ class AgentLoop:
 
         if not cmd_arg:
             # Show current session config
-            lines = [f"Session: `{session.key}`", "", "**Current config:**"]
-            lines.append(f"• model: `{cfg.model or '(default: ' + self.model + ')'}`")
-            lines.append(f"• temperature: `{cfg.temperature if cfg.temperature is not None else '(default: ' + str(self.temperature) + ')'}`")
-            lines.append(f"• max_tokens: `{cfg.max_tokens or '(default: ' + str(self.max_tokens) + ')'}`")
+            model_val = cfg.model or f"(default: {self.model})"
+            temp_val = cfg.temperature if cfg.temperature is not None else f"(default: {self.temperature})"
+            tokens_val = cfg.max_tokens or f"(default: {self.max_tokens})"
             if cfg.system_prompt:
-                preview = cfg.system_prompt[:50] + "..." if len(cfg.system_prompt) > 50 else cfg.system_prompt
-                lines.append(f"• system_prompt: `{preview}`")
+                prompt_val = cfg.system_prompt[:50] + "..." if len(cfg.system_prompt) > 50 else cfg.system_prompt
             else:
-                lines.append("• system_prompt: `(default)`")
-            lines.append("")
-            lines.append("**Usage:**")
-            lines.append("• `/config <key> <value>` — Set config")
-            lines.append("• `/config reset` — Reset to defaults")
-            lines.append("")
-            lines.append("**Keys:** model, temperature, max_tokens, system_prompt")
-            return OutboundMessage(channel=msg.channel, chat_id=msg.chat_id, content="\n".join(lines))
+                prompt_val = "(default)"
+
+            config_text = f"""Session: {session.key}
+
+[当前配置]
+model          {model_val}
+temperature    {temp_val}
+max_tokens     {tokens_val}
+system_prompt  {prompt_val}
+
+[用法]
+/config [key] [value]   设置配置
+/config [key]           重置单项为默认值
+/config reset           重置所有为默认值"""
+            return OutboundMessage(channel=msg.channel, chat_id=msg.chat_id, content=config_text)
 
         parts = cmd_arg.split(maxsplit=1)
         key = parts[0].lower()
