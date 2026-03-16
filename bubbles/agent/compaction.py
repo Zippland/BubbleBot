@@ -54,49 +54,16 @@ If you need information from earlier in the conversation, please ask the user to
 """
 
 
-CHARS_PER_TOKEN = 4
+CHARS_PER_TOKEN = 0.5  # 1 char ≈ 2 tokens (conservative for CJK)
 SAFETY_MARGIN = 1.2  # 20% buffer for estimation inaccuracy
 
 
 def estimate_tokens(text: str, with_margin: bool = False) -> int:
-    """Estimate token count from text using chars/4 heuristic."""
+    """Estimate token count from text. Conservative: 1 char = 2 tokens."""
     base = len(text or "") / CHARS_PER_TOKEN
     if with_margin:
         base *= SAFETY_MARGIN
     return max(0, round(base))
-
-
-class TokenTracker:
-    """Track token usage across API calls for automatic compaction."""
-
-    def __init__(self, context_limit: int = 128000, output_reserve: int = 4096):
-        self.context_limit = context_limit
-        self.output_reserve = output_reserve
-        self.last_prompt_tokens = 0
-        self.last_completion_tokens = 0
-        self.total_prompt_tokens = 0
-        self.total_completion_tokens = 0
-
-    def update(self, usage: dict[str, Any] | None) -> None:
-        """Update token counts from API response usage."""
-        if not usage:
-            return
-        self.last_prompt_tokens = usage.get("prompt_tokens", 0)
-        self.last_completion_tokens = usage.get("completion_tokens", 0)
-        self.total_prompt_tokens += self.last_prompt_tokens
-        self.total_completion_tokens += self.last_completion_tokens
-
-    def is_overflow(self, threshold: float = 0.85) -> bool:
-        """Check if prompt tokens exceed threshold of usable context."""
-        usable = self.context_limit - self.output_reserve
-        return self.last_prompt_tokens > usable * threshold
-
-    def reset(self) -> None:
-        """Reset all counters."""
-        self.last_prompt_tokens = 0
-        self.last_completion_tokens = 0
-        self.total_prompt_tokens = 0
-        self.total_completion_tokens = 0
 
 
 def estimate_messages_tokens(messages: list[dict[str, Any]]) -> int:
