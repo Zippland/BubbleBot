@@ -30,6 +30,7 @@ try:
         CreateMessageReactionRequestBody,
         Emoji,
         GetFileRequest,
+        GetMessageRequest,
         GetMessageResourceRequest,
         P2ImMessageReceiveV1,
     )
@@ -547,6 +548,29 @@ class FeishuChannel(BaseChannel):
             logger.exception("Error downloading {} {}", resource_type, file_key)
             return None, None
 
+    def _get_message_sync(self, message_id: str) -> tuple[str | None, dict | None]:
+        """
+        Get message details by message_id.
+
+        Returns:
+            (msg_type, content_json) - both None if request failed
+        """
+        try:
+            request = GetMessageRequest.builder().message_id(message_id).build()
+            response = self._client.im.v1.message.get(request)
+            if response.success() and response.data and response.data.items:
+                msg = response.data.items[0]
+                msg_type = msg.msg_type
+                content_json = json.loads(msg.body.content) if msg.body and msg.body.content else {}
+                logger.debug("Got parent message {}: type={}", message_id, msg_type)
+                return msg_type, content_json
+            else:
+                logger.warning("Failed to get message {}: code={}, msg={}", message_id, response.code, response.msg)
+                return None, None
+        except Exception as e:
+            logger.error("Error getting message {}: {}", message_id, e)
+            return None, None
+
     async def _download_and_save_media(
         self,
         msg_type: str,
@@ -749,6 +773,39 @@ class FeishuChannel(BaseChannel):
 
             # Remove @mention placeholders (e.g., @_user_1, @_all)
             content = re.sub(r"@_\w+\s*", "", content).strip()
+
+            # Handle quoted/replied message - download media from parent message
+            parent_id = message.parent_id
+            if parent_id:
+                loop = asyncio.get_running_loop()
+                parent_type, parent_content = await loop.run_in_executor(
+                    None, self._get_message_sync, parent_id
+                )
+                if parent_type and parent_content:
+                    if parent_type == "image":
+                        file_path, content_text = await self._download_and_save_media(
+                            "image", parent_content, parent_id, reply_to
+                        )
+                        if file_path:
+                            media_paths.append(file_path)
+                            content_parts.append(content_text)
+                    elif parent_type == "post":
+                        # Extract images from quoted post
+                        _, image_keys = _extract_post_content(parent_content)
+                        for img_key in image_keys:
+                            file_path, content_text = await self._download_and_save_media(
+                                "image", {"image_key": img_key}, parent_id, reply_to
+                            )
+                            if file_path:
+                                media_paths.append(file_path)
+                                content_parts.append(content_text)
+                    elif parent_type in ("audio", "file", "media"):
+                        file_path, content_text = await self._download_and_save_media(
+                            parent_type, parent_content, parent_id, reply_to
+                        )
+                        if file_path:
+                            media_paths.append(file_path)
+                            content_parts.append(content_text)
 
             if not content and not media_paths:
                 return
