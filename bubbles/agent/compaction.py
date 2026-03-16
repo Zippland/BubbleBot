@@ -55,35 +55,26 @@ CJK_TOKENS_PER_CHAR = 2.0  # CJK: actual ~1.5, using 2.0 for safety
 OTHER_TOKENS_PER_CHAR = 0.35  # ASCII: actual ~0.25, using 0.35 for safety
 
 
-def _is_cjk_char(char: str) -> bool:
-    """Check if a character is CJK (Chinese, Japanese, Korean)."""
-    code = ord(char)
-    return (
-        0x4E00 <= code <= 0x9FFF       # CJK Unified Ideographs
-        or 0x3400 <= code <= 0x4DBF    # CJK Extension A
-        or 0x3000 <= code <= 0x303F    # CJK Punctuation
-        or 0xFF00 <= code <= 0xFFEF    # Fullwidth Forms
-        or 0x3040 <= code <= 0x309F    # Hiragana
-        or 0x30A0 <= code <= 0x30FF    # Katakana
-        or 0xAC00 <= code <= 0xD7AF    # Korean Hangul
-    )
+def _is_high_token_char(char: str) -> bool:
+    """Check if a character likely uses more tokens (non-ASCII)."""
+    return ord(char) > 0x7F
 
 
 def estimate_tokens(text: str, with_margin: bool = False) -> int:
     """
-    Estimate token count from text with CJK-aware calculation.
+    Estimate token count with conservative non-ASCII handling.
 
-    Uses different ratios for CJK vs ASCII/Latin characters:
-    - CJK: ~1.5 tokens per character (multi-byte encoding)
-    - ASCII/Latin: ~0.25 tokens per character (4 chars = 1 token)
+    Uses different ratios:
+    - Non-ASCII (CJK, emoji, symbols): ~2.0 tokens per char (conservative)
+    - ASCII: ~0.35 tokens per char (conservative)
     """
     if not text:
         return 0
 
-    cjk_count = sum(1 for c in text if _is_cjk_char(c))
-    other_count = len(text) - cjk_count
+    high_token_count = sum(1 for c in text if _is_high_token_char(c))
+    ascii_count = len(text) - high_token_count
 
-    base = cjk_count * CJK_TOKENS_PER_CHAR + other_count * OTHER_TOKENS_PER_CHAR
+    base = high_token_count * CJK_TOKENS_PER_CHAR + ascii_count * OTHER_TOKENS_PER_CHAR
 
     if with_margin:
         base *= SAFETY_MARGIN
