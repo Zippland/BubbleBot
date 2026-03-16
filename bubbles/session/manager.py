@@ -17,6 +17,64 @@ def _is_compaction_marker(msg: dict[str, Any]) -> bool:
     return msg.get("_type") == "compaction"
 
 
+# Default number of recent images to retain when building history for LLM
+DEFAULT_KEEP_LAST_IMAGES = 5
+
+# Placeholder for pruned images
+PRUNED_IMAGE_MARKER = "[image data removed - already processed]"
+
+
+def _prune_old_images(
+    messages: list[dict[str, Any]],
+    keep_last_n: int = DEFAULT_KEEP_LAST_IMAGES,
+) -> list[dict[str, Any]]:
+    """
+    Prune old images from history, keeping only the most recent N images.
+
+    This reduces token usage when sending history to the LLM while preserving
+    enough context for follow-up questions about recent images.
+
+    Args:
+        messages: List of messages to process (will be copied, not mutated).
+        keep_last_n: Number of recent images to retain.
+
+    Returns:
+        A new list of messages with old images replaced by placeholders.
+    """
+    import copy
+
+    if keep_last_n < 0:
+        keep_last_n = 0
+
+    # Collect all image locations: (message_index, block_index)
+    image_locations: list[tuple[int, int]] = []
+
+    for msg_idx, msg in enumerate(messages):
+        content = msg.get("content")
+        if not isinstance(content, list):
+            continue
+        for block_idx, block in enumerate(content):
+            if isinstance(block, dict) and block.get("type") == "image_url":
+                image_locations.append((msg_idx, block_idx))
+
+    # Calculate how many images to prune
+    prune_count = max(0, len(image_locations) - keep_last_n)
+    if prune_count == 0:
+        return messages  # No pruning needed
+
+    # Deep copy messages to avoid mutating the original
+    result = copy.deepcopy(messages)
+
+    # Prune the oldest images (first `prune_count` in the list)
+    for i in range(prune_count):
+        msg_idx, block_idx = image_locations[i]
+        content = result[msg_idx].get("content")
+        if isinstance(content, list) and block_idx < len(content):
+            content[block_idx] = {"type": "text", "text": PRUNED_IMAGE_MARKER}
+
+    return result
+
+
 @dataclass
 class SessionConfig:
     """Session-level configuration overrides.
@@ -83,11 +141,18 @@ class Session:
         self.messages.append(msg)
         self.updated_at = datetime.now()
 
-    def get_history(self, max_messages: int = 500) -> list[dict[str, Any]]:
+    def get_history(
+        self,
+        max_messages: int = 500,
+        keep_last_images: int = DEFAULT_KEEP_LAST_IMAGES,
+    ) -> list[dict[str, Any]]:
         """Return messages for LLM input, starting after the last compaction marker.
 
         If a compaction marker exists, only messages after it are returned,
         with the summary injected as a leading system message.
+
+        Old images beyond `keep_last_images` are replaced with placeholders to
+        reduce token usage while preserving context for recent image discussions.
         """
         # Find the last compaction marker
         last_compaction_idx = -1
@@ -127,7 +192,9 @@ class Session:
                 if k in m:
                     entry[k] = m[k]
             out.append(entry)
-        return out
+
+        # Prune old images to reduce token usage, keeping recent ones for context
+        return _prune_old_images(out, keep_last_n=keep_last_images)
 
     def clear(self) -> None:
         """Clear all messages and reset session to initial state."""
