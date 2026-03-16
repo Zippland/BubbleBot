@@ -4,10 +4,6 @@ from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from typing import Any
 
-# Default token estimation constants
-CHARS_PER_TOKEN = 0.5  # 1 char ≈ 2 tokens (conservative for CJK)
-TOKENS_PER_IMAGE = 1000  # Approximate tokens per image
-
 
 @dataclass
 class ToolCallRequest:
@@ -112,39 +108,3 @@ class LLMProvider(ABC):
     def get_default_model(self) -> str:
         """Get the default model for this provider."""
         pass
-
-    async def estimate_tokens(
-        self,
-        messages: list[dict[str, Any]],
-        model: str | None = None,
-    ) -> int:
-        """Estimate token count for messages.
-
-        Default implementation uses local character-based estimation.
-        Subclasses can override to use provider-specific APIs.
-
-        Args:
-            messages: List of message dicts with 'role' and 'content'.
-            model: Model identifier (some providers need this).
-
-        Returns:
-            Estimated token count.
-        """
-        return self._local_estimate_tokens(messages)
-
-    @staticmethod
-    def _local_estimate_tokens(messages: list[dict[str, Any]]) -> int:
-        """Local character-based token estimation with image support."""
-        total = 0
-        for m in messages:
-            content = m.get("content", "")
-            if isinstance(content, list):
-                for block in content:
-                    if isinstance(block, dict):
-                        if block.get("type") == "image_url":
-                            total += TOKENS_PER_IMAGE
-                        elif block.get("type") == "text":
-                            total += int(len(block.get("text", "")) / CHARS_PER_TOKEN)
-            elif isinstance(content, str):
-                total += int(len(content) / CHARS_PER_TOKEN)
-        return total

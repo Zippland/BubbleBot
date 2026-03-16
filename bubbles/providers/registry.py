@@ -60,10 +60,6 @@ class ProviderSpec:
     # Provider supports cache_control on content blocks (e.g. Anthropic prompt caching)
     supports_prompt_caching: bool = False
 
-    # Token estimation API URL (e.g. Kimi's estimate-token-count endpoint)
-    # Empty string means use local estimation
-    token_estimate_url: str = ""
-
     @property
     def label(self) -> str:
         return self.display_name or self.name.title()
@@ -338,7 +334,6 @@ PROVIDERS: tuple[ProviderSpec, ...] = (
         model_overrides=(
             ("kimi-k2.5", {"temperature": 1.0}),
         ),
-        token_estimate_url="https://api.moonshot.cn/v1/tokenizers/estimate-token-count",
     ),
 
     # MiniMax: needs "minimax/" prefix for LiteLLM routing.

@@ -44,8 +44,6 @@ class AgentLoop:
     5. Sends responses back
     """
 
-    _TOOL_RESULT_MAX_CHARS = 500
-
     def __init__(
         self,
         bus: MessageBus,
@@ -64,7 +62,7 @@ class AgentLoop:
         channels_config: ChannelsConfig | None = None,
         # Auto-compaction settings
         compact_threshold: float = 0.85,
-        compact_keep_recent: int = 10,
+        compact_keep_recent: int = 20,
         compact_min_messages: int = 5,
     ):
         from bubbles.config.schema import ExecToolConfig
@@ -805,17 +803,10 @@ class AgentLoop:
         )
 
     def _save_turn(self, session: Session, messages: list[dict], skip: int) -> None:
-        """Save new-turn messages into session, preserving images for context."""
+        """Save new-turn messages into session."""
         from datetime import datetime
         for m in messages[skip:]:
             entry = {k: v for k, v in m.items() if k != "reasoning_content"}
-            if entry.get("role") == "tool":
-                content = entry.get("content")
-                if isinstance(content, str):
-                    if len(content) > self._TOOL_RESULT_MAX_CHARS:
-                        entry["content"] = content[:self._TOOL_RESULT_MAX_CHARS] + "\n... (truncated)"
-                # 保留 tool 返回的图片（机器人主动看的图）
-            # 保留 user 消息中的图片（用户发给机器人的图）
             entry.setdefault("timestamp", datetime.now().isoformat())
             session.messages.append(entry)
         session.updated_at = datetime.now()
@@ -832,6 +823,7 @@ class AgentLoop:
             session=session,
             provider=self.provider,
             model=self.model,
+            context_limit=self.context_limit,
             keep_recent=self.compact_keep_recent,
             min_messages_to_compact=self.compact_min_messages,
             use_fallback_on_failure=True,
