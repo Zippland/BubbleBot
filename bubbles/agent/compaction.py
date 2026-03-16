@@ -56,6 +56,7 @@ If you need information from earlier in the conversation, please ask the user to
 
 CHARS_PER_TOKEN = 0.5  # 1 char ≈ 2 tokens (conservative for CJK)
 SAFETY_MARGIN = 1.2  # 20% buffer for estimation inaccuracy
+TOKENS_PER_IMAGE = 1000  # Approximate tokens per image (medium resolution)
 
 
 def estimate_tokens(text: str, with_margin: bool = False) -> int:
@@ -67,15 +68,20 @@ def estimate_tokens(text: str, with_margin: bool = False) -> int:
 
 
 def estimate_messages_tokens(messages: list[dict[str, Any]]) -> int:
-    """Estimate tokens for a list of messages."""
+    """Estimate tokens for a list of messages, including images."""
     total = 0
     for m in messages:
         content = m.get("content", "")
         if isinstance(content, list):
-            content = " ".join(
-                block.get("text", "") for block in content if isinstance(block, dict)
-            )
-        total += estimate_tokens(str(content))
+            for block in content:
+                if isinstance(block, dict):
+                    if block.get("type") == "image_url":
+                        # Image tokens based on resolution, use fixed estimate
+                        total += TOKENS_PER_IMAGE
+                    elif block.get("type") == "text":
+                        total += estimate_tokens(block.get("text", ""))
+        else:
+            total += estimate_tokens(str(content))
     return total
 
 
