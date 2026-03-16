@@ -49,9 +49,10 @@ If you need information from earlier in the conversation, please ask the user to
 SAFETY_MARGIN = 1.2  # 20% buffer for estimation inaccuracy
 TOKENS_PER_IMAGE = 1000  # Approximate tokens per image (medium resolution)
 
-# Token estimation ratios based on empirical testing with GPT-4/Claude tokenizers
-CJK_TOKENS_PER_CHAR = 1.5  # CJK characters: ~1.5 tokens per char
-OTHER_TOKENS_PER_CHAR = 0.25  # ASCII/Latin: ~4 chars per token
+# Token estimation ratios - CONSERVATIVE to avoid context overflow
+# Actual values are lower, but we overestimate for safety
+CJK_TOKENS_PER_CHAR = 2.0  # CJK: actual ~1.5, using 2.0 for safety
+OTHER_TOKENS_PER_CHAR = 0.35  # ASCII: actual ~0.25, using 0.35 for safety
 
 
 def _is_cjk_char(char: str) -> bool:
