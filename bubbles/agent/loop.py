@@ -25,7 +25,7 @@ from bubbles.agent.tools.web import WebFetchTool, WebSearchTool
 from bubbles.bus.events import InboundMessage, OutboundMessage
 from bubbles.bus.queue import MessageBus
 from bubbles.providers.base import LLMProvider
-from bubbles.session.manager import Session, SessionConfig, SessionManager
+from bubbles.session.manager import Session, SessionConfig, SessionManager, prune_old_images_inplace
 
 if TYPE_CHECKING:
     from bubbles.config.schema import ChannelsConfig, ExecToolConfig
@@ -483,6 +483,8 @@ class AgentLoop:
                     return None
             logger.info("Processing system message from {} to session {}", msg.sender_id, key)
             session = self.sessions.get_or_create(key)
+            # 清理历史图片（每次对话入口只执行一次）
+            prune_old_images_inplace(session.messages)
             context = self._get_context(session)
             self._set_tool_context(channel, chat_id, msg.metadata.get("message_id"), session.directory, key, session)
             history = session.get_history(max_messages=self.memory_window)
@@ -569,6 +571,8 @@ class AgentLoop:
         logger.debug("Session lookup: binding_key={}, bound={}, explicit={}, final={}",
                      binding_key, bound_key, session_key, key)
         session = self.sessions.get_or_create(key)
+        # 清理历史图片（每次对话入口只执行一次）
+        prune_old_images_inplace(session.messages)
 
         # /config command - manage session-specific configuration
         if cmd_name == "/config":
