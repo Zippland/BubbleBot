@@ -18,35 +18,33 @@ def _is_compaction_marker(msg: dict[str, Any]) -> bool:
 
 
 # Default number of recent images to retain when building history for LLM
-DEFAULT_KEEP_LAST_IMAGES = 5
+DEFAULT_KEEP_LAST_IMAGES = 10
 
 # Placeholder for pruned images
-PRUNED_IMAGE_MARKER = "[image data removed - already processed]"
+PRUNED_IMAGE_MARKER = "[image data removed - already processed by model]"
 
 
-def _prune_old_images(
+def prune_old_images_inplace(
     messages: list[dict[str, Any]],
     keep_last_n: int = DEFAULT_KEEP_LAST_IMAGES,
-) -> list[dict[str, Any]]:
+) -> bool:
     """
-    Prune old images from history, keeping only the most recent N images.
+    原地清理旧图片，仅保留最近 N 张。
 
-    This reduces token usage when sending history to the LLM while preserving
-    enough context for follow-up questions about recent images.
+    应在 Agent loop 入口处显式调用，清理上一轮对话的旧图片。
+    当前轮对话的图片在 loop 过程中加入，不会被清理。
 
     Args:
-        messages: List of messages to process (will be copied, not mutated).
-        keep_last_n: Number of recent images to retain.
+        messages: 消息列表，将被原地修改。
+        keep_last_n: 保留的最近图片数量。
 
     Returns:
-        A new list of messages with old images replaced by placeholders.
+        True 如果有图片被清理，否则 False。
     """
-    import copy
-
     if keep_last_n < 0:
         keep_last_n = 0
 
-    # Collect all image locations: (message_index, block_index)
+    # 收集所有图片位置: (message_index, block_index)
     image_locations: list[tuple[int, int]] = []
 
     for msg_idx, msg in enumerate(messages):
@@ -57,22 +55,19 @@ def _prune_old_images(
             if isinstance(block, dict) and block.get("type") == "image_url":
                 image_locations.append((msg_idx, block_idx))
 
-    # Calculate how many images to prune
+    # 计算需要清理的图片数量
     prune_count = max(0, len(image_locations) - keep_last_n)
     if prune_count == 0:
-        return messages  # No pruning needed
+        return False
 
-    # Deep copy messages to avoid mutating the original
-    result = copy.deepcopy(messages)
-
-    # Prune the oldest images (first `prune_count` in the list)
+    # 原地清理最旧的图片
     for i in range(prune_count):
         msg_idx, block_idx = image_locations[i]
-        content = result[msg_idx].get("content")
+        content = messages[msg_idx].get("content")
         if isinstance(content, list) and block_idx < len(content):
             content[block_idx] = {"type": "text", "text": PRUNED_IMAGE_MARKER}
 
-    return result
+    return True
 
 
 @dataclass
@@ -141,18 +136,13 @@ class Session:
         self.messages.append(msg)
         self.updated_at = datetime.now()
 
-    def get_history(
-        self,
-        max_messages: int = 500,
-        keep_last_images: int = DEFAULT_KEEP_LAST_IMAGES,
-    ) -> list[dict[str, Any]]:
-        """Return messages for LLM input, starting after the last compaction marker.
+    def get_history(self, max_messages: int = 500) -> list[dict[str, Any]]:
+        """返回供 LLM 使用的消息历史（纯读取，无副作用）。
 
-        If a compaction marker exists, only messages after it are returned,
-        with the summary injected as a leading system message.
+        从最后一个 compaction marker 之后开始返回消息。
+        如果存在 compaction marker，会将摘要作为 system 消息注入。
 
-        Old images beyond `keep_last_images` are replaced with placeholders to
-        reduce token usage while preserving context for recent image discussions.
+        注意：图片清理应在调用此方法前由调用方显式执行。
         """
         # Find the last compaction marker
         last_compaction_idx = -1
@@ -193,8 +183,7 @@ class Session:
                     entry[k] = m[k]
             out.append(entry)
 
-        # Prune old images to reduce token usage, keeping recent ones for context
-        return _prune_old_images(out, keep_last_n=keep_last_images)
+        return out
 
     def clear(self) -> None:
         """Clear all messages and reset session to initial state."""
