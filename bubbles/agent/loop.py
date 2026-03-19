@@ -600,25 +600,13 @@ class AgentLoop:
                 content=f"Nothing to compact: {result.error or 'not enough messages'}"
             )
         if cmd == "/help":
-            help_text = """🫧 Bubbles Commands
-
-[会话管理]
-/new              清空对话历史，开始新会话
-/compact          压缩对话历史（生成摘要）
-/stop             停止当前正在执行的任务
-/session          查看当前绑定的 session
-/session [id]     绑定到指定 session
-/session unbind   解绑 session
-
-[Session 配置]
-/config                        查看当前配置
-/config reset                  重置为默认值
-/config model [name]           设置模型
-/config temperature [0-1]      设置温度
-/config max_tokens [n]         设置最大 token
-/config system_prompt [text]   设置自定义提示词
-
-留空 value 可重置单项，如 /config model"""
+            help_text = """/new - new conversation
+/compact - compress history
+/stop - stop current task
+/session [id] - bind session
+/session unbind - unbind
+/config - view/set config
+/config reset - reset all"""
             return OutboundMessage(channel=msg.channel, chat_id=msg.chat_id, content=help_text)
 
         # Check if we should respond (default True for backward compatibility)
@@ -740,26 +728,16 @@ class AgentLoop:
 
         if not cmd_arg:
             # Show current session config
-            model_val = cfg.model or f"(default: {self.model})"
-            temp_val = cfg.temperature if cfg.temperature is not None else f"(default: {self.temperature})"
-            tokens_val = cfg.max_tokens or f"(default: {self.max_tokens})"
-            if cfg.system_prompt:
-                prompt_val = cfg.system_prompt[:50] + "..." if len(cfg.system_prompt) > 50 else cfg.system_prompt
-            else:
-                prompt_val = "(default)"
+            model_val = cfg.model or self.model
+            temp_val = cfg.temperature if cfg.temperature is not None else self.temperature
+            tokens_val = cfg.max_tokens or self.max_tokens
+            prompt_val = (cfg.system_prompt[:30] + "...") if cfg.system_prompt else "-"
 
-            config_text = f"""Session: {session.key}
-
-[当前配置]
-model          {model_val}
-temperature    {temp_val}
-max_tokens     {tokens_val}
-system_prompt  {prompt_val}
-
-[用法]
-/config [key] [value]   设置配置
-/config [key]           重置单项为默认值
-/config reset           重置所有为默认值"""
+            config_text = f"""session: {session.key}
+model: {model_val}
+temperature: {temp_val}
+max_tokens: {tokens_val}
+system_prompt: {prompt_val}"""
             return OutboundMessage(channel=msg.channel, chat_id=msg.chat_id, content=config_text)
 
         parts = cmd_arg.split(maxsplit=1)
