@@ -5,9 +5,13 @@ from __future__ import annotations
 import asyncio
 import json
 import re
+import time
 from contextlib import AsyncExitStack
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Awaitable, Callable
+
+ERROR_REPLY_THROTTLE_SEC = 60.0
+DATA_CLEANUP_THROTTLE_SEC = 24 * 3600.0
 
 from loguru import logger
 
@@ -25,7 +29,13 @@ from bubbles.agent.tools.web import WebFetchTool, WebSearchTool
 from bubbles.bus.events import InboundMessage, OutboundMessage
 from bubbles.bus.queue import MessageBus
 from bubbles.providers.base import LLMProvider
-from bubbles.session.manager import Session, SessionConfig, SessionManager, prune_old_images_inplace
+from bubbles.session.manager import (
+    Session,
+    SessionConfig,
+    SessionManager,
+    cleanup_data_dir,
+    prune_old_images_inplace,
+)
 
 if TYPE_CHECKING:
     from bubbles.config.schema import ChannelsConfig, ExecToolConfig
@@ -107,6 +117,8 @@ class AgentLoop:
         self._session_bindings: dict[str, str] = {}  # {channel}:{chat_id} -> custom session key
         self._load_session_bindings()
         self._active_tasks: dict[str, list[asyncio.Task]] = {}  # session_key -> tasks
+        self._last_error_reply_at: dict[str, float] = {}  # session_key -> monotonic ts of last user-visible error reply
+        self._last_data_cleanup_at: dict[str, float] = {}  # session_key -> monotonic ts of last data/ cleanup
         self._processing_lock = asyncio.Lock()
         self.on_tool_call: Callable[[str, dict, str | None], Awaitable[None]] | None = None  # Debug callback
         self._register_default_tools()
@@ -388,6 +400,11 @@ class AgentLoop:
         """Run the agent loop, dispatching messages as tasks to stay responsive to /stop."""
         self._running = True
         await self._connect_mcp()
+        # Sweep stale files in every session's data/ directory at startup (SPEC §5.4).
+        try:
+            self.sessions.cleanup_all_data_dirs()
+        except Exception as e:
+            logger.warning("Startup data/ cleanup failed: {}", e)
         logger.info("Agent loop started")
 
         while self._running:
@@ -421,6 +438,7 @@ class AgentLoop:
 
     async def _dispatch(self, msg: InboundMessage) -> None:
         """Process a message under the global lock."""
+        self._maybe_cleanup_session_data(msg.session_key)
         async with self._processing_lock:
             try:
                 response = await self._process_message(msg, on_tool_call=self.on_tool_call)
@@ -436,10 +454,47 @@ class AgentLoop:
                 raise
             except Exception:
                 logger.exception("Error processing message for session {}", msg.session_key)
-                await self.bus.publish_outbound(OutboundMessage(
-                    channel=msg.channel, chat_id=msg.chat_id,
-                    content="Sorry, I encountered an error.",
-                ))
+                await self._emit_error_reply(msg)
+
+    def _maybe_cleanup_session_data(self, session_key: str) -> None:
+        """Sweep stale files in this session's data/ once per DATA_CLEANUP_THROTTLE_SEC (SPEC §5.4)."""
+        now = time.monotonic()
+        if (now - self._last_data_cleanup_at.get(session_key, 0.0)) < DATA_CLEANUP_THROTTLE_SEC:
+            return
+        self._last_data_cleanup_at[session_key] = now
+        try:
+            session_dir = self.sessions._get_session_dir(session_key)
+            removed = cleanup_data_dir(session_dir)
+            if removed:
+                logger.info("Cleaned {} stale data/ files for session {}", removed, session_key)
+        except Exception as e:
+            logger.warning("Runtime data/ cleanup failed for session {}: {}", session_key, e)
+
+    async def _emit_error_reply(self, msg: InboundMessage) -> None:
+        """Send a user-visible error reply per SPEC §5.1 error policy.
+
+        Group chats stay silent; private chats get one fixed message, throttled per
+        session_key. CLI always publishes something so the interactive turn can finish.
+        """
+        is_group = bool(msg.metadata and (
+            msg.metadata.get("is_group")
+            or msg.metadata.get("chat_type") == "group"
+        ))
+        now = time.monotonic()
+        throttled = (now - self._last_error_reply_at.get(msg.session_key, 0.0)) < ERROR_REPLY_THROTTLE_SEC
+
+        if not is_group and not throttled:
+            self._last_error_reply_at[msg.session_key] = now
+            await self.bus.publish_outbound(OutboundMessage(
+                channel=msg.channel, chat_id=msg.chat_id,
+                content="Sorry, I encountered an error.",
+            ))
+        elif msg.channel == "cli":
+            # Unblock the interactive prompt's turn_done waiter even when silent.
+            await self.bus.publish_outbound(OutboundMessage(
+                channel=msg.channel, chat_id=msg.chat_id,
+                content="", metadata=msg.metadata or {},
+            ))
 
     async def close_mcp(self) -> None:
         """Close MCP connections."""

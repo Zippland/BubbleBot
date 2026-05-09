@@ -2,6 +2,7 @@
 
 import json
 import shutil
+import time
 from pathlib import Path
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -10,6 +11,34 @@ from typing import Any
 from loguru import logger
 
 from bubbles.utils.helpers import ensure_dir, safe_filename
+
+
+# Files in <session>/data/ older than this are auto-cleaned (SPEC §5.4).
+DATA_DIR_TTL_SECONDS = 3 * 86400
+
+
+def cleanup_data_dir(session_dir: Path, max_age_seconds: float = DATA_DIR_TTL_SECONDS) -> int:
+    """Delete files under <session_dir>/data/ whose mtime is older than the TTL.
+
+    Returns the number of files removed. Errors are logged and swallowed —
+    cleanup must never break message processing.
+    """
+    data_dir = session_dir / "data"
+    if not data_dir.is_dir():
+        return 0
+
+    cutoff = time.time() - max_age_seconds
+    removed = 0
+    for path in data_dir.rglob("*"):
+        if not path.is_file():
+            continue
+        try:
+            if path.stat().st_mtime < cutoff:
+                path.unlink()
+                removed += 1
+        except OSError as e:
+            logger.warning("Failed to remove stale data file {}: {}", path, e)
+    return removed
 
 
 def _is_compaction_marker(msg: dict[str, Any]) -> bool:
@@ -391,6 +420,21 @@ class SessionManager:
     def invalidate(self, key: str) -> None:
         """Remove a session from the in-memory cache."""
         self._cache.pop(key, None)
+
+    def cleanup_all_data_dirs(self, max_age_seconds: float = DATA_DIR_TTL_SECONDS) -> int:
+        """Sweep <session>/data/ across every existing session and remove stale files.
+
+        Returns the total number of files removed across all sessions.
+        """
+        if not self.sessions_dir.is_dir():
+            return 0
+        total = 0
+        for child in self.sessions_dir.iterdir():
+            if child.is_dir():
+                total += cleanup_data_dir(child, max_age_seconds)
+        if total:
+            logger.info("Cleaned up {} stale files from session data/ directories", total)
+        return total
     
     def list_sessions(self) -> list[dict[str, Any]]:
         """
