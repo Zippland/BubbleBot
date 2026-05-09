@@ -89,6 +89,7 @@ class ContextBuilder:
 - If the /data directory does not exist, create it before use.
 - Temporary and one-off intermediate files must be deleted immediately after use. Keep the /data directory clean.
 - Before writing a file, confirm the target path to avoid accidentally overwriting existing files.
+- Files in <work_dir>/data are auto-deleted after 3 days of inactivity. Persist long-term facts in MEMORY.md, not in files.
 
 ## Message Context
 Reply directly with text for conversations. Only use the 'message' tool to send to a specific channel.
