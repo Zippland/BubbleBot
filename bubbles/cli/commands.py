@@ -7,6 +7,15 @@ from pathlib import Path
 import select
 import sys
 
+# Force UTF-8 on stdio before rich touches it — otherwise on Windows zh_CN consoles
+# (cp936/GBK) the 🫧 logo in __logo__ crashes the whole CLI via UnicodeEncodeError.
+for _stream in (sys.stdout, sys.stderr):
+    if _stream is not None and hasattr(_stream, "reconfigure"):
+        try:
+            _stream.reconfigure(encoding="utf-8", errors="replace")
+        except (AttributeError, OSError):
+            pass
+
 import typer
 from rich.console import Console
 from rich.markdown import Markdown
