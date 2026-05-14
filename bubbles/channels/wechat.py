@@ -272,11 +272,15 @@ class WeChatChannel(BaseChannel):
 
         try:
             if media_type == "image":
-                # Download image
+                logger.debug(
+                    "wcf.download_image start msg_id={} extra={!r} media_dir={} timeout=30",
+                    msg.id, msg.extra, media_dir,
+                )
                 file_path = await loop.run_in_executor(
                     None,
                     lambda: self.wcf.download_image(msg.id, msg.extra, str(media_dir), timeout=30)
                 )
+                logger.debug("wcf.download_image returned: {!r}", file_path)
                 if file_path:
                     filename = os.path.basename(file_path)
 
@@ -301,10 +305,19 @@ class WeChatChannel(BaseChannel):
             if file_path and os.path.exists(file_path):
                 logger.debug("Downloaded {} to {}", media_type, file_path)
                 return file_path, f"[{media_type}: <work_dir>/data/{filename}]"
+            if media_type == "image" and file_path:
+                logger.warning(
+                    "wcf.download_image returned path but file not found: {}", file_path,
+                )
 
         except Exception as e:
             logger.error("Error downloading {}: {}", media_type, e)
 
+        if media_type == "image":
+            logger.warning(
+                "Image download gave up: msg_id={}, extra_present={}, last_return={!r}",
+                msg.id, bool(msg.extra), file_path,
+            )
         return None, f"[{media_type}: download failed]"
 
     def _find_file_in_wechat_storage(self, filename: str) -> str | None:
