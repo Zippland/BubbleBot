@@ -821,7 +821,8 @@ class FeishuChannel(BaseChannel):
                 media=media_paths,
                 metadata={
                     "message_id": message_id,
-                    "chat_type": chat_type,
+                    "is_group": chat_type == "group",  # SPEC §5.2 item 4 标准字段
+                    "chat_type": chat_type,            # 旧字段，保留兼容
                     "msg_type": msg_type,
                 }
             )
