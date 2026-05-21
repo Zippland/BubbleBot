@@ -331,15 +331,15 @@ def gateway(
     heartbeat = GroupHeartbeat(
         agent_loop=agent,
         session_manager=session_manager,
-        interval_seconds=hb_cfg.interval_minutes * 60,
+        default_interval_minutes=hb_cfg.interval_minutes,
         history_window=hb_cfg.history_window,
         max_concurrent=hb_cfg.max_concurrent,
     )
     agent.group_heartbeat = heartbeat
     console.print(
         f"[green]✓[/green] Group heartbeat ready "
-        f"(interval={hb_cfg.interval_minutes}m, max_concurrent={hb_cfg.max_concurrent}; "
-        f"enable per-group via @bot /heartbeat on)"
+        f"(default_interval={hb_cfg.interval_minutes}m, max_concurrent={hb_cfg.max_concurrent}; "
+        f"enable per-group via @bot /heartbeat on [minutes])"
     )
 
     async def run():

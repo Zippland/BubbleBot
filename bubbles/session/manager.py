@@ -114,6 +114,9 @@ class SessionConfig:
     # Per-session opt-in for group heartbeat lurking (SPEC §5.2 item 3).
     # Only meaningful for group sessions; toggled via /heartbeat on|off.
     heartbeat_enabled: bool = False
+    # Per-session interval override in minutes. None = use global default
+    # (agents.defaults.group_heartbeat.interval_minutes).
+    heartbeat_interval_minutes: int | None = None
 
     def to_dict(self) -> dict[str, Any]:
         """Convert to dict, excluding None values."""
@@ -126,11 +129,14 @@ class SessionConfig:
         }.items() if v is not None}
         if self.heartbeat_enabled:
             out["heartbeat_enabled"] = True
+        if self.heartbeat_interval_minutes is not None:
+            out["heartbeat_interval_minutes"] = self.heartbeat_interval_minutes
         return out
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> "SessionConfig":
         """Create from dict."""
+        raw_interval = data.get("heartbeat_interval_minutes")
         return cls(
             provider=data.get("provider"),
             model=data.get("model"),
@@ -138,6 +144,7 @@ class SessionConfig:
             max_tokens=data.get("max_tokens"),
             system_prompt=data.get("system_prompt"),
             heartbeat_enabled=bool(data.get("heartbeat_enabled", False)),
+            heartbeat_interval_minutes=int(raw_interval) if isinstance(raw_interval, (int, float)) else None,
         )
 
 
@@ -443,15 +450,16 @@ class SessionManager:
             logger.info("Cleaned up {} stale files from session data/ directories", total)
         return total
     
-    def list_heartbeat_enabled_groups(self) -> list[str]:
-        """Return session_keys whose stored config has heartbeat_enabled=true.
+    def list_heartbeat_enabled_groups(self) -> list[dict[str, Any]]:
+        """Return heartbeat info for every session that opted in.
 
-        Reads only the metadata header of each session.jsonl, never the full message history,
-        so this is safe to call from the heartbeat tick at any frequency.
+        Each entry: ``{"key": str, "interval_minutes": int | None, "last_heartbeat_at": str | None}``.
+        Reads only the metadata header of each session.jsonl (not the full message history),
+        so this is cheap to call from the heartbeat poll loop.
         """
         if not self.sessions_dir.is_dir():
             return []
-        result: list[str] = []
+        result: list[dict[str, Any]] = []
         for child in self.sessions_dir.iterdir():
             if not child.is_dir():
                 continue
@@ -467,9 +475,17 @@ class SessionManager:
                 if data.get("_type") != "metadata":
                     continue
                 cfg = data.get("config") or {}
-                if cfg.get("heartbeat_enabled"):
-                    key = data.get("key") or child.name.replace("_", ":", 1)
-                    result.append(key)
+                if not cfg.get("heartbeat_enabled"):
+                    continue
+                key = data.get("key") or child.name.replace("_", ":", 1)
+                raw_interval = cfg.get("heartbeat_interval_minutes")
+                interval = int(raw_interval) if isinstance(raw_interval, (int, float)) else None
+                last = (data.get("metadata") or {}).get("last_heartbeat_at")
+                result.append({
+                    "key": key,
+                    "interval_minutes": interval,
+                    "last_heartbeat_at": last if isinstance(last, str) else None,
+                })
             except Exception as e:
                 logger.warning("Failed to read session metadata in {}: {}", child, e)
         return result

@@ -569,6 +569,21 @@ class AgentLoop:
         cmd_name = cmd_parts[0].lower() if cmd_parts else ""
         cmd_arg = cmd_parts[1] if len(cmd_parts) > 1 else ""
 
+        # In groups, commands with side effects must require @bot — otherwise anyone in
+        # the group could fire /new, /config reset, /session, /heartbeat etc. /help is
+        # read-only so we allow it without @. /stop is handled even earlier in agent.run()
+        # and is intentionally permissive (emergency brake).
+        should_respond = msg.metadata.get("respond", True)
+        _SAFE_NO_AT = {"/help"}
+        if (
+            not should_respond
+            and cmd_name.startswith("/")
+            and cmd_name not in _SAFE_NO_AT
+        ):
+            cmd = ""
+            cmd_name = ""
+            cmd_arg = ""
+
         # Check session binding
         binding_key = f"{msg.channel}:{msg.chat_id}"
         bound_key = self._session_bindings.get(binding_key)
@@ -613,6 +628,10 @@ class AgentLoop:
 
         # Require session binding before chatting (except CLI)
         if msg.channel != "cli" and not bound_key:
+            if not should_respond:
+                # Stay silent in groups when bot wasn't @'d and there's no session yet —
+                # don't reply "请先 /session", don't create a stray session either.
+                return None
             return OutboundMessage(
                 channel=msg.channel, chat_id=msg.chat_id,
                 content="⚠️ 无权限\n\n请先使用/session <name> 绑定工作区。"
@@ -667,10 +686,8 @@ class AgentLoop:
 /heartbeat on|off|status - group lurking (groups only)"""
             return OutboundMessage(channel=msg.channel, chat_id=msg.chat_id, content=help_text)
 
-        # Check if we should respond (default True for backward compatibility)
-        should_respond = msg.metadata.get("respond", True)
-
-        # If not responding, just save the message to history and return
+        # should_respond was computed at the top of this method (around the command-gate).
+        # If not responding, just save the message to history and return.
         if not should_respond:
             # Move media files to session directory if present
             media = self._relocate_media_to_session(msg.media, session) if msg.media else None
@@ -872,34 +889,153 @@ system_prompt: {prompt_val}"""
     def _handle_heartbeat_command(
         self, msg: InboundMessage, session: Session, cmd_arg: str
     ) -> OutboundMessage:
-        """Toggle / inspect heartbeat lurking for the current group session (SPEC §5.2 item 3)."""
+        """Toggle / inspect heartbeat lurking for the current group session (SPEC §5.2 item 3).
+
+        Accepted forms (case-insensitive):
+            /heartbeat                  → status
+            /heartbeat status           → status
+            /heartbeat on               → enable, keep existing interval override (or use default)
+            /heartbeat on <minutes>     → enable, set per-session interval override
+            /heartbeat <minutes>        → shortcut for "/heartbeat on <minutes>"
+            /heartbeat off              → disable (interval override is remembered for next on)
+        """
         is_group = bool(msg.metadata and msg.metadata.get("is_group"))
         if not is_group:
             return OutboundMessage(
                 channel=msg.channel, chat_id=msg.chat_id,
                 content="心跳潜水只对群聊有意义，私聊不需要。",
             )
-        arg = cmd_arg.strip().lower()
-        if arg == "on":
-            session.config.heartbeat_enabled = True
-            self.sessions.save(session)
-            interval = getattr(self.group_heartbeat, "interval_minutes", None) or "?"
-            return OutboundMessage(
-                channel=msg.channel, chat_id=msg.chat_id,
-                content=f"心跳潜水已开启，每 {interval} 分钟扫一次。",
-            )
-        if arg == "off":
+
+        default_interval = getattr(self.group_heartbeat, "default_interval_minutes", None)
+        parts = cmd_arg.strip().lower().split()
+
+        def _reply(text: str) -> OutboundMessage:
+            return OutboundMessage(channel=msg.channel, chat_id=msg.chat_id, content=text)
+
+        def _parse_minutes(s: str) -> int | None:
+            try:
+                v = int(s)
+                return v if v >= 1 else None
+            except (ValueError, TypeError):
+                return None
+
+        # /heartbeat / /heartbeat status
+        if not parts or parts[0] == "status":
+            return _reply(self._format_heartbeat_status(session, default_interval))
+
+        head = parts[0]
+        rest = parts[1:]
+
+        # /heartbeat off  (any trailing args ignored)
+        if head == "off":
+            was_on = session.config.heartbeat_enabled
             session.config.heartbeat_enabled = False
             self.sessions.save(session)
-            return OutboundMessage(
-                channel=msg.channel, chat_id=msg.chat_id,
-                content="心跳潜水已关闭。",
-            )
-        on = bool(session.config.heartbeat_enabled)
-        return OutboundMessage(
-            channel=msg.channel, chat_id=msg.chat_id,
-            content=f"心跳潜水：{'开启' if on else '关闭'}",
+            override = session.config.heartbeat_interval_minutes
+            lines = ["✓ 心跳潜水已关闭"]
+            if not was_on:
+                lines.append("（此前本就是关闭状态）")
+            else:
+                lines.append("此后该群里没 @ 的消息不会再触发主动判决，纯静默入历史。")
+                if override:
+                    lines.append(f"保留的间隔设置: {override} 分钟（下次 /heartbeat on 不带数字会复用）")
+            lines.append("")
+            lines.append("查看状态: /heartbeat status")
+            lines.append("重新开启: /heartbeat on [minutes]")
+            return _reply("\n".join(lines))
+
+        # /heartbeat on [minutes]  OR  /heartbeat <minutes>  (shortcut)
+        if head == "on":
+            new_interval: int | None = None
+            if rest:
+                new_interval = _parse_minutes(rest[0])
+                if new_interval is None:
+                    return _reply(
+                        f"参数无效: `{rest[0]}` 不是合法的分钟数。\n"
+                        "用法: /heartbeat on [minutes]   minutes 必须是 >= 1 的整数"
+                    )
+            return _reply(self._apply_heartbeat_on(session, new_interval, default_interval))
+
+        # /heartbeat <minutes>  (numeric shortcut; implies on)
+        if (m := _parse_minutes(head)) is not None and not rest:
+            return _reply(self._apply_heartbeat_on(session, m, default_interval))
+
+        return _reply(
+            f"未识别的参数: `{cmd_arg.strip()}`。\n"
+            "用法:\n"
+            "  /heartbeat [status]    查看当前状态\n"
+            "  /heartbeat on          按当前/全局间隔开启\n"
+            "  /heartbeat on <分钟>   开启并设置间隔\n"
+            "  /heartbeat <分钟>      同上（数字快捷形式）\n"
+            "  /heartbeat off         关闭"
         )
+
+    def _apply_heartbeat_on(
+        self, session: Session, new_interval: int | None, default_interval: int | None,
+    ) -> str:
+        """Turn on heartbeat for this session; return a detailed user-facing reply."""
+        was_on = session.config.heartbeat_enabled
+        prev_override = session.config.heartbeat_interval_minutes
+        session.config.heartbeat_enabled = True
+        if new_interval is not None:
+            session.config.heartbeat_interval_minutes = new_interval
+        self.sessions.save(session)
+
+        effective = session.config.heartbeat_interval_minutes or default_interval or "?"
+        is_override = session.config.heartbeat_interval_minutes is not None
+
+        if was_on:
+            if new_interval is not None:
+                if prev_override == new_interval:
+                    head = f"心跳潜水保持开启（间隔仍为 {effective} 分钟）"
+                else:
+                    head = f"✓ 心跳潜水间隔已更新为 {effective} 分钟"
+            else:
+                head = f"心跳潜水保持开启，每 {effective} 分钟扫一次"
+        else:
+            head = f"✓ 心跳潜水已开启，每 {effective} 分钟扫一次"
+
+        lines = [head]
+        if is_override:
+            lines.append(f"（本群自定义间隔；全局默认是 {default_interval} 分钟）")
+        else:
+            lines.append("（使用全局默认间隔；可用 /heartbeat on <分钟> 单独覆盖）")
+        lines.append("")
+        lines.append("行为: bot 每个周期扫一次自上次扫描以来的群里新消息，自己判断要不要插话。")
+        lines.append(f"首次真实判决: 启用后下一个周期建立水位，再下一个周期（≈ {effective} 分钟后）开始判决。")
+        lines.append("")
+        lines.append("查看状态: /heartbeat status")
+        lines.append("关闭: /heartbeat off")
+        return "\n".join(lines)
+
+    def _format_heartbeat_status(
+        self, session: Session, default_interval: int | None,
+    ) -> str:
+        """Render status reply with effective interval + watermark."""
+        on = bool(session.config.heartbeat_enabled)
+        override = session.config.heartbeat_interval_minutes
+        effective = override or default_interval or "?"
+        last = session.metadata.get("last_heartbeat_at")
+
+        lines = [f"心跳潜水: {'开启' if on else '关闭'}"]
+        if on:
+            lines.append(
+                f"扫描间隔: {effective} 分钟"
+                + ("（本群自定义）" if override else "（全局默认）")
+            )
+            if last:
+                lines.append(f"上次扫描: {last}")
+            else:
+                lines.append("上次扫描: 尚未（启用后等下一个周期建水位）")
+        else:
+            if override:
+                lines.append(f"保留的间隔设置: {override} 分钟（下次 on 不带数字会复用）")
+        lines.append("")
+        lines.append("用法:")
+        lines.append("  /heartbeat on [<分钟>]  开启")
+        lines.append("  /heartbeat <分钟>        开启并设置间隔（数字快捷形式）")
+        lines.append("  /heartbeat off           关闭")
+        return "\n".join(lines)
 
     @staticmethod
     def _format_heartbeat_prompt(unread_items: list[dict]) -> str:
