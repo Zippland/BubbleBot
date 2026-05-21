@@ -218,7 +218,7 @@ class GroupHeartbeatConfig(Base):
     These are tuning knobs for an already-running service.
     """
 
-    interval_minutes: int = 5
+    interval_minutes: int = 30
     history_window: int = 20  # Most recent group messages shown to the model on tick
     max_concurrent: int = 3   # Concurrency cap per tick across groups
 
