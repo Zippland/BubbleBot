@@ -320,14 +320,32 @@ def gateway(
         console.print(f"[green]✓[/green] Channels enabled: {', '.join(channels.enabled_channels)}")
     else:
         console.print("[yellow]Warning: No channels enabled[/yellow]")
-    
+
     cron_status = cron.status()
     if cron_status["jobs"] > 0:
         console.print(f"[green]✓[/green] Cron: {cron_status['jobs']} scheduled jobs")
 
+    # Group-chat heartbeat (SPEC §5.2 item 3): always running; per-group opt-in via /heartbeat on.
+    from bubbles.agent.group_heartbeat import GroupHeartbeat
+    hb_cfg = config.agents.defaults.group_heartbeat
+    heartbeat = GroupHeartbeat(
+        agent_loop=agent,
+        session_manager=session_manager,
+        interval_seconds=hb_cfg.interval_minutes * 60,
+        history_window=hb_cfg.history_window,
+        max_concurrent=hb_cfg.max_concurrent,
+    )
+    agent.group_heartbeat = heartbeat
+    console.print(
+        f"[green]✓[/green] Group heartbeat ready "
+        f"(interval={hb_cfg.interval_minutes}m, max_concurrent={hb_cfg.max_concurrent}; "
+        f"enable per-group via @bot /heartbeat on)"
+    )
+
     async def run():
         try:
             await cron.start()
+            await heartbeat.start()
             await asyncio.gather(
                 agent.run(),
                 channels.start_all(),
@@ -335,11 +353,12 @@ def gateway(
         except KeyboardInterrupt:
             console.print("\nShutting down...")
         finally:
+            await heartbeat.stop()
             await agent.close_mcp()
             cron.stop()
             agent.stop()
             await channels.stop_all()
-    
+
     asyncio.run(run())
 
 

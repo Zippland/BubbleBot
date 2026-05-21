@@ -121,6 +121,8 @@ class AgentLoop:
         self._last_data_cleanup_at: dict[str, float] = {}  # session_key -> monotonic ts of last data/ cleanup
         self._processing_lock = asyncio.Lock()
         self.on_tool_call: Callable[[str, dict, str | None], Awaitable[None]] | None = None  # Debug callback
+        # Optional group-chat heartbeat service; gateway attaches when enabled (SPEC §5.2 item 3).
+        self.group_heartbeat: Any | None = None
         self._register_default_tools()
 
     def _register_default_tools(self) -> None:
@@ -661,7 +663,8 @@ class AgentLoop:
 /session [id] - bind session
 /session unbind - unbind
 /config - view/set config
-/config reset - reset all"""
+/config reset - reset all
+/heartbeat on|off|status - group lurking (groups only)"""
             return OutboundMessage(channel=msg.channel, chat_id=msg.chat_id, content=help_text)
 
         # Check if we should respond (default True for backward compatibility)
@@ -688,7 +691,17 @@ class AgentLoop:
             session.messages.append(entry)
             self.sessions.save(session)
             logger.debug("Saved non-respond message to history: {}", msg.content[:50])
+            # Tell the heartbeat service this group has activity + remember its outbound route.
+            if msg.metadata.get("is_group") and self.group_heartbeat is not None:
+                try:
+                    self.group_heartbeat.note_outbound_route(key, msg.channel, msg.chat_id)
+                except Exception:
+                    logger.exception("group_heartbeat.note_outbound_route failed")
             return None
+
+        # /heartbeat command — only reachable when should_respond=True (i.e. @ in groups).
+        if cmd_name == "/heartbeat":
+            return self._handle_heartbeat_command(msg, session, cmd_arg)
 
         # Move media files to correct session directory if needed (handles session binding)
         media = self._relocate_media_to_session(msg.media, session) if msg.media else None
@@ -855,6 +868,215 @@ system_prompt: {prompt_val}"""
             channel=msg.channel, chat_id=msg.chat_id,
             content=f"Unknown config key: `{key}`\n\nValid keys: provider, model, temperature, max_tokens, system_prompt"
         )
+
+    def _handle_heartbeat_command(
+        self, msg: InboundMessage, session: Session, cmd_arg: str
+    ) -> OutboundMessage:
+        """Toggle / inspect heartbeat lurking for the current group session (SPEC §5.2 item 3)."""
+        is_group = bool(msg.metadata and msg.metadata.get("is_group"))
+        if not is_group:
+            return OutboundMessage(
+                channel=msg.channel, chat_id=msg.chat_id,
+                content="心跳潜水只对群聊有意义，私聊不需要。",
+            )
+        arg = cmd_arg.strip().lower()
+        if arg == "on":
+            session.config.heartbeat_enabled = True
+            self.sessions.save(session)
+            interval = getattr(self.group_heartbeat, "interval_minutes", None) or "?"
+            return OutboundMessage(
+                channel=msg.channel, chat_id=msg.chat_id,
+                content=f"心跳潜水已开启，每 {interval} 分钟扫一次。",
+            )
+        if arg == "off":
+            session.config.heartbeat_enabled = False
+            self.sessions.save(session)
+            return OutboundMessage(
+                channel=msg.channel, chat_id=msg.chat_id,
+                content="心跳潜水已关闭。",
+            )
+        on = bool(session.config.heartbeat_enabled)
+        return OutboundMessage(
+            channel=msg.channel, chat_id=msg.chat_id,
+            content=f"心跳潜水：{'开启' if on else '关闭'}",
+        )
+
+    @staticmethod
+    def _format_heartbeat_prompt(unread_items: list[dict]) -> str:
+        """Synthesize the user message that drives a heartbeat-triggered turn.
+
+        ``unread_items`` are the user-role history dicts newer than the last scan,
+        each with ``content`` already prefixed by ``[sender_name]:``.
+        """
+        from datetime import datetime
+        now = datetime.now().isoformat(timespec="seconds")
+        lines: list[str] = []
+        for m in unread_items:
+            ts_raw = m.get("timestamp", "")
+            try:
+                t = datetime.fromisoformat(ts_raw).strftime("%H:%M")
+            except Exception:
+                t = "??:??"
+            lines.append(f"[{t}] {m.get('content', '')}")
+        new_block = "\n".join(lines) if lines else "(none)"
+        return (
+            f"[心跳扫描 @ {now}]\n\n"
+            "你在群里潜水。下面这几条是上次扫描后新进来的消息：\n\n"
+            f"{new_block}\n\n"
+            "上面 history 部分（这次 turn 的前面那些 messages）是群里更早的对话供参考，"
+            "**但你这次要判断的只是上面这一段新消息**。不要回头翻旧话题主动接茬。\n\n"
+            "默认不插话。只有当你能贡献别人没说过、且明显有用的信息时再开口——"
+            "回答具体问题、纠正明显错误、提供新信息。不要附和、不要重复别人说过的话、"
+            "不要为了刷存在感开口。\n\n"
+            "判断结果：\n"
+            "- 该插话 → 直接正常回复，回复会被发到群里。\n"
+            "- 不该插话 → 调 pass_heartbeat() 然后结束。"
+        )
+
+    async def run_heartbeat(
+        self,
+        *,
+        session_key: str,
+        channel: str,
+        chat_id: str,
+        history_window: int,
+    ) -> None:
+        """Heartbeat-triggered scan for a group chat (SPEC §5.2 item 3).
+
+        Runs one full agent turn with the ``pass_heartbeat`` tool temporarily registered.
+        If the model calls that tool, nothing is sent. Otherwise the reply goes to
+        (channel, chat_id) like a normal response.
+
+        Watermark (``last_heartbeat_at``) lives in ``session.metadata`` so it survives
+        gateway restarts; messages that arrived before a crash but after the last persisted
+        scan are still considered unread on next boot.
+        """
+        from datetime import datetime
+        from bubbles.agent.tools.pass_heartbeat import PassHeartbeatTool
+
+        async with self._processing_lock:
+            session = self.sessions.get_or_create(session_key)
+
+            last_iso = session.metadata.get("last_heartbeat_at")
+            last_scanned_at: datetime | None = None
+            if last_iso:
+                try:
+                    last_scanned_at = datetime.fromisoformat(last_iso)
+                except Exception:
+                    last_scanned_at = None
+
+            # First-ever scan only establishes the watermark — never invokes the LLM on
+            # an unbounded history slice. Persist immediately so a crash here doesn't
+            # cause the next boot to re-establish a watermark that skips real messages.
+            if last_scanned_at is None:
+                session.metadata["last_heartbeat_at"] = datetime.now().isoformat()
+                self.sessions.save(session)
+                logger.debug(
+                    "heartbeat: first scan for {}, watermark established, no LLM call",
+                    session_key,
+                )
+                return
+
+            prune_old_images_inplace(session.messages)
+            history = session.get_history(max_messages=history_window)
+
+            def _ts_of(m: dict) -> datetime | None:
+                t = m.get("timestamp")
+                if not t:
+                    return None
+                try:
+                    return datetime.fromisoformat(t)
+                except Exception:
+                    return None
+
+            # Collect the actual unread user messages — these get embedded into the
+            # synthetic prompt so the model doesn't have to infer "new vs old" itself.
+            unread_items: list[dict] = []
+            for m in history:
+                if m.get("role") != "user":
+                    continue
+                ts = _ts_of(m)
+                if ts is not None and ts > last_scanned_at:
+                    unread_items.append(m)
+            # No unread → do NOT advance the watermark. If we advanced here and a message
+            # arrived between this tick and the next, it would be silently skipped.
+            if not unread_items:
+                logger.debug("heartbeat: no unread for {}, skip", session_key)
+                return
+
+            logger.info(
+                "heartbeat tick: scanning {} (unread={})", session_key, len(unread_items),
+            )
+
+            pass_tool = PassHeartbeatTool()
+            self.tools.register(pass_tool)
+            try:
+                self._set_tool_context(
+                    channel, chat_id, None, session.directory, session_key, session,
+                )
+                if mt := self.tools.get("message"):
+                    if isinstance(mt, MessageTool):
+                        mt.start_turn()
+
+                synthetic = self._format_heartbeat_prompt(unread_items)
+                context = self._get_context(session)
+                initial_messages = context.build_messages(
+                    history=history,
+                    current_message=synthetic,
+                    channel=channel, chat_id=chat_id,
+                    sender_id="heartbeat",
+                    sender_name=None,
+                    system_prompt_extra=session.config.system_prompt,
+                    session_bindings=self._get_bindings_for_session(session_key),
+                )
+
+                if self._should_compact(initial_messages):
+                    logger.info("heartbeat: entry compaction for {}", session_key)
+                    await self._do_compact(session)
+                    self.sessions.save(session)
+                    history = session.get_history(max_messages=history_window)
+                    initial_messages = context.build_messages(
+                        history=history,
+                        current_message=synthetic,
+                        channel=channel, chat_id=chat_id,
+                        sender_id="heartbeat",
+                        sender_name=None,
+                        system_prompt_extra=session.config.system_prompt,
+                        session_bindings=self._get_bindings_for_session(session_key),
+                    )
+
+                final_content, tools_used, all_msgs = await self._run_agent_loop(
+                    initial_messages, session=session,
+                )
+            finally:
+                self.tools.unregister(pass_tool.name)
+
+            # Advance watermark now that we've fully processed this slice. Persisted on
+            # both the pass and respond paths so the same messages don't re-trigger.
+            now_iso = datetime.now().isoformat()
+
+            if "pass_heartbeat" in tools_used:
+                logger.info("heartbeat: pass for {}", session_key)
+                session.metadata["last_heartbeat_at"] = now_iso
+                self.sessions.save(session)
+                return
+
+            # Persist the assistant's reply (and any intermediate tool turns), but NOT the
+            # synthetic user prompt — skip past system + history + the synthetic user message.
+            self._save_turn(session, all_msgs, 2 + len(history))
+            session.metadata["last_heartbeat_at"] = now_iso
+            self.sessions.save(session)
+
+            if (mt := self.tools.get("message")) and isinstance(mt, MessageTool) and mt._sent_in_turn:
+                return
+
+            if final_content:
+                logger.info(
+                    "heartbeat: replying in {} ({} chars)", session_key, len(final_content),
+                )
+                await self.bus.publish_outbound(OutboundMessage(
+                    channel=channel, chat_id=chat_id, content=final_content,
+                ))
 
     def _save_turn(self, session: Session, messages: list[dict], skip: int) -> None:
         """Save new-turn messages into session."""
