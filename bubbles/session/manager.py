@@ -111,16 +111,22 @@ class SessionConfig:
     temperature: float | None = None
     max_tokens: int | None = None
     system_prompt: str | None = None
+    # Per-session opt-in for group heartbeat lurking (SPEC §5.2 item 3).
+    # Only meaningful for group sessions; toggled via /heartbeat on|off.
+    heartbeat_enabled: bool = False
 
     def to_dict(self) -> dict[str, Any]:
         """Convert to dict, excluding None values."""
-        return {k: v for k, v in {
+        out: dict[str, Any] = {k: v for k, v in {
             "provider": self.provider,
             "model": self.model,
             "temperature": self.temperature,
             "max_tokens": self.max_tokens,
             "system_prompt": self.system_prompt,
         }.items() if v is not None}
+        if self.heartbeat_enabled:
+            out["heartbeat_enabled"] = True
+        return out
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> "SessionConfig":
@@ -131,6 +137,7 @@ class SessionConfig:
             temperature=data.get("temperature"),
             max_tokens=data.get("max_tokens"),
             system_prompt=data.get("system_prompt"),
+            heartbeat_enabled=bool(data.get("heartbeat_enabled", False)),
         )
 
 
@@ -436,6 +443,37 @@ class SessionManager:
             logger.info("Cleaned up {} stale files from session data/ directories", total)
         return total
     
+    def list_heartbeat_enabled_groups(self) -> list[str]:
+        """Return session_keys whose stored config has heartbeat_enabled=true.
+
+        Reads only the metadata header of each session.jsonl, never the full message history,
+        so this is safe to call from the heartbeat tick at any frequency.
+        """
+        if not self.sessions_dir.is_dir():
+            return []
+        result: list[str] = []
+        for child in self.sessions_dir.iterdir():
+            if not child.is_dir():
+                continue
+            path = child / "session.jsonl"
+            if not path.exists():
+                continue
+            try:
+                with open(path, encoding="utf-8") as f:
+                    first_line = f.readline().strip()
+                if not first_line:
+                    continue
+                data = json.loads(first_line)
+                if data.get("_type") != "metadata":
+                    continue
+                cfg = data.get("config") or {}
+                if cfg.get("heartbeat_enabled"):
+                    key = data.get("key") or child.name.replace("_", ":", 1)
+                    result.append(key)
+            except Exception as e:
+                logger.warning("Failed to read session metadata in {}: {}", child, e)
+        return result
+
     def list_sessions(self) -> list[dict[str, Any]]:
         """
         List all sessions.
