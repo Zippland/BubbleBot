@@ -1189,8 +1189,11 @@ def _split_providers(config) -> tuple[list[str], int]:
         is_set = False
         suffix = ""
         if spec.is_oauth:
-            is_set = True
-            suffix = " (OAuth)"
+            # Actually check whether a token has been cached — don't just trust
+            # the OAuth-type flag (otherwise users see (OAuth) even before login).
+            if _is_oauth_authenticated(spec):
+                is_set = True
+                suffix = " (OAuth)"
         elif spec.is_local:
             if p.api_base:
                 is_set = True
@@ -1201,6 +1204,37 @@ def _split_providers(config) -> tuple[list[str], int]:
         else:
             unconfigured += 1
     return configured, unconfigured
+
+
+def _is_oauth_authenticated(spec) -> bool:
+    """Best-effort check that the user has completed OAuth login for this provider.
+
+    Reads the on-disk token cache without triggering any network refresh, so it's
+    safe to call from a static status command. Any error → treat as not authenticated.
+    """
+    try:
+        if spec.name == "openai_codex":
+            from oauth_cli_kit import OPENAI_CODEX_PROVIDER
+            from oauth_cli_kit.storage import FileTokenStorage
+            tok = FileTokenStorage(
+                token_filename=OPENAI_CODEX_PROVIDER.token_filename,
+            ).load()
+            return bool(tok and tok.access)
+        if spec.name == "github_copilot":
+            import os
+            token_dir = os.getenv(
+                "GITHUB_COPILOT_TOKEN_DIR",
+                os.path.expanduser("~/.config/litellm/github_copilot"),
+            )
+            token_file = os.path.join(
+                token_dir,
+                os.getenv("GITHUB_COPILOT_ACCESS_TOKEN_FILE", "access-token"),
+            )
+            with open(token_file, encoding="utf-8") as f:
+                return bool(f.read().strip())
+    except Exception:
+        return False
+    return False
 
 
 def _enabled_channels(config) -> list[str]:
