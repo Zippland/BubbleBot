@@ -1092,61 +1092,165 @@ def cron_run(
 def status():
     """Show bubbles status."""
     from bubbles.config.loader import load_config, get_config_path
-    from bubbles.utils.helpers import get_sessions_path
+    from bubbles.utils.helpers import get_sessions_path, get_data_path
 
     config_path = get_config_path()
-    config = load_config()
     sessions_dir = get_sessions_path()
 
     console.print(f"{__logo__} bubbles Status\n")
 
-    console.print(f"Config: {config_path} {'[green]✓[/green]' if config_path.exists() else '[red]✗[/red]'}")
-    console.print(f"Sessions: {sessions_dir} {'[green]✓[/green]' if sessions_dir.exists() else '[red]✗[/red]'}")
+    if not config_path.exists():
+        console.print(f"Config:    [red]missing[/red] (expected at {config_path})")
+        console.print("\nRun [cyan]bubbles onboard[/cyan] to initialize.")
+        return
 
-    if config_path.exists():
-        from bubbles.providers.registry import PROVIDERS
+    config = load_config()
+    console.print(f"Config:    {config_path}")
 
-        console.print(f"Model: {config.agents.defaults.model}")
+    # Sessions: path + count + last activity
+    session_count, last_activity = _scan_sessions(sessions_dir)
+    if session_count == 0:
+        console.print(f"Sessions:  {sessions_dir}  [dim](none)[/dim]")
+    else:
+        activity = f"last activity {_humanize_ago(last_activity)}" if last_activity else "never used"
+        console.print(f"Sessions:  {sessions_dir}  [dim]({session_count} session(s), {activity})[/dim]")
 
-        # Check API keys from registry
-        for spec in PROVIDERS:
-            p = getattr(config.providers, spec.name, None)
-            if p is None:
-                continue
-            if spec.is_oauth:
-                console.print(f"{spec.label}: [green]✓ (OAuth)[/green]")
-            elif spec.is_local:
-                # Local deployments show api_base instead of api_key
-                if p.api_base:
-                    console.print(f"{spec.label}: [green]✓ {p.api_base}[/green]")
-                else:
-                    console.print(f"{spec.label}: [dim]not set[/dim]")
-            else:
-                has_key = bool(p.api_key)
-                console.print(f"{spec.label}: {'[green]✓[/green]' if has_key else '[dim]not set[/dim]'}")
+    # Agent: model + configured providers (folded summary)
+    console.print(f"\nModel:     {config.agents.defaults.model}")
+    configured, unconfigured = _split_providers(config)
+    if configured:
+        console.print(f"Providers: {', '.join(configured)}")
+        if unconfigured:
+            console.print(f"           [dim]({unconfigured} others not configured)[/dim]")
+    else:
+        console.print("Providers: [yellow]none configured[/yellow]")
 
-        # Group heartbeat status (SPEC §5.2 item 3)
-        from bubbles.session.manager import SessionManager
-        hb_cfg = config.agents.defaults.group_heartbeat
+    # Runtime capabilities
+    enabled_channels = _enabled_channels(config)
+    if enabled_channels:
+        console.print(f"\nChannels:  {', '.join(enabled_channels)}")
+    else:
+        console.print("\nChannels:  [dim]none enabled[/dim]")
+
+    # Cron count (read store without starting the service)
+    cron_count = _count_cron_jobs(get_data_path())
+    console.print(f"Cron:      {cron_count} scheduled job(s)")
+
+    # Heartbeats
+    _print_heartbeat_status(sessions_dir, config.agents.defaults.group_heartbeat)
+
+
+def _scan_sessions(sessions_dir) -> tuple[int, "datetime | None"]:
+    """Return (session_count, most_recent_session_jsonl_mtime) by scanning sessions_dir."""
+    from datetime import datetime
+    if not sessions_dir.is_dir():
+        return 0, None
+    count = 0
+    latest: float | None = None
+    for child in sessions_dir.iterdir():
+        if not child.is_dir():
+            continue
+        jsonl = child / "session.jsonl"
+        if not jsonl.exists():
+            continue
+        count += 1
         try:
-            enabled = SessionManager(sessions_dir).list_heartbeat_enabled_groups()
-        except Exception as e:
-            console.print(f"\n[yellow]Heartbeats: failed to read ({e})[/yellow]")
-            enabled = []
-        if enabled:
-            console.print(
-                f"\nHeartbeats: [green]{len(enabled)}[/green] enabled "
-                f"(global default {hb_cfg.interval_minutes}m)"
-            )
-            for entry in enabled:
-                key = entry["key"]
-                interval = entry.get("interval_minutes") or hb_cfg.interval_minutes
-                is_override = entry.get("interval_minutes") is not None
-                last = entry.get("last_heartbeat_at") or "never"
-                tag = " [dim](custom)[/dim]" if is_override else ""
-                console.print(f"  • {key}  [cyan]{interval}m[/cyan]{tag}  last: [dim]{last}[/dim]")
+            mtime = jsonl.stat().st_mtime
+            if latest is None or mtime > latest:
+                latest = mtime
+        except OSError:
+            pass
+    return count, datetime.fromtimestamp(latest) if latest else None
+
+
+def _humanize_ago(when: "datetime") -> str:
+    """Rough human time (e.g. '2h ago', '3d ago')."""
+    from datetime import datetime
+    delta = datetime.now() - when
+    s = int(delta.total_seconds())
+    if s < 60:
+        return f"{s}s ago"
+    if s < 3600:
+        return f"{s // 60}m ago"
+    if s < 86400:
+        return f"{s // 3600}h ago"
+    return f"{s // 86400}d ago"
+
+
+def _split_providers(config) -> tuple[list[str], int]:
+    """Return (configured_labels, count_unconfigured)."""
+    from bubbles.providers.registry import PROVIDERS
+    configured: list[str] = []
+    unconfigured = 0
+    for spec in PROVIDERS:
+        p = getattr(config.providers, spec.name, None)
+        if p is None:
+            continue
+        is_set = False
+        suffix = ""
+        if spec.is_oauth:
+            is_set = True
+            suffix = " (OAuth)"
+        elif spec.is_local:
+            if p.api_base:
+                is_set = True
         else:
-            console.print(f"\nHeartbeats: [dim]none enabled[/dim] (global default {hb_cfg.interval_minutes}m)")
+            is_set = bool(p.api_key)
+        if is_set:
+            configured.append(f"{spec.label}{suffix}")
+        else:
+            unconfigured += 1
+    return configured, unconfigured
+
+
+def _enabled_channels(config) -> list[str]:
+    """List channel names whose .enabled is True."""
+    channels_cfg = config.channels
+    out: list[str] = []
+    # Iterate known channel attributes; each has .enabled
+    for name in (
+        "telegram", "feishu", "wechat", "discord", "dingtalk",
+        "qq", "slack", "whatsapp", "matrix", "mochat", "email",
+    ):
+        sub = getattr(channels_cfg, name, None)
+        if sub is not None and getattr(sub, "enabled", False):
+            out.append(name)
+    return out
+
+
+def _count_cron_jobs(data_path) -> int:
+    """Count cron jobs in jobs.json without starting CronService."""
+    import json as _json
+    path = data_path / "cron" / "jobs.json"
+    if not path.exists():
+        return 0
+    try:
+        with open(path, encoding="utf-8") as f:
+            data = _json.load(f)
+        return len(data.get("jobs", []))
+    except Exception:
+        return 0
+
+
+def _print_heartbeat_status(sessions_dir, hb_cfg) -> None:
+    """Print heartbeat summary lines (SPEC §5.2 item 3)."""
+    from bubbles.session.manager import SessionManager
+    try:
+        enabled = SessionManager(sessions_dir).list_heartbeat_enabled_groups()
+    except Exception as e:
+        console.print(f"Heartbeats: [yellow]failed to read ({e})[/yellow]")
+        return
+    if not enabled:
+        console.print(f"Heartbeats: [dim]none enabled[/dim] (default {hb_cfg.interval_minutes}m)")
+        return
+    console.print(f"Heartbeats: {len(enabled)} enabled (default {hb_cfg.interval_minutes}m)")
+    for entry in enabled:
+        key = entry["key"]
+        interval = entry.get("interval_minutes") or hb_cfg.interval_minutes
+        is_override = entry.get("interval_minutes") is not None
+        last = entry.get("last_heartbeat_at") or "never"
+        tag = " [dim](custom)[/dim]" if is_override else ""
+        console.print(f"  • {key}  [cyan]{interval}m[/cyan]{tag}  last: [dim]{last}[/dim]")
 
 
 # ============================================================================
