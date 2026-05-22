@@ -1107,7 +1107,7 @@ def status():
         from bubbles.providers.registry import PROVIDERS
 
         console.print(f"Model: {config.agents.defaults.model}")
-        
+
         # Check API keys from registry
         for spec in PROVIDERS:
             p = getattr(config.providers, spec.name, None)
@@ -1124,6 +1124,29 @@ def status():
             else:
                 has_key = bool(p.api_key)
                 console.print(f"{spec.label}: {'[green]✓[/green]' if has_key else '[dim]not set[/dim]'}")
+
+        # Group heartbeat status (SPEC §5.2 item 3)
+        from bubbles.session.manager import SessionManager
+        hb_cfg = config.agents.defaults.group_heartbeat
+        try:
+            enabled = SessionManager(sessions_dir).list_heartbeat_enabled_groups()
+        except Exception as e:
+            console.print(f"\n[yellow]Heartbeats: failed to read ({e})[/yellow]")
+            enabled = []
+        if enabled:
+            console.print(
+                f"\nHeartbeats: [green]{len(enabled)}[/green] enabled "
+                f"(global default {hb_cfg.interval_minutes}m)"
+            )
+            for entry in enabled:
+                key = entry["key"]
+                interval = entry.get("interval_minutes") or hb_cfg.interval_minutes
+                is_override = entry.get("interval_minutes") is not None
+                last = entry.get("last_heartbeat_at") or "never"
+                tag = " [dim](custom)[/dim]" if is_override else ""
+                console.print(f"  • {key}  [cyan]{interval}m[/cyan]{tag}  last: [dim]{last}[/dim]")
+        else:
+            console.print(f"\nHeartbeats: [dim]none enabled[/dim] (global default {hb_cfg.interval_minutes}m)")
 
 
 # ============================================================================
