@@ -928,21 +928,9 @@ system_prompt: {prompt_val}"""
 
         # /heartbeat off  (any trailing args ignored)
         if head == "off":
-            was_on = session.config.heartbeat_enabled
             session.config.heartbeat_enabled = False
             self.sessions.save(session)
-            override = session.config.heartbeat_interval_minutes
-            lines = ["✓ 心跳潜水已关闭"]
-            if not was_on:
-                lines.append("（此前本就是关闭状态）")
-            else:
-                lines.append("此后该群里没 @ 的消息不会再触发主动判决，纯静默入历史。")
-                if override:
-                    lines.append(f"保留的间隔设置: {override} 分钟（下次 /heartbeat on 不带数字会复用）")
-            lines.append("")
-            lines.append("查看状态: /heartbeat status")
-            lines.append("重新开启: /heartbeat on [minutes]")
-            return _reply("\n".join(lines))
+            return _reply("✓ 心跳已关闭。")
 
         # /heartbeat on [minutes]  OR  /heartbeat <minutes>  (shortcut)
         if head == "on":
@@ -950,30 +938,19 @@ system_prompt: {prompt_val}"""
             if rest:
                 new_interval = _parse_minutes(rest[0])
                 if new_interval is None:
-                    return _reply(
-                        f"参数无效: `{rest[0]}` 不是合法的分钟数。\n"
-                        "用法: /heartbeat on [minutes]   minutes 必须是 >= 1 的整数"
-                    )
+                    return _reply(f"参数无效：`{rest[0]}` 不是合法的分钟数。")
             return _reply(self._apply_heartbeat_on(session, new_interval, default_interval))
 
         # /heartbeat <minutes>  (numeric shortcut; implies on)
         if (m := _parse_minutes(head)) is not None and not rest:
             return _reply(self._apply_heartbeat_on(session, m, default_interval))
 
-        return _reply(
-            f"未识别的参数: `{cmd_arg.strip()}`。\n"
-            "用法:\n"
-            "  /heartbeat [status]    查看当前状态\n"
-            "  /heartbeat on          按当前/全局间隔开启\n"
-            "  /heartbeat on <分钟>   开启并设置间隔\n"
-            "  /heartbeat <分钟>      同上（数字快捷形式）\n"
-            "  /heartbeat off         关闭"
-        )
+        return _reply(f"未识别的参数：`{cmd_arg.strip()}`")
 
     def _apply_heartbeat_on(
         self, session: Session, new_interval: int | None, default_interval: int | None,
     ) -> str:
-        """Turn on heartbeat for this session; return a detailed user-facing reply."""
+        """Turn on heartbeat for this session; return a short user-facing confirmation."""
         was_on = session.config.heartbeat_enabled
         prev_override = session.config.heartbeat_interval_minutes
         session.config.heartbeat_enabled = True
@@ -982,60 +959,23 @@ system_prompt: {prompt_val}"""
         self.sessions.save(session)
 
         effective = session.config.heartbeat_interval_minutes or default_interval or "?"
-        is_override = session.config.heartbeat_interval_minutes is not None
 
+        if was_on and new_interval is not None and prev_override != new_interval:
+            return f"✓ 心跳间隔已更新为 {effective} 分钟。"
         if was_on:
-            if new_interval is not None:
-                if prev_override == new_interval:
-                    head = f"心跳潜水保持开启（间隔仍为 {effective} 分钟）"
-                else:
-                    head = f"✓ 心跳潜水间隔已更新为 {effective} 分钟"
-            else:
-                head = f"心跳潜水保持开启，每 {effective} 分钟扫一次"
-        else:
-            head = f"✓ 心跳潜水已开启，每 {effective} 分钟扫一次"
-
-        lines = [head]
-        if is_override:
-            lines.append(f"（本群自定义间隔；全局默认是 {default_interval} 分钟）")
-        else:
-            lines.append("（使用全局默认间隔；可用 /heartbeat on <分钟> 单独覆盖）")
-        lines.append("")
-        lines.append("行为: bot 每个周期扫一次自上次扫描以来的群里新消息，自己判断要不要插话。")
-        lines.append(f"首次真实判决: 启用后下一个周期建立水位，再下一个周期（≈ {effective} 分钟后）开始判决。")
-        lines.append("")
-        lines.append("查看状态: /heartbeat status")
-        lines.append("关闭: /heartbeat off")
-        return "\n".join(lines)
+            return f"心跳已开启，每 {effective} 分钟。"
+        return f"✓ 心跳已开启，每 {effective} 分钟。"
 
     def _format_heartbeat_status(
         self, session: Session, default_interval: int | None,
     ) -> str:
-        """Render status reply with effective interval + watermark."""
+        """One-line status reply."""
         on = bool(session.config.heartbeat_enabled)
+        if not on:
+            return "心跳：关闭"
         override = session.config.heartbeat_interval_minutes
         effective = override or default_interval or "?"
-        last = session.metadata.get("last_heartbeat_at")
-
-        lines = [f"心跳潜水: {'开启' if on else '关闭'}"]
-        if on:
-            lines.append(
-                f"扫描间隔: {effective} 分钟"
-                + ("（本群自定义）" if override else "（全局默认）")
-            )
-            if last:
-                lines.append(f"上次扫描: {last}")
-            else:
-                lines.append("上次扫描: 尚未（启用后等下一个周期建水位）")
-        else:
-            if override:
-                lines.append(f"保留的间隔设置: {override} 分钟（下次 on 不带数字会复用）")
-        lines.append("")
-        lines.append("用法:")
-        lines.append("  /heartbeat on [<分钟>]  开启")
-        lines.append("  /heartbeat <分钟>        开启并设置间隔（数字快捷形式）")
-        lines.append("  /heartbeat off           关闭")
-        return "\n".join(lines)
+        return f"心跳：开启，每 {effective} 分钟"
 
     @staticmethod
     def _format_heartbeat_prompt(unread_items: list[dict]) -> str:
