@@ -13,21 +13,39 @@ from loguru import logger
 from bubbles.cron.types import CronJob, CronJobState, CronPayload, CronSchedule, CronStore
 
 
+MAX_TIMER_DELAY_MS = 60_000
+
+# Exponential backoff after consecutive failures: 30s, 1m, 5m, 15m, 60m.
+# 5th+ failure stays at 60m. Reset to 0 on first success.
+BACKOFF_SCHEDULE_MS = (30_000, 60_000, 5 * 60_000, 15 * 60_000, 60 * 60_000)
+
+
+def _backoff_delay_ms(consecutive_errors: int) -> int:
+    """Delay for the Nth consecutive error (1-indexed). Capped at the tail value."""
+    idx = max(0, min(consecutive_errors - 1, len(BACKOFF_SCHEDULE_MS) - 1))
+    return BACKOFF_SCHEDULE_MS[idx]
+
+
 def _now_ms() -> int:
     return int(time.time() * 1000)
 
 
 def _compute_next_run(schedule: CronSchedule, now_ms: int) -> int | None:
-    """Compute next run time in ms."""
+    """Compute the next strictly-future run time in ms."""
     if schedule.kind == "at":
         return schedule.at_ms if schedule.at_ms and schedule.at_ms > now_ms else None
-    
+
     if schedule.kind == "every":
-        if not schedule.every_ms or schedule.every_ms <= 0:
+        every = schedule.every_ms
+        if not every or every <= 0:
             return None
-        # Next interval from now
-        return now_ms + schedule.every_ms
-    
+        anchor = schedule.anchor_ms if schedule.anchor_ms is not None else now_ms
+        if now_ms < anchor:
+            return anchor
+        elapsed = now_ms - anchor
+        steps = elapsed // every + 1  # always strictly future
+        return anchor + steps * every
+
     if schedule.kind == "cron" and schedule.expr:
         try:
             from croniter import croniter
@@ -91,6 +109,7 @@ class CronService:
                             kind=j["schedule"]["kind"],
                             at_ms=j["schedule"].get("atMs"),
                             every_ms=j["schedule"].get("everyMs"),
+                            anchor_ms=j["schedule"].get("anchorMs"),
                             expr=j["schedule"].get("expr"),
                             tz=j["schedule"].get("tz"),
                         ),
@@ -105,6 +124,9 @@ class CronService:
                         state=CronJobState(
                             next_run_at_ms=j.get("state", {}).get("nextRunAtMs"),
                             last_run_at_ms=j.get("state", {}).get("lastRunAtMs"),
+                            running_at_ms=j.get("state", {}).get("runningAtMs"),
+                            consecutive_errors=j.get("state", {}).get("consecutiveErrors", 0),
+                            backoff_until_ms=j.get("state", {}).get("backoffUntilMs"),
                             last_status=j.get("state", {}).get("lastStatus"),
                             last_error=j.get("state", {}).get("lastError"),
                         ),
@@ -139,6 +161,7 @@ class CronService:
                         "kind": j.schedule.kind,
                         "atMs": j.schedule.at_ms,
                         "everyMs": j.schedule.every_ms,
+                        "anchorMs": j.schedule.anchor_ms,
                         "expr": j.schedule.expr,
                         "tz": j.schedule.tz,
                     },
@@ -153,6 +176,9 @@ class CronService:
                     "state": {
                         "nextRunAtMs": j.state.next_run_at_ms,
                         "lastRunAtMs": j.state.last_run_at_ms,
+                        "runningAtMs": j.state.running_at_ms,
+                        "consecutiveErrors": j.state.consecutive_errors,
+                        "backoffUntilMs": j.state.backoff_until_ms,
                         "lastStatus": j.state.last_status,
                         "lastError": j.state.last_error,
                     },
@@ -170,103 +196,172 @@ class CronService:
         """Start the cron service."""
         self._running = True
         self._load_store()
-        self._recompute_next_runs()
+        self._sanitize_state_on_load()
         self._save_store()
         self._arm_timer()
-        logger.info("Cron service started with {} jobs", len(self._store.jobs if self._store else []))
-    
+        if self._store:
+            now = _now_ms()
+            overdue = sum(
+                1 for j in self._store.jobs
+                if j.enabled and j.state.next_run_at_ms and j.state.next_run_at_ms <= now
+            )
+            logger.info(
+                "Cron service started with {} job(s){}",
+                len(self._store.jobs),
+                f", {overdue} overdue (will catch up)" if overdue else "",
+            )
+
     def stop(self) -> None:
         """Stop the cron service."""
         self._running = False
         if self._timer_task:
             self._timer_task.cancel()
             self._timer_task = None
-    
-    def _recompute_next_runs(self) -> None:
-        """Recompute next run times for all enabled jobs."""
+
+    def _sanitize_state_on_load(self) -> None:
+        """Fix up state that may be stale after a crash or new-add-without-state."""
         if not self._store:
             return
         now = _now_ms()
         for job in self._store.jobs:
-            if job.enabled:
+            if job.state.running_at_ms is not None:
+                # Process crashed mid-run. next_run_at_ms was pre-advanced before
+                # the run started, so just clear the flag and treat as completed
+                # (better to miss one tick than risk double-fire).
+                logger.warning(
+                    "Cron: job '{}' was interrupted mid-run; treating as completed",
+                    job.name,
+                )
+                job.state.running_at_ms = None
+            if job.enabled and job.state.next_run_at_ms is None:
                 job.state.next_run_at_ms = _compute_next_run(job.schedule, now)
-    
+
+    @staticmethod
+    def _effective_next_run_ms(state: CronJobState) -> int | None:
+        """Job is gated by max(next_run, backoff_until)."""
+        nxt = state.next_run_at_ms
+        if not nxt:
+            return None
+        if state.backoff_until_ms and state.backoff_until_ms > nxt:
+            return state.backoff_until_ms
+        return nxt
+
     def _get_next_wake_ms(self) -> int | None:
-        """Get the earliest next run time across all jobs."""
+        """Get the earliest next-run time (honoring backoff) across all jobs."""
         if not self._store:
             return None
-        times = [j.state.next_run_at_ms for j in self._store.jobs 
-                 if j.enabled and j.state.next_run_at_ms]
+        times = [
+            self._effective_next_run_ms(j.state)
+            for j in self._store.jobs
+            if j.enabled
+        ]
+        times = [t for t in times if t]
         return min(times) if times else None
-    
+
     def _arm_timer(self) -> None:
-        """Schedule the next timer tick."""
+        """Schedule the next timer tick. Capped at MAX_TIMER_DELAY_MS so we
+        re-check at least every minute (protects against system clock skew /
+        suspend-resume / asyncio quirks)."""
         if self._timer_task:
             self._timer_task.cancel()
-        
-        next_wake = self._get_next_wake_ms()
-        if not next_wake or not self._running:
+
+        if not self._running:
             return
-        
-        delay_ms = max(0, next_wake - _now_ms())
+        next_wake = self._get_next_wake_ms()
+        if not next_wake:
+            return
+
+        delay_ms = max(0, min(MAX_TIMER_DELAY_MS, next_wake - _now_ms()))
         delay_s = delay_ms / 1000
-        
+
         async def tick():
-            await asyncio.sleep(delay_s)
+            try:
+                await asyncio.sleep(delay_s)
+            except asyncio.CancelledError:
+                return
             if self._running:
                 await self._on_timer()
-        
+
         self._timer_task = asyncio.create_task(tick())
-    
+
     async def _on_timer(self) -> None:
         """Handle timer tick - run due jobs."""
         if not self._store:
             return
-        
+
         now = _now_ms()
         due_jobs = [
             j for j in self._store.jobs
-            if j.enabled and j.state.next_run_at_ms and now >= j.state.next_run_at_ms
+            if j.enabled
+            and j.state.next_run_at_ms
+            and now >= j.state.next_run_at_ms
+            and j.state.running_at_ms is None  # skip in-flight jobs
+            and (not j.state.backoff_until_ms or now >= j.state.backoff_until_ms)
         ]
-        
+
         for job in due_jobs:
             await self._execute_job(job)
-        
+
         self._save_store()
         self._arm_timer()
-    
+
     async def _execute_job(self, job: CronJob) -> None:
-        """Execute a single job."""
+        """Execute a single job.
+
+        Crash safety: running_at_ms + next_run_at_ms are set and saved BEFORE
+        the on_job callback runs. If the process dies mid-call, the next slot
+        is already advanced past the current one, so we don't double-fire.
+        """
         start_ms = _now_ms()
+        job.state.running_at_ms = start_ms
+        # Pre-advance next_run so a crash mid-run doesn't re-fire this slot.
+        if job.schedule.kind == "at":
+            job.state.next_run_at_ms = None  # one-shot; never fire again
+        else:
+            job.state.next_run_at_ms = _compute_next_run(job.schedule, start_ms)
+        self._save_store()
+
         logger.info("Cron: executing job '{}' ({})", job.name, job.id)
-        
+
         try:
-            response = None
             if self.on_job:
-                response = await self.on_job(job)
-            
+                await self.on_job(job)
             job.state.last_status = "ok"
             job.state.last_error = None
+            job.state.consecutive_errors = 0
+            job.state.backoff_until_ms = None
             logger.info("Cron: job '{}' completed", job.name)
-            
         except Exception as e:
             job.state.last_status = "error"
             job.state.last_error = str(e)
-            logger.error("Cron: job '{}' failed: {}", job.name, e)
-        
+            job.state.consecutive_errors += 1
+            # at-kind jobs are one-shot; backoff would never fire anyway.
+            if job.schedule.kind != "at":
+                delay_ms = _backoff_delay_ms(job.state.consecutive_errors)
+                job.state.backoff_until_ms = _now_ms() + delay_ms
+                logger.error(
+                    "Cron: job '{}' failed ({} consecutive): {} — backing off {}s",
+                    job.name, job.state.consecutive_errors, e, delay_ms // 1000,
+                )
+            else:
+                logger.error("Cron: job '{}' failed: {}", job.name, e)
+
+        end_ms = _now_ms()
         job.state.last_run_at_ms = start_ms
-        job.updated_at_ms = _now_ms()
-        
-        # Handle one-shot jobs
+        job.updated_at_ms = end_ms
+
         if job.schedule.kind == "at":
             if job.delete_after_run:
                 self._store.jobs = [j for j in self._store.jobs if j.id != job.id]
+                return  # job object is detached; nothing more to do
             else:
                 job.enabled = False
-                job.state.next_run_at_ms = None
         else:
-            # Compute next run
-            job.state.next_run_at_ms = _compute_next_run(job.schedule, _now_ms())
+            # Re-advance from end-of-run so long-running jobs don't fall behind
+            # their own interval (otherwise they'd re-fire immediately).
+            job.state.next_run_at_ms = _compute_next_run(job.schedule, end_ms)
+
+        job.state.running_at_ms = None
     
     # ========== Public API ==========
     
@@ -291,6 +386,11 @@ class CronService:
         store = self._load_store()
         _validate_schedule_for_add(schedule)
         now = _now_ms()
+
+        # Anchor every-kind schedules to add-time so interval alignment is
+        # restart-safe (next_run = anchor + N*every, not now + every each boot).
+        if schedule.kind == "every" and schedule.anchor_ms is None:
+            schedule.anchor_ms = now
 
         job = CronJob(
             id=str(uuid.uuid4())[:8],
@@ -349,11 +449,21 @@ class CronService:
         return None
     
     async def run_job(self, job_id: str, force: bool = False) -> bool:
-        """Manually run a job."""
+        """Manually run a job. `force=True` bypasses enabled/backoff gates."""
         store = self._load_store()
         for job in store.jobs:
             if job.id == job_id:
                 if not force and not job.enabled:
+                    return False
+                if job.state.running_at_ms is not None:
+                    logger.warning("Cron: job '{}' already running; skipping manual run", job.name)
+                    return False
+                if (
+                    not force
+                    and job.state.backoff_until_ms
+                    and _now_ms() < job.state.backoff_until_ms
+                ):
+                    logger.info("Cron: job '{}' in backoff window; skipping", job.name)
                     return False
                 await self._execute_job(job)
                 self._save_store()

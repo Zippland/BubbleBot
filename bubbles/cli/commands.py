@@ -294,21 +294,38 @@ def gateway(
     
     # Set cron callback (needs agent)
     async def on_cron_job(job: CronJob) -> str | None:
-        """Execute a cron job through the agent."""
+        """Execute a cron job through the agent.
+
+        Registers ``stay_silent`` for the duration of the turn so the model can
+        opt out of delivery when the cron's condition isn't met. If the model
+        calls it, nothing is sent regardless of ``deliver``.
+        """
+        from bubbles.agent.tools.stay_silent import StaySilentTool
+        from bubbles.bus.events import OutboundMessage
+
         # Use the saved session_key to inject history, fallback to cron:{job.id}
         session_key = job.payload.session_key or f"cron:{job.id}"
-        response = await agent.process_direct(
-            job.payload.message,
-            session_key=session_key,
-            channel=job.payload.channel or "cli",
-            chat_id=job.payload.to or "direct",
-        )
-        if job.payload.deliver and job.payload.to:
-            from bubbles.bus.events import OutboundMessage
+
+        agent.tools.register(StaySilentTool())
+        try:
+            response, tools_used = await agent.process_direct(
+                job.payload.message,
+                session_key=session_key,
+                channel=job.payload.channel or "cli",
+                chat_id=job.payload.to or "direct",
+            )
+        finally:
+            agent.tools.unregister("stay_silent")
+
+        if "stay_silent" in tools_used:
+            logger.info("cron: stay_silent for job {} ({})", job.id, job.name)
+            return None
+
+        if job.payload.deliver and job.payload.to and response:
             await bus.publish_outbound(OutboundMessage(
                 channel=job.payload.channel or "cli",
                 chat_id=job.payload.to,
-                content=response or ""
+                content=response,
             ))
         return response
     cron.on_job = on_cron_job
@@ -325,27 +342,9 @@ def gateway(
     if cron_status["jobs"] > 0:
         console.print(f"[green]✓[/green] Cron: {cron_status['jobs']} scheduled jobs")
 
-    # Group-chat heartbeat (SPEC §5.2 item 3): always running; per-group opt-in via /heartbeat on.
-    from bubbles.agent.group_heartbeat import GroupHeartbeat
-    hb_cfg = config.agents.defaults.group_heartbeat
-    heartbeat = GroupHeartbeat(
-        agent_loop=agent,
-        session_manager=session_manager,
-        default_interval_minutes=hb_cfg.interval_minutes,
-        history_window=hb_cfg.history_window,
-        max_concurrent=hb_cfg.max_concurrent,
-    )
-    agent.group_heartbeat = heartbeat
-    console.print(
-        f"[green]✓[/green] Group heartbeat ready "
-        f"(default_interval={hb_cfg.interval_minutes}m, max_concurrent={hb_cfg.max_concurrent}; "
-        f"enable per-group via @bot /heartbeat on [minutes])"
-    )
-
     async def run():
         try:
             await cron.start()
-            await heartbeat.start()
             await asyncio.gather(
                 agent.run(),
                 channels.start_all(),
@@ -353,7 +352,6 @@ def gateway(
         except KeyboardInterrupt:
             console.print("\nShutting down...")
         finally:
-            await heartbeat.stop()
             await agent.close_mcp()
             cron.stop()
             agent.stop()
@@ -509,7 +507,7 @@ def agent(
             if debug:
                 _print_debug_info(agent_loop, session_id)
             with _thinking_ctx():
-                response = await agent_loop.process_direct(
+                response, _tools_used = await agent_loop.process_direct(
                     message, session_id,
                     on_progress=_cli_progress,
                     on_tool_call=_debug_tool_call if debug else None,
@@ -1061,7 +1059,7 @@ def cron_run(
     result_holder = []
 
     async def on_job(job: CronJob) -> str | None:
-        response = await agent_loop.process_direct(
+        response, _tools_used = await agent_loop.process_direct(
             job.payload.message,
             session_key=f"cron:{job.id}",
             channel=job.payload.channel or "cli",
@@ -1135,9 +1133,6 @@ def status():
     # Cron count (read store without starting the service)
     cron_count = _count_cron_jobs(get_data_path())
     console.print(f"Cron:      {cron_count} scheduled job(s)")
-
-    # Heartbeats
-    _print_heartbeat_status(sessions_dir, config.agents.defaults.group_heartbeat)
 
 
 def _scan_sessions(sessions_dir) -> tuple[int, "datetime | None"]:
@@ -1264,27 +1259,6 @@ def _count_cron_jobs(data_path) -> int:
         return len(data.get("jobs", []))
     except Exception:
         return 0
-
-
-def _print_heartbeat_status(sessions_dir, hb_cfg) -> None:
-    """Print heartbeat summary lines (SPEC §5.2 item 3)."""
-    from bubbles.session.manager import SessionManager
-    try:
-        enabled = SessionManager(sessions_dir).list_heartbeat_enabled_groups()
-    except Exception as e:
-        console.print(f"Heartbeats: [yellow]failed to read ({e})[/yellow]")
-        return
-    if not enabled:
-        console.print(f"Heartbeats: [dim]none enabled[/dim] (default {hb_cfg.interval_minutes}m)")
-        return
-    console.print(f"Heartbeats: {len(enabled)} enabled (default {hb_cfg.interval_minutes}m)")
-    for entry in enabled:
-        key = entry["key"]
-        interval = entry.get("interval_minutes") or hb_cfg.interval_minutes
-        is_override = entry.get("interval_minutes") is not None
-        last = entry.get("last_heartbeat_at") or "never"
-        tag = " [dim](custom)[/dim]" if is_override else ""
-        console.print(f"  • {key}  [cyan]{interval}m[/cyan]{tag}  last: [dim]{last}[/dim]")
 
 
 # ============================================================================

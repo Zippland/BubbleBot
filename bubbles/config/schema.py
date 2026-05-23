@@ -211,18 +211,6 @@ class ChannelsConfig(Base):
     matrix: MatrixConfig = Field(default_factory=MatrixConfig)
 
 
-class GroupHeartbeatConfig(Base):
-    """Group-chat heartbeat lurking. SPEC §5.2 item 3.
-
-    No global on/off switch — per-group opt-in via /heartbeat on is the only enable path.
-    These are tuning knobs for an already-running service.
-    """
-
-    interval_minutes: int = 30
-    history_window: int = 20  # Most recent group messages shown to the model on tick
-    max_concurrent: int = 3   # Concurrency cap per tick across groups
-
-
 class AgentDefaults(Base):
     """Default agent configuration."""
 
@@ -233,7 +221,6 @@ class AgentDefaults(Base):
     temperature: float = 1.0
     max_tool_iterations: int = 40
     memory_window: int = 100
-    group_heartbeat: GroupHeartbeatConfig = Field(default_factory=GroupHeartbeatConfig)
 
 
 class AgentsConfig(Base):
