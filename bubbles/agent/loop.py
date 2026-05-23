@@ -18,28 +18,20 @@ HEARTBEAT_MAX_MINUTES = 24 * 60
 
 HEARTBEATS_TEMPLATE = """# Heartbeats
 
-The user enabled heartbeats with `/heartbeat <interval>`. From now on the bot
-gets an auto-wake tick at that cadence and reads this file. Edit freely — add
-checks, remove them, rewrite framing.
+Your periodic check-in list. The bot reads this file on every heartbeat tick.
+Add items, remove them, rewrite framing freely.
 
-## Items to check on each tick
+## Items
 
-- (no items yet — examples you could add:)
-  - Look at recent messages in this session and follow up on anything left dangling.
-  - Scan MEMORY.md for facts that may have gone stale.
-  - If it's been quiet for 8+ hours and it's daytime, send a light check-in.
-
-## Rules
-
-- Default to silence. Spam is worse than missed nudges.
-- Only act when a checklist item maps to a concrete action right now.
-- If nothing in the list applies this cycle, call `stay_silent` and end the turn.
+- (no items yet — examples:)
+  - Scan MEMORY.md for stale facts.
+  - Light check-in if quiet for 8+ hours during daytime.
 """
 
 HEARTBEAT_TICK_MESSAGE = (
-    "[心跳触发] 定时唤醒。查看 <work_dir>/HEARTBEATS.md（已加载在上方 context）里的检查清单，"
-    "判断本次是否有事项需要主动处理。\n\n"
-    "默认沉默。只有清单中有清晰应处理的事项才说话或调用工具。没事说就调 stay_silent 结束。"
+    "[心跳触发] 严格按照 <work_dir>/HEARTBEATS.md（上方已加载）里的清单执行。"
+    "不要从历史对话里翻补未完成的旧任务。\n\n"
+    "默认沉默。清单里没有当下应处理的事项就调 stay_silent 结束。"
 )
 
 from loguru import logger
@@ -988,22 +980,15 @@ system_prompt: {prompt_val}"""
             if not job or not job.schedule.every_ms:
                 return OutboundMessage(
                     channel=msg.channel, chat_id=msg.chat_id,
-                    content=(
-                        "心跳未开启。\n\n"
-                        "开启：`/heartbeat 30m`（支持 `30m` / `2h` / 纯数字默认分钟）\n"
-                        "开启后会在 <work_dir>/HEARTBEATS.md 写入清单模板，可自行编辑。"
-                    ),
+                    content="心跳未开启。",
                 )
             minutes = job.schedule.every_ms // 60_000
-            lines = [
-                f"心跳已开启，每 {self._humanize_minutes_cn(minutes)} 触发一次。",
-            ]
+            line = f"心跳每 {self._humanize_minutes_cn(minutes)} 触发"
             if job.state.next_run_at_ms:
                 from datetime import datetime as _dt
                 nxt = _dt.fromtimestamp(job.state.next_run_at_ms / 1000)
-                lines.append(f"下一次：{nxt.strftime('%H:%M:%S')}")
-            lines.append("\n关闭：`/heartbeat off`")
-            return OutboundMessage(channel=msg.channel, chat_id=msg.chat_id, content="\n".join(lines))
+                line += f"，下次 {nxt.strftime('%H:%M:%S')}"
+            return OutboundMessage(channel=msg.channel, chat_id=msg.chat_id, content=line + "。")
 
         # Off
         if arg == "off":
@@ -1058,12 +1043,9 @@ system_prompt: {prompt_val}"""
             session_key=session_key,
         )
 
-        body = f"心跳已开启，每 {self._humanize_minutes_cn(minutes)} 触发一次。"
+        body = f"心跳已开启，每 {self._humanize_minutes_cn(minutes)} 触发。"
         if created_template:
-            body += "\n\n已在 <work_dir>/HEARTBEATS.md 写入清单模板，可自行编辑。"
-        else:
-            body += "\n\n沿用现有的 <work_dir>/HEARTBEATS.md。"
-        body += "\n\n关闭：`/heartbeat off`"
+            body += " 已写入 HEARTBEATS.md 模板。"
         return OutboundMessage(channel=msg.channel, chat_id=msg.chat_id, content=body)
 
     def _save_turn(self, session: Session, messages: list[dict], skip: int) -> None:
