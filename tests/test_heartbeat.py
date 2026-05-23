@@ -196,3 +196,75 @@ def test_heartbeat_isolated_per_session(loop) -> None:
     assert loop._get_heartbeat_job("cli:bob") is None
     assert loop._build_heartbeat_info("cli:alice") is not None
     assert loop._build_heartbeat_info("cli:bob") is None
+
+
+# ---------- bubbles status integration ----------
+
+def test_scan_cron_jobs_separates_heartbeats(tmp_path) -> None:
+    """`_scan_cron_jobs` must split regular cron jobs from heartbeats."""
+    from bubbles.cli.commands import _scan_cron_jobs, _format_interval
+    from bubbles.cron.service import CronService
+    from bubbles.cron.types import CronSchedule
+
+    svc = CronService(tmp_path / "cron" / "jobs.json")
+    # 1 plain cron + 2 heartbeats
+    svc.add_job(
+        name="daily standup",
+        schedule=CronSchedule(kind="cron", expr="0 9 * * *", tz="UTC"),
+        message="ping",
+    )
+    svc.add_job(
+        name="heartbeat:cli:alice",
+        schedule=CronSchedule(kind="every", every_ms=30 * 60_000),
+        message="tick",
+    )
+    svc.add_job(
+        name="heartbeat:telegram:work",
+        schedule=CronSchedule(kind="every", every_ms=60 * 60_000),
+        message="tick",
+    )
+
+    cron_count, heartbeats = _scan_cron_jobs(tmp_path)
+    assert cron_count == 1, "regular cron job should not be counted as heartbeat"
+    sessions = sorted(h["session"] for h in heartbeats)
+    assert sessions == ["cli:alice", "telegram:work"]
+
+    intervals = {h["session"]: _format_interval(h["every_ms"]) for h in heartbeats}
+    assert intervals["cli:alice"] == "30m"
+    assert intervals["telegram:work"] == "1h"
+
+
+def test_scan_cron_jobs_skips_disabled_heartbeats(tmp_path) -> None:
+    """Disabled heartbeat rows shouldn't show up in status."""
+    from bubbles.cli.commands import _scan_cron_jobs
+    from bubbles.cron.service import CronService
+    from bubbles.cron.types import CronSchedule
+
+    svc = CronService(tmp_path / "cron" / "jobs.json")
+    job = svc.add_job(
+        name="heartbeat:cli:test",
+        schedule=CronSchedule(kind="every", every_ms=30 * 60_000),
+        message="tick",
+    )
+    svc.enable_job(job.id, enabled=False)
+
+    cron_count, heartbeats = _scan_cron_jobs(tmp_path)
+    assert cron_count == 0
+    assert heartbeats == []
+
+
+def test_scan_cron_jobs_handles_missing_store(tmp_path) -> None:
+    from bubbles.cli.commands import _scan_cron_jobs
+    cron_count, heartbeats = _scan_cron_jobs(tmp_path)
+    assert cron_count == 0
+    assert heartbeats == []
+
+
+def test_format_interval() -> None:
+    from bubbles.cli.commands import _format_interval
+    assert _format_interval(30 * 60_000) == "30m"
+    assert _format_interval(60 * 60_000) == "1h"
+    assert _format_interval(2 * 60 * 60_000) == "2h"
+    assert _format_interval(90 * 60_000) == "90m"  # not a whole hour
+    assert _format_interval(None) == "?"
+    assert _format_interval(0) == "?"
