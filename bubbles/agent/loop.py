@@ -13,6 +13,35 @@ from typing import TYPE_CHECKING, Any, Awaitable, Callable
 ERROR_REPLY_THROTTLE_SEC = 60.0
 DATA_CLEANUP_THROTTLE_SEC = 24 * 3600.0
 
+HEARTBEAT_MIN_MINUTES = 1
+HEARTBEAT_MAX_MINUTES = 24 * 60
+
+HEARTBEATS_TEMPLATE = """# Heartbeats
+
+The user enabled heartbeats with `/heartbeat <interval>`. From now on the bot
+gets an auto-wake tick at that cadence and reads this file. Edit freely — add
+checks, remove them, rewrite framing.
+
+## Items to check on each tick
+
+- (no items yet — examples you could add:)
+  - Look at recent messages in this session and follow up on anything left dangling.
+  - Scan MEMORY.md for facts that may have gone stale.
+  - If it's been quiet for 8+ hours and it's daytime, send a light check-in.
+
+## Rules
+
+- Default to silence. Spam is worse than missed nudges.
+- Only act when a checklist item maps to a concrete action right now.
+- If nothing in the list applies this cycle, call `stay_silent` and end the turn.
+"""
+
+HEARTBEAT_TICK_MESSAGE = (
+    "[心跳触发] 定时唤醒。查看 <work_dir>/HEARTBEATS.md（已加载在上方 context）里的检查清单，"
+    "判断本次是否有事项需要主动处理。\n\n"
+    "默认沉默。只有清单中有清晰应处理的事项才说话或调用工具。没事说就调 stay_silent 结束。"
+)
+
 from loguru import logger
 
 from bubbles.agent.compaction import compact_session, CompactionResult, estimate_messages_tokens
@@ -121,8 +150,6 @@ class AgentLoop:
         self._last_data_cleanup_at: dict[str, float] = {}  # session_key -> monotonic ts of last data/ cleanup
         self._processing_lock = asyncio.Lock()
         self.on_tool_call: Callable[[str, dict, str | None], Awaitable[None]] | None = None  # Debug callback
-        # Optional group-chat heartbeat service; gateway attaches when enabled (SPEC §5.2 item 3).
-        self.group_heartbeat: Any | None = None
         self._register_default_tools()
 
     def _register_default_tools(self) -> None:
@@ -277,6 +304,7 @@ class AgentLoop:
                 if tool := self.tools.get(tool_name):
                     if hasattr(tool, "set_session"):
                         tool.set_session(session)
+
 
     @staticmethod
     def _strip_think(text: str | None) -> str | None:
@@ -552,6 +580,7 @@ class AgentLoop:
                 sender_name=msg.metadata.get("sender_name"),
                 system_prompt_extra=session.config.system_prompt,
                 session_bindings=self._get_bindings_for_session(session.key),
+                heartbeat_info=self._build_heartbeat_info(session.key),
             )
             final_content, _, all_msgs = await self._run_agent_loop(
                 messages, session=session, on_tool_call=on_tool_call)
@@ -570,9 +599,9 @@ class AgentLoop:
         cmd_arg = cmd_parts[1] if len(cmd_parts) > 1 else ""
 
         # In groups, commands with side effects must require @bot — otherwise anyone in
-        # the group could fire /new, /config reset, /session, /heartbeat etc. /help is
-        # read-only so we allow it without @. /stop is handled even earlier in agent.run()
-        # and is intentionally permissive (emergency brake).
+        # the group could fire /new, /config reset, /session etc. /help is read-only so
+        # we allow it without @. /stop is handled even earlier in agent.run() and is
+        # intentionally permissive (emergency brake).
         should_respond = msg.metadata.get("respond", True)
         _SAFE_NO_AT = {"/help"}
         if (
@@ -654,6 +683,10 @@ class AgentLoop:
         if cmd_name == "/config":
             return await self._handle_config_command(msg, session, cmd_arg)
 
+        # /heartbeat - user-controlled periodic auto-wake (AI cannot enable)
+        if cmd_name == "/heartbeat":
+            return self._handle_heartbeat_command(msg, session, key, cmd_arg)
+
         if cmd == "/new":
             session.clear()
             self.sessions.save(session)
@@ -683,7 +716,12 @@ class AgentLoop:
 /session unbind - unbind
 /config - view/set config
 /config reset - reset all
-/heartbeat on|off|status - group lurking (groups only)"""
+/heartbeat 30m - enable periodic auto-wake (or 2h, etc.)
+/heartbeat off - disable
+/heartbeat - show status
+
+For periodic / proactive tasks, just tell me in natural language and I'll
+register a cron job ("each morning at 9, check my deadlines", etc.)."""
             return OutboundMessage(channel=msg.channel, chat_id=msg.chat_id, content=help_text)
 
         # should_respond was computed at the top of this method (around the command-gate).
@@ -708,17 +746,7 @@ class AgentLoop:
             session.messages.append(entry)
             self.sessions.save(session)
             logger.debug("Saved non-respond message to history: {}", msg.content[:50])
-            # Tell the heartbeat service this group has activity + remember its outbound route.
-            if msg.metadata.get("is_group") and self.group_heartbeat is not None:
-                try:
-                    self.group_heartbeat.note_outbound_route(key, msg.channel, msg.chat_id)
-                except Exception:
-                    logger.exception("group_heartbeat.note_outbound_route failed")
             return None
-
-        # /heartbeat command — only reachable when should_respond=True (i.e. @ in groups).
-        if cmd_name == "/heartbeat":
-            return self._handle_heartbeat_command(msg, session, cmd_arg)
 
         # Move media files to correct session directory if needed (handles session binding)
         media = self._relocate_media_to_session(msg.media, session) if msg.media else None
@@ -757,6 +785,7 @@ class AgentLoop:
                 sender_name=msg.metadata.get("sender_name"),
                 system_prompt_extra=session.config.system_prompt,
                 session_bindings=self._get_bindings_for_session(session.key),
+                heartbeat_info=self._build_heartbeat_info(session.key),
             )
 
         # Track progress messages to detect loops
@@ -886,273 +915,156 @@ system_prompt: {prompt_val}"""
             content=f"Unknown config key: `{key}`\n\nValid keys: provider, model, temperature, max_tokens, system_prompt"
         )
 
-    def _handle_heartbeat_command(
-        self, msg: InboundMessage, session: Session, cmd_arg: str
-    ) -> OutboundMessage:
-        """Toggle / inspect heartbeat lurking for the current group session (SPEC §5.2 item 3).
-
-        Accepted forms (case-insensitive):
-            /heartbeat                  → status
-            /heartbeat status           → status
-            /heartbeat on               → enable, keep existing interval override (or use default)
-            /heartbeat on <minutes>     → enable, set per-session interval override
-            /heartbeat <minutes>        → shortcut for "/heartbeat on <minutes>"
-            /heartbeat off              → disable (interval override is remembered for next on)
-        """
-        is_group = bool(msg.metadata and msg.metadata.get("is_group"))
-        if not is_group:
-            return OutboundMessage(
-                channel=msg.channel, chat_id=msg.chat_id,
-                content="心跳潜水只对群聊有意义，私聊不需要。",
-            )
-
-        default_interval = getattr(self.group_heartbeat, "default_interval_minutes", None)
-        parts = cmd_arg.strip().lower().split()
-
-        def _reply(text: str) -> OutboundMessage:
-            return OutboundMessage(channel=msg.channel, chat_id=msg.chat_id, content=text)
-
-        def _parse_minutes(s: str) -> int | None:
-            try:
-                v = int(s)
-                return v if v >= 1 else None
-            except (ValueError, TypeError):
-                return None
-
-        # /heartbeat / /heartbeat status
-        if not parts or parts[0] == "status":
-            return _reply(self._format_heartbeat_status(session, default_interval))
-
-        head = parts[0]
-        rest = parts[1:]
-
-        # /heartbeat off  (any trailing args ignored)
-        if head == "off":
-            session.config.heartbeat_enabled = False
-            self.sessions.save(session)
-            return _reply("✓ 心跳已关闭。")
-
-        # /heartbeat on [minutes]  OR  /heartbeat <minutes>  (shortcut)
-        if head == "on":
-            new_interval: int | None = None
-            if rest:
-                new_interval = _parse_minutes(rest[0])
-                if new_interval is None:
-                    return _reply(f"参数无效：`{rest[0]}` 不是合法的分钟数。")
-            return _reply(self._apply_heartbeat_on(session, new_interval, default_interval))
-
-        # /heartbeat <minutes>  (numeric shortcut; implies on)
-        if (m := _parse_minutes(head)) is not None and not rest:
-            return _reply(self._apply_heartbeat_on(session, m, default_interval))
-
-        return _reply(f"未识别的参数：`{cmd_arg.strip()}`")
-
-    def _apply_heartbeat_on(
-        self, session: Session, new_interval: int | None, default_interval: int | None,
-    ) -> str:
-        """Turn on heartbeat for this session; return a short user-facing confirmation."""
-        was_on = session.config.heartbeat_enabled
-        prev_override = session.config.heartbeat_interval_minutes
-        session.config.heartbeat_enabled = True
-        if new_interval is not None:
-            session.config.heartbeat_interval_minutes = new_interval
-        self.sessions.save(session)
-
-        effective = session.config.heartbeat_interval_minutes or default_interval or "?"
-
-        if was_on and new_interval is not None and prev_override != new_interval:
-            return f"✓ 心跳间隔已更新为 {effective} 分钟。"
-        if was_on:
-            return f"心跳已开启，每 {effective} 分钟。"
-        return f"✓ 心跳已开启，每 {effective} 分钟。"
-
-    def _format_heartbeat_status(
-        self, session: Session, default_interval: int | None,
-    ) -> str:
-        """One-line status reply."""
-        on = bool(session.config.heartbeat_enabled)
-        if not on:
-            return "心跳：关闭"
-        override = session.config.heartbeat_interval_minutes
-        effective = override or default_interval or "?"
-        return f"心跳：开启，每 {effective} 分钟"
+    # ===== Heartbeat (user-controlled periodic auto-wake) =====
 
     @staticmethod
-    def _format_heartbeat_prompt(unread_items: list[dict]) -> str:
-        """Synthesize the user message that drives a heartbeat-triggered turn.
+    def _heartbeat_job_name(session_key: str) -> str:
+        return f"heartbeat:{session_key}"
 
-        ``unread_items`` are the user-role history dicts newer than the last scan,
-        each with ``content`` already prefixed by ``[sender_name]:``.
-        """
-        from datetime import datetime
-        now = datetime.now().isoformat(timespec="seconds")
-        lines: list[str] = []
-        for m in unread_items:
-            ts_raw = m.get("timestamp", "")
-            try:
-                t = datetime.fromisoformat(ts_raw).strftime("%H:%M")
-            except Exception:
-                t = "??:??"
-            lines.append(f"[{t}] {m.get('content', '')}")
-        new_block = "\n".join(lines) if lines else "(none)"
+    @staticmethod
+    def _parse_heartbeat_interval(s: str) -> int | None:
+        """Parse '30m', '2h', '90s', or bare number (= minutes). Return minutes, or None."""
+        m = re.match(r"^(\d+)\s*([smh]?)$", s.strip().lower())
+        if not m:
+            return None
+        n = int(m.group(1))
+        unit = m.group(2) or "m"
+        if unit == "s":
+            return max(1, (n + 30) // 60)  # round to nearest minute, floor 1
+        if unit == "h":
+            return n * 60
+        return n
+
+    @staticmethod
+    def _humanize_minutes_cn(minutes: int) -> str:
+        if minutes >= 60 and minutes % 60 == 0:
+            return f"{minutes // 60} 小时"
+        return f"{minutes} 分钟"
+
+    @staticmethod
+    def _humanize_minutes_en(minutes: int) -> str:
+        if minutes >= 60 and minutes % 60 == 0:
+            h = minutes // 60
+            return f"{h} hour{'s' if h > 1 else ''}"
+        return f"{minutes} minute{'s' if minutes > 1 else ''}"
+
+    def _get_heartbeat_job(self, session_key: str):
+        """Return the heartbeat cron job for this session, or None."""
+        if not self.cron_service:
+            return None
+        name = self._heartbeat_job_name(session_key)
+        for j in self.cron_service.list_jobs(include_disabled=True):
+            if j.name == name:
+                return j
+        return None
+
+    def _build_heartbeat_info(self, session_key: str) -> str | None:
+        """Return a system-prompt block describing the active heartbeat, or None if off."""
+        job = self._get_heartbeat_job(session_key)
+        if not job or not job.schedule.every_ms:
+            return None
+        minutes = job.schedule.every_ms // 60_000
         return (
-            f"[心跳扫描 @ {now}]\n\n"
-            "你在群里潜水。下面这几条是上次扫描后新进来的消息：\n\n"
-            f"{new_block}\n\n"
-            "上面 history 部分（这次 turn 的前面那些 messages）是群里更早的对话供参考，"
-            "**但你这次要判断的只是上面这一段新消息**。不要回头翻旧话题主动接茬。\n\n"
-            "默认不插话。只有当你能贡献别人没说过、且明显有用的信息时再开口——"
-            "回答具体问题、纠正明显错误、提供新信息。不要附和、不要重复别人说过的话、"
-            "不要为了刷存在感开口。\n\n"
-            "判断结果：\n"
-            "- 该插话 → 直接正常回复，回复会被发到群里。\n"
-            "- 不该插话 → 调 pass_heartbeat() 然后结束。"
+            f"## Heartbeat: ON\n\n"
+            f"Firing every {self._humanize_minutes_en(minutes)}. HEARTBEATS.md is loaded above. "
+            f"On each tick, scan the checklist and act only when something genuinely warrants "
+            f"attention. Call `stay_silent` to end the turn quietly when nothing applies."
         )
 
-    async def run_heartbeat(
-        self,
-        *,
-        session_key: str,
-        channel: str,
-        chat_id: str,
-        history_window: int,
-    ) -> None:
-        """Heartbeat-triggered scan for a group chat (SPEC §5.2 item 3).
-
-        Runs one full agent turn with the ``pass_heartbeat`` tool temporarily registered.
-        If the model calls that tool, nothing is sent. Otherwise the reply goes to
-        (channel, chat_id) like a normal response.
-
-        Watermark (``last_heartbeat_at``) lives in ``session.metadata`` so it survives
-        gateway restarts; messages that arrived before a crash but after the last persisted
-        scan are still considered unread on next boot.
-        """
-        from datetime import datetime
-        from bubbles.agent.tools.pass_heartbeat import PassHeartbeatTool
-
-        async with self._processing_lock:
-            session = self.sessions.get_or_create(session_key)
-
-            last_iso = session.metadata.get("last_heartbeat_at")
-            last_scanned_at: datetime | None = None
-            if last_iso:
-                try:
-                    last_scanned_at = datetime.fromisoformat(last_iso)
-                except Exception:
-                    last_scanned_at = None
-
-            # First-ever scan only establishes the watermark — never invokes the LLM on
-            # an unbounded history slice. Persist immediately so a crash here doesn't
-            # cause the next boot to re-establish a watermark that skips real messages.
-            if last_scanned_at is None:
-                session.metadata["last_heartbeat_at"] = datetime.now().isoformat()
-                self.sessions.save(session)
-                logger.debug(
-                    "heartbeat: first scan for {}, watermark established, no LLM call",
-                    session_key,
-                )
-                return
-
-            prune_old_images_inplace(session.messages)
-            history = session.get_history(max_messages=history_window)
-
-            def _ts_of(m: dict) -> datetime | None:
-                t = m.get("timestamp")
-                if not t:
-                    return None
-                try:
-                    return datetime.fromisoformat(t)
-                except Exception:
-                    return None
-
-            # Collect the actual unread user messages — these get embedded into the
-            # synthetic prompt so the model doesn't have to infer "new vs old" itself.
-            unread_items: list[dict] = []
-            for m in history:
-                if m.get("role") != "user":
-                    continue
-                ts = _ts_of(m)
-                if ts is not None and ts > last_scanned_at:
-                    unread_items.append(m)
-            # No unread → do NOT advance the watermark. If we advanced here and a message
-            # arrived between this tick and the next, it would be silently skipped.
-            if not unread_items:
-                logger.debug("heartbeat: no unread for {}, skip", session_key)
-                return
-
-            logger.info(
-                "heartbeat tick: scanning {} (unread={})", session_key, len(unread_items),
+    def _handle_heartbeat_command(
+        self, msg: InboundMessage, session: Session, session_key: str, arg: str,
+    ) -> OutboundMessage:
+        if not self.cron_service:
+            return OutboundMessage(
+                channel=msg.channel, chat_id=msg.chat_id,
+                content="心跳功能不可用：cron 服务未配置。",
             )
 
-            pass_tool = PassHeartbeatTool()
-            self.tools.register(pass_tool)
-            try:
-                self._set_tool_context(
-                    channel, chat_id, None, session.directory, session_key, session,
+        arg = (arg or "").strip().lower()
+
+        # No-arg → status
+        if not arg:
+            job = self._get_heartbeat_job(session_key)
+            if not job or not job.schedule.every_ms:
+                return OutboundMessage(
+                    channel=msg.channel, chat_id=msg.chat_id,
+                    content=(
+                        "心跳未开启。\n\n"
+                        "开启：`/heartbeat 30m`（支持 `30m` / `2h` / 纯数字默认分钟）\n"
+                        "开启后会在 <work_dir>/HEARTBEATS.md 写入清单模板，可自行编辑。"
+                    ),
                 )
-                if mt := self.tools.get("message"):
-                    if isinstance(mt, MessageTool):
-                        mt.start_turn()
+            minutes = job.schedule.every_ms // 60_000
+            lines = [
+                f"心跳已开启，每 {self._humanize_minutes_cn(minutes)} 触发一次。",
+            ]
+            if job.state.next_run_at_ms:
+                from datetime import datetime as _dt
+                nxt = _dt.fromtimestamp(job.state.next_run_at_ms / 1000)
+                lines.append(f"下一次：{nxt.strftime('%H:%M:%S')}")
+            lines.append("\n关闭：`/heartbeat off`")
+            return OutboundMessage(channel=msg.channel, chat_id=msg.chat_id, content="\n".join(lines))
 
-                synthetic = self._format_heartbeat_prompt(unread_items)
-                context = self._get_context(session)
-                initial_messages = context.build_messages(
-                    history=history,
-                    current_message=synthetic,
-                    channel=channel, chat_id=chat_id,
-                    sender_id="heartbeat",
-                    sender_name=None,
-                    system_prompt_extra=session.config.system_prompt,
-                    session_bindings=self._get_bindings_for_session(session_key),
+        # Off
+        if arg == "off":
+            job = self._get_heartbeat_job(session_key)
+            if not job:
+                return OutboundMessage(
+                    channel=msg.channel, chat_id=msg.chat_id, content="心跳本来就没开。",
                 )
+            self.cron_service.remove_job(job.id)
+            return OutboundMessage(
+                channel=msg.channel, chat_id=msg.chat_id, content="心跳已关闭。",
+            )
 
-                if self._should_compact(initial_messages):
-                    logger.info("heartbeat: entry compaction for {}", session_key)
-                    await self._do_compact(session)
-                    self.sessions.save(session)
-                    history = session.get_history(max_messages=history_window)
-                    initial_messages = context.build_messages(
-                        history=history,
-                        current_message=synthetic,
-                        channel=channel, chat_id=chat_id,
-                        sender_id="heartbeat",
-                        sender_name=None,
-                        system_prompt_extra=session.config.system_prompt,
-                        session_bindings=self._get_bindings_for_session(session_key),
-                    )
+        # Else: try to parse as interval
+        minutes = self._parse_heartbeat_interval(arg)
+        if minutes is None:
+            return OutboundMessage(
+                channel=msg.channel, chat_id=msg.chat_id,
+                content=(
+                    "格式不对。\n\n"
+                    "示例：`/heartbeat 30m`、`/heartbeat 2h`、`/heartbeat 30`（默认分钟）、`/heartbeat off`"
+                ),
+            )
+        if minutes < HEARTBEAT_MIN_MINUTES or minutes > HEARTBEAT_MAX_MINUTES:
+            return OutboundMessage(
+                channel=msg.channel, chat_id=msg.chat_id,
+                content=f"间隔需在 {HEARTBEAT_MIN_MINUTES} 分钟到 {HEARTBEAT_MAX_MINUTES // 60} 小时之间。",
+            )
 
-                final_content, tools_used, all_msgs = await self._run_agent_loop(
-                    initial_messages, session=session,
-                )
-            finally:
-                self.tools.unregister(pass_tool.name)
+        # Drop any existing heartbeat job for this session, then register fresh
+        existing = self._get_heartbeat_job(session_key)
+        if existing:
+            self.cron_service.remove_job(existing.id)
 
-            # Advance watermark now that we've fully processed this slice. Persisted on
-            # both the pass and respond paths so the same messages don't re-trigger.
-            now_iso = datetime.now().isoformat()
+        # Write template if HEARTBEATS.md missing
+        created_template = False
+        if session.directory:
+            hb_path = session.directory / "HEARTBEATS.md"
+            if not hb_path.exists():
+                hb_path.write_text(HEARTBEATS_TEMPLATE, encoding="utf-8")
+                created_template = True
+                logger.info("Created HEARTBEATS.md at {}", hb_path)
 
-            if "pass_heartbeat" in tools_used:
-                logger.info("heartbeat: pass for {}", session_key)
-                session.metadata["last_heartbeat_at"] = now_iso
-                self.sessions.save(session)
-                return
+        from bubbles.cron.types import CronSchedule
+        self.cron_service.add_job(
+            name=self._heartbeat_job_name(session_key),
+            schedule=CronSchedule(kind="every", every_ms=minutes * 60_000),
+            message=HEARTBEAT_TICK_MESSAGE,
+            deliver=True,
+            channel=msg.channel,
+            to=msg.chat_id,
+            session_key=session_key,
+        )
 
-            # Persist the assistant's reply (and any intermediate tool turns), but NOT the
-            # synthetic user prompt — skip past system + history + the synthetic user message.
-            self._save_turn(session, all_msgs, 2 + len(history))
-            session.metadata["last_heartbeat_at"] = now_iso
-            self.sessions.save(session)
-
-            if (mt := self.tools.get("message")) and isinstance(mt, MessageTool) and mt._sent_in_turn:
-                return
-
-            if final_content:
-                logger.info(
-                    "heartbeat: replying in {} ({} chars)", session_key, len(final_content),
-                )
-                await self.bus.publish_outbound(OutboundMessage(
-                    channel=channel, chat_id=chat_id, content=final_content,
-                ))
+        body = f"心跳已开启，每 {self._humanize_minutes_cn(minutes)} 触发一次。"
+        if created_template:
+            body += "\n\n已在 <work_dir>/HEARTBEATS.md 写入清单模板，可自行编辑。"
+        else:
+            body += "\n\n沿用现有的 <work_dir>/HEARTBEATS.md。"
+        body += "\n\n关闭：`/heartbeat off`"
+        return OutboundMessage(channel=msg.channel, chat_id=msg.chat_id, content=body)
 
     def _save_turn(self, session: Session, messages: list[dict], skip: int) -> None:
         """Save new-turn messages into session."""
@@ -1235,6 +1147,7 @@ system_prompt: {prompt_val}"""
             current_message=current_query or "",
             channel="cli",
             chat_id="direct",
+            heartbeat_info=self._build_heartbeat_info(session.key),
         )
 
         return rebuilt
@@ -1247,15 +1160,30 @@ system_prompt: {prompt_val}"""
         chat_id: str = "direct",
         on_progress: Callable[[str], Awaitable[None]] | None = None,
         on_tool_call: Callable[[str, dict, str | None], Awaitable[None]] | None = None,
-    ) -> str:
+    ) -> tuple[str, list[str]]:
         """Process a message directly (for CLI or cron usage).
 
         If session_key is None, the session will be determined by:
         1. User's session binding (if exists)
         2. Default: f"{channel}:{chat_id}"
+
+        Returns ``(response_text, tools_used)``. ``tools_used`` lists tool names
+        invoked during the turn — callers can check for sentinel tools like
+        ``stay_silent`` to suppress outbound delivery.
         """
         await self._connect_mcp()
         msg = InboundMessage(channel=channel, sender_id="user", chat_id=chat_id, content=content)
+
+        # Capture which tools ran, while still forwarding to any user-provided on_tool_call.
+        tools_used: list[str] = []
+
+        async def _capture(name: str, args: dict, result: str | None) -> None:
+            if on_tool_call is not None:
+                await on_tool_call(name, args, result)
+            if result is not None:
+                tools_used.append(name)
+
         response = await self._process_message(
-            msg, session_key=session_key, on_progress=on_progress, on_tool_call=on_tool_call)
-        return response.content if response else ""
+            msg, session_key=session_key, on_progress=on_progress, on_tool_call=_capture,
+        )
+        return (response.content if response else ""), tools_used

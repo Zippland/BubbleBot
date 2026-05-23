@@ -1,0 +1,5 @@
+Call this ONLY during a system-triggered turn (heartbeat scan, scheduled cron tick, or any other periodic / autonomous wake-up) when you decide NOT to act this cycle.
+
+The runner periodically wakes you to inspect some context (recent group messages, a workspace file, a scheduled check, etc.). If after looking you judge nothing is worth sending or doing right now (off-topic, already handled, casual chatter you can't add to, condition not met), call this tool. The agent loop ends and nothing is sent to the outbound channel.
+
+If you DO think you should act, just reply normally or call other tools — do NOT call this. This tool is only available during system-triggered turns; if the user message directly asks you something, this tool will not be available.

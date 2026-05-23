@@ -1,5 +1,0 @@
-Call this ONLY during a heartbeat scan of a group chat when you decide NOT to chime in.
-
-The heartbeat scan periodically wakes you to look at recent group messages that didn't @ you. If after reading them you judge the bot should not speak right now (off-topic, already answered by others, casual chatter you have nothing to add to, etc.), call this tool. After calling, the agent loop ends and nothing is sent to the group.
-
-If you DO think the bot should speak, just reply normally — do NOT call this tool. This tool is only available during heartbeat turns; if you don't see a "[heartbeat scan]" preamble in the user message, this tool will not be available.

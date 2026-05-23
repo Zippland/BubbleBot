@@ -20,7 +20,7 @@ class ContextBuilder:
     """
 
     # Bootstrap files loaded from session directory
-    BOOTSTRAP_FILES = ["SOUL.md", "MEMORY.md"]
+    BOOTSTRAP_FILES = ["SOUL.md", "MEMORY.md", "HEARTBEATS.md"]
 
     def __init__(self, session_dir: Path):
         """Initialize context builder.
@@ -114,7 +114,22 @@ Two files in your workspace persist across sessions. Keep them curated.
 
 **Boundary.** Facts about the user / project / world → MEMORY. Rules about how you behave or who you are → SOUL. In doubt: MEMORY holds *"X is true"*, SOUL holds *"I do / don't do X"*.
 
-**Prune ruthlessly.** These are working notes, not append-only logs. When a fact is no longer true (preference changed, project shifted, relationship ended) or a soul entry no longer reflects you, **delete it with `edit_file`**. Stale entries dilute signal and waste tokens every turn. A short, sharp file beats a long, cluttered one."""
+**Prune ruthlessly.** These are working notes, not append-only logs. When a fact is no longer true (preference changed, project shifted, relationship ended) or a soul entry no longer reflects you, **delete it with `edit_file`**. Stale entries dilute signal and waste tokens every turn. A short, sharp file beats a long, cluttered one.
+
+## Periodic tasks
+When the user asks you to do something on a schedule — "remind me at 9am tomorrow", "every 30 min check X", "在这群每 N 分钟扫一下有没有人问技术问题再回答", "每周看看 MEMORY 有没有过时的" — use the `cron` tool to register it.
+
+Write the cron `message` so it carries the full intent:
+- State the condition explicitly (look at recent group history? check a URL? read a file? scan MEMORY?).
+- If the task is "act only when something is worth saying", end the message with: *"If condition met → reply / use the message tool normally. Otherwise → call `stay_silent` and end the turn."* That keeps you quiet when there's nothing to do.
+- Bias toward silence by default: spell out *"Default to no action."* Spam is worse than missed nudges.
+
+`stay_silent` is available in every cron-triggered turn (and any other system-triggered turn). It's NOT available when the user talks to you directly — there, you should always answer.
+
+## Heartbeat (user-controlled)
+Heartbeat is a periodic auto-wake the user can enable per session with `/heartbeat <interval>` (e.g. `/heartbeat 30m`, `/heartbeat 2h`). When ON, the system fires a tick every N minutes asking you to scan `<work_dir>/HEARTBEATS.md` and decide whether to proactively act. Default to silence on ticks — call `stay_silent` when the checklist has nothing pressing. The user disables with `/heartbeat off`.
+
+**You cannot enable heartbeat yourself.** It's intentionally user-only — if the user asks "turn on heartbeat", tell them to run the slash command. The current ON/OFF state is reflected in a `## Heartbeat: ON` block in this prompt when active; if you don't see that block, heartbeat is off."""
 
     @staticmethod
     def _inject_runtime_context(
@@ -164,6 +179,7 @@ Two files in your workspace persist across sessions. Keep them curated.
         sender_name: str | None = None,
         system_prompt_extra: str | None = None,
         session_bindings: list[str] | None = None,
+        heartbeat_info: str | None = None,
     ) -> list[dict[str, Any]]:
         """
         Build the complete message list for an LLM call.
@@ -187,6 +203,10 @@ Two files in your workspace persist across sessions. Keep them curated.
 
         # System prompt
         system_prompt = self.build_system_prompt(skill_names)
+
+        # Heartbeat ON block (only present when enabled for this session)
+        if heartbeat_info:
+            system_prompt += f"\n\n{heartbeat_info}"
 
         # Add session bindings info
         if session_bindings:
