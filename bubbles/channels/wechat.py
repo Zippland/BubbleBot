@@ -785,11 +785,11 @@ class WeChatChannel(BaseChannel):
             logger.error("Failed to send WeChat message: {}", e)
 
     async def get_group_members(self, chat_id: str) -> list[dict[str, object]]:
-        """Return enriched member records for a WeChat group.
+        """Return member records for a WeChat group.
 
-        Each record: ``{id: wxid, name: display, aliases: [searchable names]}``
-        where `name` is the display-priority name (群昵称 > 备注名 > 微信昵称 > 微信号 > wxid)
-        and `aliases` lists every distinct non-empty name for substring search.
+        Each record: ``{id: wxid, names: {label: value, ...}}`` where `names`
+        contains every non-empty identifier we know about, labeled for the
+        model (群昵称 / 备注名 / 微信昵称 / 微信号). The @ marker uses `id`.
         """
         if not self.wcf or not chat_id.endswith("@chatroom"):
             return []
@@ -801,31 +801,24 @@ class WeChatChannel(BaseChannel):
             return []
 
         def _build(wxid: str, room_nickname: str) -> dict[str, object]:
-            # 群昵称 (per-room alias), if any
             try:
                 room_alias = self.wcf.get_alias_in_chatroom(wxid, chat_id) or ""
             except Exception:
                 room_alias = ""
             contact = self._contacts.get(wxid) or WeChatContact()
-            # Display-priority order; dedupe preserving order
-            ordered = [
-                room_alias,
-                contact.remark,
-                contact.nickname,
-                room_nickname,
-                contact.alias,
-            ]
-            seen: set[str] = set()
-            unique: list[str] = []
-            for n in ordered:
-                if n and n not in seen:
-                    seen.add(n)
-                    unique.append(n)
-            return {
-                "id": wxid,
-                "name": unique[0] if unique else wxid,
-                "aliases": unique,
-            }
+            names: dict[str, str] = {}
+            if room_alias:
+                names["群昵称"] = room_alias
+            if contact.remark:
+                names["备注名"] = contact.remark
+            if contact.nickname:
+                names["微信昵称"] = contact.nickname
+            if room_nickname and room_nickname not in names.values():
+                # Distinct from above (rare, but possible if wcferry rosters drift)
+                names.setdefault("成员表昵称", room_nickname)
+            if contact.alias:
+                names["微信号"] = contact.alias
+            return {"id": wxid, "names": names}
 
         return [
             await loop.run_in_executor(None, _build, wxid, nickname)

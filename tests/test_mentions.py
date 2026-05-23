@@ -194,8 +194,8 @@ def test_find_person_no_members(tool) -> None:
 def test_find_person_single_match_returns_marker(tool) -> None:
     cm, _ = _make_channel_manager({
         "room@chatroom": [
-            {"id": "wxid_alice", "name": "Alice"},
-            {"id": "wxid_bob", "name": "Bob"},
+            {"id": "wxid_alice", "names": {"群昵称": "Alice"}},
+            {"id": "wxid_bob", "names": {"群昵称": "Bob"}},
         ]
     })
     tool.set_channel_manager(cm)
@@ -209,9 +209,9 @@ def test_find_person_single_match_returns_marker(tool) -> None:
 def test_find_person_case_insensitive_substring(tool) -> None:
     cm, _ = _make_channel_manager({
         "room@chatroom": [
-            {"id": "1", "name": "张三"},
-            {"id": "2", "name": "张三丰"},
-            {"id": "3", "name": "李四"},
+            {"id": "1", "names": {"群昵称": "张三"}},
+            {"id": "2", "names": {"群昵称": "张三丰"}},
+            {"id": "3", "names": {"群昵称": "李四"}},
         ]
     })
     tool.set_channel_manager(cm)
@@ -224,7 +224,7 @@ def test_find_person_case_insensitive_substring(tool) -> None:
 
 
 def test_find_person_truncates_when_many(tool) -> None:
-    members = [{"id": f"id_{i}", "name": f"User_{i}"} for i in range(15)]
+    members = [{"id": f"id_{i}", "names": {"群昵称": f"User_{i}"}} for i in range(15)]
     cm, _ = _make_channel_manager({"room@chatroom": members})
     tool.set_channel_manager(cm)
     tool.set_context("wechat", "room@chatroom")
@@ -235,48 +235,56 @@ def test_find_person_truncates_when_many(tool) -> None:
     assert out.count("<@id_") == 10
 
 
-def test_find_person_matches_against_aliases(tool) -> None:
-    """Search must hit alternate names (微信号 / 备注 / 微信昵称) too, not just display name."""
+def test_find_person_searches_all_name_fields(tool) -> None:
+    """Search must hit every labelled name (群昵称 / 备注名 / 微信昵称 / 微信号), not just one."""
     cm, _ = _make_channel_manager({
         "room@chatroom": [
             {
                 "id": "wxid_zs",
-                "name": "三哥",                       # 群昵称 (display)
-                "aliases": ["三哥", "Zhang2024", "zs_2024"],  # 备注/微信昵称/微信号
+                "names": {
+                    "群昵称": "三哥",
+                    "备注名": "Zhang2024",
+                    "微信昵称": "Zhangsan",
+                    "微信号": "zs_2024",
+                },
             },
             {
                 "id": "wxid_other",
-                "name": "李四",
-                "aliases": ["李四"],
+                "names": {"群昵称": "李四"},
             },
         ]
     })
     tool.set_channel_manager(cm)
     tool.set_context("wechat", "room@chatroom")
 
-    # Search via 群昵称 (primary name)
-    out = asyncio.run(tool.execute(query="三哥"))
-    assert "<@wxid_zs>" in out
-
-    # Search via 微信昵称 (alternate, not primary)
-    out = asyncio.run(tool.execute(query="zhang"))
-    assert "<@wxid_zs>" in out
-    # And the display includes a "a.k.a." hint so model knows why this matched
-    assert "a.k.a." in out
-
-    # Search via 微信号 (yet another alternate)
-    out = asyncio.run(tool.execute(query="zs_2024"))
-    assert "<@wxid_zs>" in out
+    # Each name layer is independently searchable
+    for query in ("三哥", "zhang", "zs_2024", "Zhangsan"):
+        out = asyncio.run(tool.execute(query=query))
+        assert "<@wxid_zs>" in out, f"query={query!r} did not match"
+        assert "wxid_other" not in out, f"query={query!r} produced false positive"
 
 
-def test_find_person_no_aka_when_primary_matched(tool) -> None:
-    """If query directly hits the display name, don't add (a.k.a. ...) noise."""
+def test_find_person_lists_all_names_in_output(tool) -> None:
+    """Output must show ALL known names of each match so the model can choose how to refer to them."""
     cm, _ = _make_channel_manager({
         "room@chatroom": [
-            {"id": "wxid_zs", "name": "三哥", "aliases": ["三哥", "Zhang"]},
+            {
+                "id": "wxid_zs",
+                "names": {
+                    "群昵称": "三哥",
+                    "备注名": "Zhang2024",
+                    "微信号": "zs_2024",
+                },
+            }
         ]
     })
     tool.set_channel_manager(cm)
     tool.set_context("wechat", "room@chatroom")
     out = asyncio.run(tool.execute(query="三哥"))
-    assert "a.k.a." not in out
+    # All labels surface so the model can pick the right one for prose
+    assert "群昵称: 三哥" in out
+    assert "备注名: Zhang2024" in out
+    assert "微信号: zs_2024" in out
+    # The marker is clearly flagged as the @ identifier
+    assert "<@wxid_zs>" in out
+    assert "put this in your reply" in out.lower()

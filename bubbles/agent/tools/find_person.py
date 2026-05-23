@@ -61,11 +61,8 @@ class FindPersonTool(Tool):
         q_lower = q.lower()
 
         def _matches(m: dict) -> bool:
-            if q_lower in m.get("name", "").lower():
-                return True
-            # Also match against alternate names (微信号 / 微信昵称 / 备注 etc.)
-            for alt in m.get("aliases", []) or []:
-                if q_lower in str(alt).lower():
+            for v in (m.get("names") or {}).values():
+                if v and q_lower in str(v).lower():
                     return True
             return False
 
@@ -75,17 +72,18 @@ class FindPersonTool(Tool):
 
         total = len(matches)
         shown = matches[:MAX_MATCHES_SHOWN]
-        tail = f"\n({total - MAX_MATCHES_SHOWN} more matches truncated — refine the query)" if total > MAX_MATCHES_SHOWN else ""
+        tail = (
+            f"\n({total - MAX_MATCHES_SHOWN} more matches truncated — refine the query)"
+            if total > MAX_MATCHES_SHOWN else ""
+        )
 
         lines = [
-            f"Found {total} match{'es' if total > 1 else ''}.",
-            "To @-mention someone in your reply, embed the `<@id>` marker inline (e.g. `好的 <@xxx> 我看下`).",
+            f"Found {total} match{'es' if total > 1 else ''}. "
+            "Embed the `<@id>` marker shown below into your reply text to @ them."
         ]
-        for m in shown:
-            name = m["name"]
-            aliases = m.get("aliases") or []
-            # Show alternate names if matched on them (helps disambiguate)
-            extra = [a for a in aliases if a and a != name]
-            alt_str = f" (a.k.a. {', '.join(extra)})" if extra and q_lower not in name.lower() else ""
-            lines.append(f"- {name}{alt_str} → `<@{m['id']}>`")
+        for i, m in enumerate(shown, 1):
+            lines.append("")
+            lines.append(f"#{i}  <@{m['id']}>   ← put this in your reply")
+            for label, value in (m.get("names") or {}).items():
+                lines.append(f"    {label}: {value}")
         return "\n".join(lines) + tail
