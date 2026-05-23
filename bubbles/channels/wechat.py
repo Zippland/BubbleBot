@@ -6,6 +6,7 @@ import asyncio
 import html
 import os
 import re
+from dataclasses import dataclass, field
 from queue import Empty
 from threading import Thread
 
@@ -34,6 +35,22 @@ MSG_TYPE_APP = 49  # 文件、链接、小程序、引用等
 MSG_TYPE_SYSTEM = 10000
 
 
+@dataclass
+class WeChatContact:
+    """Names attached to a wxid. Empty strings mean field is not set."""
+    nickname: str = ""  # 微信昵称（profile name）
+    alias: str = ""     # 微信号（user-chosen short id）
+    remark: str = ""    # 备注名（this bot account's note on the contact）
+
+    def all_names(self) -> list[str]:
+        """All non-empty searchable names, in display-priority order."""
+        return [n for n in (self.remark, self.nickname, self.alias) if n]
+
+    def primary(self) -> str:
+        """Best name for display: remark > nickname > alias > '' ."""
+        return self.remark or self.nickname or self.alias or ""
+
+
 class WeChatChannel(BaseChannel):
     """
     WeChat channel using wcferry.
@@ -59,7 +76,7 @@ class WeChatChannel(BaseChannel):
         self._wechat_home: str = ""  # WeChat file storage base directory
         self._recv_thread: Thread | None = None
         self._loop: asyncio.AbstractEventLoop | None = None
-        self._contacts: dict[str, str] = {}  # wxid -> nickname cache
+        self._contacts: dict[str, WeChatContact] = {}  # wxid -> WeChatContact
 
     async def start(self) -> None:
         """Start WeChat client and begin listening for messages."""
@@ -94,25 +111,32 @@ class WeChatChannel(BaseChannel):
             await asyncio.sleep(1)
 
     def _load_contacts(self) -> None:
-        """Load all contacts from WeChat database."""
+        """Load full Contact records from WeChat database (nickname + alias + remark)."""
         if not self.wcf:
             return
         try:
             contacts = self.wcf.query_sql(
                 "MicroMsg.db",
-                "SELECT UserName, NickName FROM Contact;"
+                "SELECT UserName, NickName, Alias, Remark FROM Contact;",
             )
-            self._contacts = {c["UserName"]: c["NickName"] for c in contacts}
+            self._contacts = {
+                c["UserName"]: WeChatContact(
+                    nickname=c.get("NickName") or "",
+                    alias=c.get("Alias") or "",
+                    remark=c.get("Remark") or "",
+                )
+                for c in contacts
+            }
             logger.info("Loaded {} contacts", len(self._contacts))
         except Exception as e:
             logger.warning("Failed to load contacts: {}", e)
 
     def _get_sender_name(self, sender_id: str, room_id: str | None = None) -> str | None:
-        """Get sender display name. For groups, try group alias first."""
+        """Resolve display name: 群昵称 → 备注名 → 微信昵称 → 微信号."""
         if not self.wcf:
             return None
 
-        # For group chat, try to get alias in chatroom first
+        # For group chat, try to get the per-room alias (群昵称) first
         if room_id:
             try:
                 alias = self.wcf.get_alias_in_chatroom(sender_id, room_id)
@@ -121,8 +145,8 @@ class WeChatChannel(BaseChannel):
             except Exception:
                 pass
 
-        # Fallback to contact nickname
-        return self._contacts.get(sender_id)
+        contact = self._contacts.get(sender_id)
+        return contact.primary() if contact else None
 
     def _recv_loop(self) -> None:
         """Background thread for receiving messages from wcferry."""
@@ -295,13 +319,12 @@ class WeChatChannel(BaseChannel):
         return replace_mentions(text, repl), ",".join(aters)
 
     def _is_at_in_text(self, text: str) -> bool:
-        """Check if text contains @mention to self."""
+        """True if text contains `@<bot-name>` under any of the bot's known names."""
         if not self.wcf:
             return False
-        my_name = self._contacts.get(self.wxid, "")
-        if my_name and f"@{my_name}" in text:
-            return True
-        return False
+        contact = self._contacts.get(self.wxid)
+        names = contact.all_names() if contact else []
+        return any(name and f"@{name}" in text for name in names)
 
     async def _download_and_save_media(
         self,
@@ -761,17 +784,53 @@ class WeChatChannel(BaseChannel):
         except Exception as e:
             logger.error("Failed to send WeChat message: {}", e)
 
-    async def get_group_members(self, chat_id: str) -> list[dict[str, str]]:
-        """Return [{id: wxid, name: nickname}] for a WeChat group, or [] if not a group / unavailable."""
+    async def get_group_members(self, chat_id: str) -> list[dict[str, object]]:
+        """Return enriched member records for a WeChat group.
+
+        Each record: ``{id: wxid, name: display, aliases: [searchable names]}``
+        where `name` is the display-priority name (群昵称 > 备注名 > 微信昵称 > 微信号 > wxid)
+        and `aliases` lists every distinct non-empty name for substring search.
+        """
         if not self.wcf or not chat_id.endswith("@chatroom"):
             return []
+        loop = asyncio.get_running_loop()
         try:
-            loop = asyncio.get_running_loop()
             members = await loop.run_in_executor(None, self.wcf.get_chatroom_members, chat_id)
         except Exception as e:
             logger.warning("Failed to fetch chatroom members for {}: {}", chat_id, e)
             return []
-        return [{"id": wxid, "name": name} for wxid, name in (members or {}).items()]
+
+        def _build(wxid: str, room_nickname: str) -> dict[str, object]:
+            # 群昵称 (per-room alias), if any
+            try:
+                room_alias = self.wcf.get_alias_in_chatroom(wxid, chat_id) or ""
+            except Exception:
+                room_alias = ""
+            contact = self._contacts.get(wxid) or WeChatContact()
+            # Display-priority order; dedupe preserving order
+            ordered = [
+                room_alias,
+                contact.remark,
+                contact.nickname,
+                room_nickname,
+                contact.alias,
+            ]
+            seen: set[str] = set()
+            unique: list[str] = []
+            for n in ordered:
+                if n and n not in seen:
+                    seen.add(n)
+                    unique.append(n)
+            return {
+                "id": wxid,
+                "name": unique[0] if unique else wxid,
+                "aliases": unique,
+            }
+
+        return [
+            await loop.run_in_executor(None, _build, wxid, nickname)
+            for wxid, nickname in (members or {}).items()
+        ]
 
     async def stop(self) -> None:
         """Stop WeChat client."""

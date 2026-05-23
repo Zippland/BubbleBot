@@ -59,7 +59,17 @@ class FindPersonTool(Tool):
             return "No group members available (this isn't a group, or the roster is empty)."
 
         q_lower = q.lower()
-        matches = [m for m in members if q_lower in m.get("name", "").lower()]
+
+        def _matches(m: dict) -> bool:
+            if q_lower in m.get("name", "").lower():
+                return True
+            # Also match against alternate names (微信号 / 微信昵称 / 备注 etc.)
+            for alt in m.get("aliases", []) or []:
+                if q_lower in str(alt).lower():
+                    return True
+            return False
+
+        matches = [m for m in members if _matches(m)]
         if not matches:
             return f"No member matched '{q}' (searched {len(members)} member(s))."
 
@@ -72,5 +82,10 @@ class FindPersonTool(Tool):
             "To @-mention someone in your reply, embed the `<@id>` marker inline (e.g. `好的 <@xxx> 我看下`).",
         ]
         for m in shown:
-            lines.append(f"- {m['name']} → `<@{m['id']}>`")
+            name = m["name"]
+            aliases = m.get("aliases") or []
+            # Show alternate names if matched on them (helps disambiguate)
+            extra = [a for a in aliases if a and a != name]
+            alt_str = f" (a.k.a. {', '.join(extra)})" if extra and q_lower not in name.lower() else ""
+            lines.append(f"- {name}{alt_str} → `<@{m['id']}>`")
         return "\n".join(lines) + tail

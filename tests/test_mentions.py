@@ -233,3 +233,50 @@ def test_find_person_truncates_when_many(tool) -> None:
     assert "truncated" in out.lower()
     # Only 10 markers shown
     assert out.count("<@id_") == 10
+
+
+def test_find_person_matches_against_aliases(tool) -> None:
+    """Search must hit alternate names (微信号 / 备注 / 微信昵称) too, not just display name."""
+    cm, _ = _make_channel_manager({
+        "room@chatroom": [
+            {
+                "id": "wxid_zs",
+                "name": "三哥",                       # 群昵称 (display)
+                "aliases": ["三哥", "Zhang2024", "zs_2024"],  # 备注/微信昵称/微信号
+            },
+            {
+                "id": "wxid_other",
+                "name": "李四",
+                "aliases": ["李四"],
+            },
+        ]
+    })
+    tool.set_channel_manager(cm)
+    tool.set_context("wechat", "room@chatroom")
+
+    # Search via 群昵称 (primary name)
+    out = asyncio.run(tool.execute(query="三哥"))
+    assert "<@wxid_zs>" in out
+
+    # Search via 微信昵称 (alternate, not primary)
+    out = asyncio.run(tool.execute(query="zhang"))
+    assert "<@wxid_zs>" in out
+    # And the display includes a "a.k.a." hint so model knows why this matched
+    assert "a.k.a." in out
+
+    # Search via 微信号 (yet another alternate)
+    out = asyncio.run(tool.execute(query="zs_2024"))
+    assert "<@wxid_zs>" in out
+
+
+def test_find_person_no_aka_when_primary_matched(tool) -> None:
+    """If query directly hits the display name, don't add (a.k.a. ...) noise."""
+    cm, _ = _make_channel_manager({
+        "room@chatroom": [
+            {"id": "wxid_zs", "name": "三哥", "aliases": ["三哥", "Zhang"]},
+        ]
+    })
+    tool.set_channel_manager(cm)
+    tool.set_context("wechat", "room@chatroom")
+    out = asyncio.run(tool.execute(query="三哥"))
+    assert "a.k.a." not in out
