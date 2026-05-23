@@ -1,0 +1,13 @@
+Search for a person in the current group chat by name to get an @-mention marker.
+
+Use this when you want to @-mention someone in your reply but don't yet know their channel-native ID. Returns matching members along with their `<@id>` markers. Embed the marker directly into your reply text — the channel layer will translate it into a real @-mention on send.
+
+Only works in group chats; private chats / CLI return "No group members available." The search is case-insensitive substring match against display names. If multiple people match, refine the query (e.g., longer fragment).
+
+Example usage:
+- You want to reply to a Bob who asked something. Call find_person("Bob") → returns `Bob → <@wxid_xxx>`. Your reply: `好的 <@wxid_xxx> 我看下`.
+
+Do NOT call this when:
+- You're not in a group chat (the tool will tell you, but it's wasted call).
+- You already see a `<@id>` marker in the conversation history — just reuse it directly.
+- The person hasn't appeared in this group's roster (tool can't find them).

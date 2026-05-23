@@ -41,6 +41,7 @@ from bubbles.agent.context import ContextBuilder
 from bubbles.agent.subagent import SubagentManager
 from bubbles.agent.tools.cron import CronTool
 from bubbles.agent.tools.filesystem import EditFileTool, ListDirTool, ReadFileTool, WriteFileTool
+from bubbles.agent.tools.find_person import FindPersonTool
 from bubbles.agent.tools.message import MessageTool
 from bubbles.agent.tools.registry import ToolRegistry
 from bubbles.agent.tools.shell import ExecTool
@@ -89,6 +90,7 @@ class AgentLoop:
         exec_config: ExecToolConfig | None = None,
         cron_service: CronService | None = None,
         session_manager: SessionManager | None = None,
+        channel_manager: Any = None,
         mcp_servers: dict | None = None,
         channels_config: ChannelsConfig | None = None,
         # Auto-compaction settings
@@ -111,6 +113,7 @@ class AgentLoop:
         self.tavily_api_key = tavily_api_key
         self.exec_config = exec_config or ExecToolConfig()
         self.cron_service = cron_service
+        self.channel_manager = channel_manager
 
         # Auto-compaction settings
         self.compact_threshold = compact_threshold
@@ -160,6 +163,10 @@ class AgentLoop:
         self.tools.register(SpawnTool(manager=self.subagents))
         if self.cron_service:
             self.tools.register(CronTool(self.cron_service))
+        if self.channel_manager is not None:
+            find_person = FindPersonTool()
+            find_person.set_channel_manager(self.channel_manager)
+            self.tools.register(find_person)
         # Task tools: session is set dynamically via _set_tool_context()
         for cls in (TaskListTool, TaskGetTool, TaskCreateTool, TaskUpdateTool):
             self.tools.register(cls())
@@ -274,7 +281,7 @@ class AgentLoop:
         session: Session | None = None,
     ) -> None:
         """Update context for all tools that need routing info."""
-        for name in ("message", "spawn", "cron"):
+        for name in ("message", "spawn", "cron", "find_person"):
             if tool := self.tools.get(name):
                 if hasattr(tool, "set_context"):
                     if name == "message":

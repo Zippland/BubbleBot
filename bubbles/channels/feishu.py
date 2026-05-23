@@ -15,6 +15,7 @@ from loguru import logger
 from bubbles.bus.events import OutboundMessage
 from bubbles.bus.queue import MessageBus
 from bubbles.channels.base import BaseChannel
+from bubbles.channels.mentions import replace_mentions
 from bubbles.config.schema import FeishuConfig
 
 try:
@@ -396,6 +397,32 @@ class FeishuChannel(BaseChannel):
             "rows": [{f"c{i}": r[i] if i < len(r) else "" for i in range(len(headers))} for r in rows],
         }
 
+    @staticmethod
+    def _resolve_inbound_mentions(content: str, mentions: Any) -> str:
+        """Convert Feishu `@_user_X` placeholders into cross-channel `<@id>` markers.
+
+        Uses the message's `mentions` array (each item exposes `key` like
+        "@_user_1" and an `id` object with `.open_id`). Placeholders without a
+        matching mention (e.g. `@_all`) are dropped as before.
+        """
+        if not content:
+            return content
+
+        mapping: dict[str, str] = {}
+        for m in mentions or []:
+            key = getattr(m, "key", None)
+            mid = getattr(m, "id", None)
+            open_id = getattr(mid, "open_id", None) if mid else None
+            if key and open_id:
+                mapping[key] = open_id
+
+        def _replace(match: "re.Match[str]") -> str:
+            key = match.group(0).rstrip()
+            return f"<@{mapping[key]}> " if key in mapping else ""
+
+        # Strip trailing whitespace from match itself and re-add a single space on hit
+        return re.sub(r"@_\w+\s*", _replace, content)
+
     def _build_card_elements(self, content: str) -> list[dict]:
         """Split content into div/markdown + table elements for Feishu card."""
         elements, last_end = [], 0
@@ -677,7 +704,9 @@ class FeishuChannel(BaseChannel):
                         )
 
             if msg.content and msg.content.strip():
-                card = {"config": {"wide_screen_mode": True}, "elements": self._build_card_elements(msg.content)}
+                # Translate cross-channel `<@id>` markers to Feishu's `<at id="...">` markdown
+                translated = replace_mentions(msg.content, lambda i: f'<at id="{i}"></at>')
+                card = {"config": {"wide_screen_mode": True}, "elements": self._build_card_elements(translated)}
                 await loop.run_in_executor(
                     None, self._send_message_sync,
                     receive_id_type, msg.chat_id, "interactive", json.dumps(card, ensure_ascii=False),
@@ -685,7 +714,46 @@ class FeishuChannel(BaseChannel):
 
         except Exception as e:
             logger.error("Error sending Feishu message: {}", e)
-    
+
+    def _list_chat_members_sync(self, chat_id: str) -> list[dict[str, str]]:
+        """Paginated GET /im/v1/chats/{chat_id}/members. Synchronous; runs in executor."""
+        from lark_oapi.api.im.v1 import GetChatMembersRequest
+
+        results: list[dict[str, str]] = []
+        page_token: str | None = None
+        for _ in range(20):  # safety cap: 20 pages * 100 = 2000 members
+            builder = GetChatMembersRequest.builder().chat_id(chat_id) \
+                .member_id_type("open_id").page_size(100)
+            if page_token:
+                builder = builder.page_token(page_token)
+            try:
+                resp = self._client.im.v1.chat_members.get(builder.build())
+            except Exception as e:
+                logger.warning("Feishu get_chat_members failed for {}: {}", chat_id, e)
+                break
+            if not resp.success():
+                logger.warning(
+                    "Feishu get_chat_members error: code={}, msg={}", resp.code, resp.msg,
+                )
+                break
+            items = (resp.data.items if resp.data else None) or []
+            for m in items:
+                if m.member_id and m.name:
+                    results.append({"id": m.member_id, "name": m.name})
+            if not (resp.data and resp.data.has_more):
+                break
+            page_token = resp.data.page_token
+            if not page_token:
+                break
+        return results
+
+    async def get_group_members(self, chat_id: str) -> list[dict[str, str]]:
+        """Return [{id: open_id, name}] for a Feishu group chat, [] otherwise."""
+        if not self._client or not chat_id.startswith("oc_"):
+            return []
+        loop = asyncio.get_running_loop()
+        return await loop.run_in_executor(None, self._list_chat_members_sync, chat_id)
+
     def _on_message_sync(self, data: "P2ImMessageReceiveV1") -> None:
         """
         Sync handler for incoming messages (called from WebSocket thread).
@@ -771,8 +839,8 @@ class FeishuChannel(BaseChannel):
 
             content = "\n".join(content_parts) if content_parts else ""
 
-            # Remove @mention placeholders (e.g., @_user_1, @_all)
-            content = re.sub(r"@_\w+\s*", "", content).strip()
+            # Convert Feishu @-mention placeholders to cross-channel `<@id>` markers
+            content = self._resolve_inbound_mentions(content, message.mentions).strip()
 
             # Handle quoted/replied message - download media from parent message
             parent_id = message.parent_id
@@ -808,7 +876,7 @@ class FeishuChannel(BaseChannel):
                             content_parts.append(content_text)
                 # Rebuild content with quoted media descriptions
                 content = "\n".join(content_parts) if content_parts else ""
-                content = re.sub(r"@_\w+\s*", "", content).strip()
+                content = self._resolve_inbound_mentions(content, message.mentions).strip()
 
             if not content and not media_paths:
                 return
