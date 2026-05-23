@@ -14,6 +14,7 @@ from loguru import logger
 from bubbles.bus.events import OutboundMessage
 from bubbles.bus.queue import MessageBus
 from bubbles.channels.base import BaseChannel
+from bubbles.channels.mentions import extract_mentions, replace_mentions
 from bubbles.config.schema import WeChatConfig
 
 try:
@@ -169,7 +170,16 @@ class WeChatChannel(BaseChannel):
         media_paths: list[str] = []
 
         if msg.type == MSG_TYPE_TEXT:
-            text = self._strip_at_mention(msg.content) if is_at_me and is_group else msg.content
+            text = msg.content
+            # In groups, convert WeChat-native "@nickname " mentions to `<@wxid>`
+            # markers so the model sees a uniform format. Falls back to stripping
+            # @me when no aters info is available.
+            if is_group:
+                aters = self._parse_atuserlist(msg.xml)
+                if aters:
+                    text = self._convert_inbound_mentions(text, aters)
+                elif is_at_me:
+                    text = self._strip_at_mention(text)
 
         elif msg.type == MSG_TYPE_IMAGE:
             file_path, content_text = await self._download_and_save_media(
@@ -236,6 +246,53 @@ class WeChatChannel(BaseChannel):
         # WeChat @mention format: @nickname followed by space or text
         # Pattern: @xxx followed by space or end
         return re.sub(r"@\S+\s*", "", content).strip()
+
+    @staticmethod
+    def _parse_atuserlist(xml: str | None) -> list[str]:
+        """Extract @-ed wxids from msg.xml's <atuserlist> element (ordered)."""
+        if not xml:
+            return []
+        m = re.search(r"<atuserlist>(?:<!\[CDATA\[)?(.*?)(?:\]\]>)?</atuserlist>", xml, re.S)
+        if not m:
+            return []
+        return [w for w in m.group(1).strip().strip(",").split(",") if w]
+
+    @staticmethod
+    def _convert_inbound_mentions(text: str, aters: list[str]) -> str:
+        """Replace `@<token>` substrings positionally with `<@wxid>` markers.
+
+        Order in `aters` is assumed to match the order of `@` substrings in text
+        (the WeChat client emits them aligned).
+        """
+        if not aters or not text:
+            return text
+        it = iter(aters)
+
+        def repl(_m: re.Match) -> str:
+            try:
+                return f"<@{next(it)}>"
+            except StopIteration:
+                return _m.group(0)
+
+        return re.sub(r"@\S+", repl, text)
+
+    def _translate_outbound_mentions(self, text: str, chat_id: str) -> tuple[str, str]:
+        """Convert `<@wxid>` markers to WeChat `@nickname` format + aters CSV.
+
+        WeChat requires the outbound text to contain N `@` substrings matching
+        the N wxids in `aters`. We resolve the nickname (group alias preferred,
+        falling back to contact nickname or wxid) so the visible text is friendly.
+        """
+        aters: list[str] = []
+        room_id = chat_id if chat_id.endswith("@chatroom") else None
+
+        def repl(wxid: str) -> str:
+            aters.append(wxid)
+            nickname = self._get_sender_name(wxid, room_id) or wxid
+            # U+2005 is the four-per-em space WeChat itself uses after @nickname
+            return f"@{nickname} "
+
+        return replace_mentions(text, repl), ",".join(aters)
 
     def _is_at_in_text(self, text: str) -> bool:
         """Check if text contains @mention to self."""
@@ -695,10 +752,26 @@ class WeChatChannel(BaseChannel):
 
             # Send text content
             if msg.content and msg.content.strip():
-                self.wcf.send_text(msg.content, msg.chat_id)
-                logger.debug("Sent message to {}: {}...", msg.chat_id, msg.content[:50])
+                text, aters = self._translate_outbound_mentions(msg.content, msg.chat_id)
+                self.wcf.send_text(text, msg.chat_id, aters)
+                logger.debug(
+                    "Sent message to {}: {}... (aters={})",
+                    msg.chat_id, text[:50], aters or "-",
+                )
         except Exception as e:
             logger.error("Failed to send WeChat message: {}", e)
+
+    async def get_group_members(self, chat_id: str) -> list[dict[str, str]]:
+        """Return [{id: wxid, name: nickname}] for a WeChat group, or [] if not a group / unavailable."""
+        if not self.wcf or not chat_id.endswith("@chatroom"):
+            return []
+        try:
+            loop = asyncio.get_running_loop()
+            members = await loop.run_in_executor(None, self.wcf.get_chatroom_members, chat_id)
+        except Exception as e:
+            logger.warning("Failed to fetch chatroom members for {}: {}", chat_id, e)
+            return []
+        return [{"id": wxid, "name": name} for wxid, name in (members or {}).items()]
 
     async def stop(self) -> None:
         """Stop WeChat client."""

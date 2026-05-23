@@ -63,6 +63,14 @@ class BaseChannel(ABC):
         """
         pass
     
+    async def get_group_members(self, chat_id: str) -> list[dict[str, str]]:
+        """Return [{id, name}] for members of chat_id (group chats only).
+
+        Default implementation returns []. Channels that support group rosters
+        (WeChat, Feishu, etc.) should override.
+        """
+        return []
+
     def is_allowed(self, sender_id: str) -> bool:
         """
         Check if a sender is allowed to use this bot.

@@ -273,8 +273,12 @@ def gateway(
     # Create cron service first (callback set after agent creation)
     cron_store_path = get_data_dir() / "cron" / "jobs.json"
     cron = CronService(cron_store_path)
-    
-    # Create agent with cron service
+
+    # Channels are needed by the agent (find_person tool dispatches to them),
+    # so construct them before the agent. Started later, alongside the agent.
+    channels = ChannelManager(config, bus)
+
+    # Create agent with cron service + channel manager
     agent = AgentLoop(
         bus=bus,
         provider=provider,
@@ -288,6 +292,7 @@ def gateway(
         exec_config=config.tools.exec,
         cron_service=cron,
         session_manager=session_manager,
+        channel_manager=channels,
         mcp_servers=config.tools.mcp_servers,
         channels_config=config.channels,
     )
@@ -329,9 +334,6 @@ def gateway(
             ))
         return response
     cron.on_job = on_cron_job
-    
-    # Create channel manager
-    channels = ChannelManager(config, bus)
 
     if channels.enabled_channels:
         console.print(f"[green]✓[/green] Channels enabled: {', '.join(channels.enabled_channels)}")
