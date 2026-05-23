@@ -127,9 +127,7 @@ Write the cron `message` so it carries the full intent:
 `stay_silent` is available in every cron-triggered turn (and any other system-triggered turn). It's NOT available when the user talks to you directly — there, you should always answer.
 
 ## Heartbeat (user-controlled)
-Heartbeat is a periodic auto-wake the user can enable per session with `/heartbeat <interval>` (e.g. `/heartbeat 30m`, `/heartbeat 2h`). When ON, the system fires a tick every N minutes asking you to scan `<work_dir>/HEARTBEATS.md` and decide whether to proactively act. Default to silence on ticks — call `stay_silent` when the checklist has nothing pressing. The user disables with `/heartbeat off`.
-
-**You cannot enable heartbeat yourself.** It's intentionally user-only — if the user asks "turn on heartbeat", tell them to run the slash command. The current ON/OFF state is reflected in a `## Heartbeat: ON` block in this prompt when active; if you don't see that block, heartbeat is off."""
+The user can enable a periodic auto-wake with `/heartbeat <interval>` (e.g. `30m`, `2h`); disable with `/heartbeat off`. **You cannot enable it yourself** — only the user can. When active, a `## Heartbeat: ON` block appears below and ticks fire on the cadence asking you to read HEARTBEATS.md and act on its checklist."""
 
     @staticmethod
     def _inject_runtime_context(

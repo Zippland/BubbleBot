@@ -141,7 +141,8 @@ def test_heartbeat_replace_keeps_existing_template(loop) -> None:
     assert "已开启" in out.content
     assert "1 小时" in out.content
     assert hb_path.read_text(encoding="utf-8") == "# my own checklist\n- item A"
-    assert "沿用现有" in out.content
+    # Re-enabling on an existing file must not boast about writing a template
+    assert "模板" not in out.content
 
     # Only one heartbeat job exists (old was replaced, not duplicated)
     matches = [
