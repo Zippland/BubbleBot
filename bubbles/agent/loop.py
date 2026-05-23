@@ -91,6 +91,8 @@ class AgentLoop:
         cron_service: CronService | None = None,
         session_manager: SessionManager | None = None,
         channel_manager: Any = None,
+        provider_factory: Callable[[str], tuple[str, LLMProvider]] | None = None,
+        default_provider_name: str | None = None,
         mcp_servers: dict | None = None,
         channels_config: ChannelsConfig | None = None,
         # Auto-compaction settings
@@ -114,6 +116,11 @@ class AgentLoop:
         self.exec_config = exec_config or ExecToolConfig()
         self.cron_service = cron_service
         self.channel_manager = channel_manager
+        self.provider_factory = provider_factory
+        self.default_provider_name = default_provider_name
+        self._provider_cache: dict[str, LLMProvider] = {}
+        if provider is not None and default_provider_name:
+            self._provider_cache[default_provider_name] = provider
 
         # Auto-compaction settings
         self.compact_threshold = compact_threshold
@@ -170,6 +177,28 @@ class AgentLoop:
         # Task tools: session is set dynamically via _set_tool_context()
         for cls in (TaskListTool, TaskGetTool, TaskCreateTool, TaskUpdateTool):
             self.tools.register(cls())
+
+    def _provider_for(self, model: str | None) -> LLMProvider:
+        """Resolve the provider that should handle this model.
+
+        Caches per provider_name; falls back to the default provider when no
+        factory is configured or instantiation fails (logged warning).
+        """
+        if not model or self.provider_factory is None:
+            return self.provider
+        try:
+            provider_name, prov = self.provider_factory(model)
+        except Exception as e:
+            logger.warning(
+                "Provider factory failed for model {!r}: {} — falling back to default",
+                model, e,
+            )
+            return self.provider
+        cached = self._provider_cache.get(provider_name)
+        if cached is not None:
+            return cached
+        self._provider_cache[provider_name] = prov
+        return prov
 
     def _get_context(self, session: Session) -> ContextBuilder:
         """Get ContextBuilder for a session (cached per session key)."""
@@ -359,7 +388,7 @@ class AgentLoop:
             if self._should_compact(messages):
                 messages = await self._mid_loop_compact(session, messages, on_progress)
 
-            response = await self.provider.chat(
+            response = await self._provider_for(model).chat(
                 messages=messages,
                 tools=self.tools.get_definitions(),
                 model=model,
@@ -860,6 +889,14 @@ system_prompt: {prompt_val}"""
             )
 
         if key == "model":
+            if value and self.provider_factory is not None:
+                try:
+                    self.provider_factory(value)
+                except Exception as e:
+                    return OutboundMessage(
+                        channel=msg.channel, chat_id=msg.chat_id,
+                        content=f"无法切换到 `{value}`：{e}",
+                    )
             cfg.model = value if value else None
             self.sessions.save(session)
             return OutboundMessage(
