@@ -715,11 +715,11 @@ class FeishuChannel(BaseChannel):
         except Exception as e:
             logger.error("Error sending Feishu message: {}", e)
 
-    def _list_chat_members_sync(self, chat_id: str) -> list[dict[str, str]]:
+    def _list_chat_members_sync(self, chat_id: str) -> list[dict[str, object]]:
         """Paginated GET /im/v1/chats/{chat_id}/members. Synchronous; runs in executor."""
         from lark_oapi.api.im.v1 import GetChatMembersRequest
 
-        results: list[dict[str, str]] = []
+        results: list[dict[str, object]] = []
         page_token: str | None = None
         for _ in range(20):  # safety cap: 20 pages * 100 = 2000 members
             builder = GetChatMembersRequest.builder().chat_id(chat_id) \
@@ -739,7 +739,7 @@ class FeishuChannel(BaseChannel):
             items = (resp.data.items if resp.data else None) or []
             for m in items:
                 if m.member_id and m.name:
-                    results.append({"id": m.member_id, "name": m.name})
+                    results.append({"id": m.member_id, "names": {"姓名": m.name}})
             if not (resp.data and resp.data.has_more):
                 break
             page_token = resp.data.page_token
@@ -747,8 +747,8 @@ class FeishuChannel(BaseChannel):
                 break
         return results
 
-    async def get_group_members(self, chat_id: str) -> list[dict[str, str]]:
-        """Return [{id: open_id, name}] for a Feishu group chat, [] otherwise."""
+    async def get_group_members(self, chat_id: str) -> list[dict[str, object]]:
+        """Return [{id: open_id, names: {姓名: ...}}] for a Feishu group, [] otherwise."""
         if not self._client or not chat_id.startswith("oc_"):
             return []
         loop = asyncio.get_running_loop()
