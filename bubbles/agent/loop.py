@@ -708,19 +708,18 @@ class AgentLoop:
                 content=f"Nothing to compact: {result.error or 'not enough messages'}"
             )
         if cmd == "/help":
-            help_text = """/new - new conversation
-/compact - compress history
-/stop - stop current task
-/session [id] - bind session
-/session unbind - unbind
-/config - view/set config
-/config reset - reset all
-/heartbeat 30m - enable periodic auto-wake (or 2h, etc.)
-/heartbeat off - disable
-/heartbeat - show status
-
-For periodic / proactive tasks, just tell me in natural language and I'll
-register a cron job ("each morning at 9, check my deadlines", etc.)."""
+            help_text = """/new
+  开始一段新对话
+/compact
+  压缩历史
+/stop
+  中止当前任务
+/session [<id>|unbind]
+  绑定 / 解绑会话
+/config [<key> <value>|reset]
+  key: model | system_prompt；reset 还原默认
+/heartbeat [<间隔>|off]
+  开启（30m / 2h…）/ 关闭定时唤醒"""
             return OutboundMessage(channel=msg.channel, chat_id=msg.chat_id, content=help_text)
 
         # should_respond was computed at the top of this method (around the command-gate).
@@ -840,16 +839,11 @@ register a cron job ("each morning at 9, check my deadlines", etc.)."""
         cfg = session.config
 
         if not cmd_arg:
-            # Show current session config
+            # Show current session config (only the settable keys)
             model_val = cfg.model or self.model
-            temp_val = cfg.temperature if cfg.temperature is not None else self.temperature
-            tokens_val = cfg.max_tokens or self.max_tokens
             prompt_val = (cfg.system_prompt[:30] + "...") if cfg.system_prompt else "-"
-
             config_text = f"""session: {session.key}
 model: {model_val}
-temperature: {temp_val}
-max_tokens: {tokens_val}
 system_prompt: {prompt_val}"""
             return OutboundMessage(channel=msg.channel, chat_id=msg.chat_id, content=config_text)
 
@@ -873,34 +867,6 @@ system_prompt: {prompt_val}"""
                 content=f"model = `{value}`" if value else "model reset to default"
             )
 
-        if key == "temperature":
-            try:
-                cfg.temperature = float(value) if value else None
-                self.sessions.save(session)
-                return OutboundMessage(
-                    channel=msg.channel, chat_id=msg.chat_id,
-                    content=f"temperature = `{value}`" if value else "temperature reset to default"
-                )
-            except ValueError:
-                return OutboundMessage(
-                    channel=msg.channel, chat_id=msg.chat_id,
-                    content=f"Invalid temperature: `{value}` (must be a number)"
-                )
-
-        if key == "max_tokens":
-            try:
-                cfg.max_tokens = int(value) if value else None
-                self.sessions.save(session)
-                return OutboundMessage(
-                    channel=msg.channel, chat_id=msg.chat_id,
-                    content=f"max_tokens = `{value}`" if value else "max_tokens reset to default"
-                )
-            except ValueError:
-                return OutboundMessage(
-                    channel=msg.channel, chat_id=msg.chat_id,
-                    content=f"Invalid max_tokens: `{value}` (must be an integer)"
-                )
-
         if key == "system_prompt":
             cfg.system_prompt = value if value else None
             self.sessions.save(session)
@@ -911,7 +877,7 @@ system_prompt: {prompt_val}"""
 
         return OutboundMessage(
             channel=msg.channel, chat_id=msg.chat_id,
-            content=f"Unknown config key: `{key}`\n\nValid keys: provider, model, temperature, max_tokens, system_prompt"
+            content=f"Unknown config key: `{key}`\n\nValid keys: model, system_prompt"
         )
 
     # ===== Heartbeat (user-controlled periodic auto-wake) =====
