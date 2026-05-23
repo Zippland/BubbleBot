@@ -729,6 +729,18 @@ class WeChatChannel(BaseChannel):
         if media_dir is None:
             return None, "[图片: 请先使用 /session <name> 绑定工作区]"
 
+        # wcferry 下载图片时按 md5 命名落到 data/；quote XML 里 <img md5="..."/>
+        # 就是同一张图。命中本地副本就直接复用，避开旧消息 cdn 已过期导致的
+        # FUNC_DOWNLOAD_ATTACH 超时。
+        md5_match = re.search(r'md5="([0-9a-f]{32})"', content_xml)
+        if md5_match:
+            md5 = md5_match.group(1)
+            for ext in self._IMAGE_EXTS:
+                cached = media_dir / f"{md5}{ext}"
+                if cached.exists():
+                    logger.debug("Reusing cached quoted image: {}", cached)
+                    return str(cached), f"[图片: <work_dir>/data/{md5}{ext}]"
+
         # Use the decoded content XML directly as extra parameter
         # wcferry's download_attach can parse this XML to get the image
         extra = content_xml
