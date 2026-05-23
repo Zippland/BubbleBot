@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import asyncio
-import html
 import os
 import re
 from dataclasses import dataclass, field
@@ -14,8 +13,10 @@ from loguru import logger
 
 from bubbles.bus.events import OutboundMessage
 from bubbles.bus.queue import MessageBus
+from bubbles.channels import wechat_app
 from bubbles.channels.base import BaseChannel
 from bubbles.channels.mentions import extract_mentions, replace_mentions
+from bubbles.channels.wechat_app import IMAGE_EXTS
 from bubbles.config.schema import WeChatConfig
 
 try:
@@ -231,7 +232,10 @@ class WeChatChannel(BaseChannel):
 
         elif msg.type == MSG_TYPE_APP:
             # Handle app messages (files, links, quotes, etc.)
-            text, media_paths, is_reply_to_me = await self._process_app_msg(msg, chat_id)
+            text, media_paths, is_reply_to_me = await wechat_app.process_app_msg(
+                self.wcf, msg, self._get_media_dir(chat_id),
+                wechat_home=self._wechat_home, bot_wxid=self.wxid,
+            )
             # For quoted messages in groups, check if replying to bot or @mentioned
             if is_group:
                 if is_reply_to_me:
@@ -400,371 +404,6 @@ class WeChatChannel(BaseChannel):
             )
         return None, f"[{media_type}: download failed]"
 
-    def _find_file_in_wechat_storage(self, filename: str) -> str | None:
-        """
-        Search for a file in WeChat's FileStorage directory.
-
-        WeChat stores auto-downloaded files at:
-        {home}/{wxid}/FileStorage/File/{year-month}/{filename}
-
-        Returns the full path if found, None otherwise.
-        """
-        from datetime import datetime
-        from pathlib import Path
-
-        if not self._wechat_home or not self.wxid:
-            return None
-
-        base_path = Path(self._wechat_home) / self.wxid / "FileStorage" / "File"
-        if not base_path.exists():
-            return None
-
-        # Current month directory (most likely location)
-        current_month = datetime.now().strftime("%Y-%m")
-        current_dir = base_path / current_month
-        if current_dir.exists():
-            file_path = current_dir / filename
-            if file_path.exists():
-                return str(file_path)
-
-        # Search in all month directories (descending order, recent first)
-        try:
-            for month_dir in sorted(base_path.iterdir(), reverse=True):
-                if month_dir.is_dir():
-                    file_path = month_dir / filename
-                    if file_path.exists():
-                        return str(file_path)
-        except Exception as e:
-            logger.debug("Error searching WeChat storage: {}", e)
-
-        return None
-
-    async def _download_file(
-        self,
-        msg: WxMsg,
-        filename: str,
-        chat_id: str,
-        timeout: int = 30,
-    ) -> tuple[str | None, str]:
-        """
-        Download a file attachment from WeChat.
-
-        Args:
-            msg: The WeChat message object
-            filename: The filename from XML
-            chat_id: Chat ID for session binding
-            timeout: Download timeout in seconds
-
-        Returns:
-            (file_path, content_text)
-        """
-        import shutil
-
-        # Check session binding first
-        media_dir = self._get_media_dir(chat_id)
-        if media_dir is None:
-            return None, f"[文件: {filename}] (请先使用 /session <name> 绑定工作区)"
-
-        if not self.wcf:
-            return None, f"[文件: {filename}]"
-
-        extra = msg.extra or ""
-        thumb = msg.thumb or ""
-
-        # Log full message info for debugging
-        logger.debug("File message details: id={}, thumb='{}', extra='{}', xml_len={}, content_len={}",
-                     msg.id, thumb[:80], extra[:80], len(msg.xml or ""), len(msg.content or ""))
-
-        # For file messages, try to extract attach info from XML content
-        # File XML format: <appattach><totallen>...</totallen><attachid>...</attachid>...</appattach>
-        if not extra and msg.content:
-            # Try to find file path in content XML
-            attachid_match = re.search(r'<attachid>(.*?)</attachid>', msg.content)
-            cdnurl_match = re.search(r'<cdnattachurl>(.*?)</cdnattachurl>', msg.content)
-            if attachid_match:
-                logger.debug("Found attachid in XML: {}", attachid_match.group(1)[:50])
-            if cdnurl_match:
-                logger.debug("Found cdnattachurl in XML: {}", cdnurl_match.group(1)[:80])
-            # Use content XML as extra for download_attach
-            extra = msg.content
-
-        logger.debug("Attempting to download file '{}': id={}", filename, msg.id)
-
-        # If extra already points to an existing file, use it directly
-        if extra and os.path.exists(extra):
-            dest_path = media_dir / filename
-            shutil.copy2(extra, dest_path)
-            logger.debug("File already exists, copied to {}", dest_path)
-            return str(dest_path), f"[文件: <work_dir>/data/{filename}]"
-
-        # For auto-downloaded files (like PDF/xlsx with auto-download enabled),
-        # check WeChat's FileStorage directory
-        wechat_file = self._find_file_in_wechat_storage(filename)
-        if wechat_file:
-            dest_path = media_dir / filename
-            shutil.copy2(wechat_file, dest_path)
-            logger.debug("Found file in WeChat storage, copied to {}", dest_path)
-            return str(dest_path), f"[文件: <work_dir>/data/{filename}]"
-
-        try:
-            loop = asyncio.get_running_loop()
-
-            # For PDF/xlsx etc., WeChat needs the user to "accept" the file first
-            # msg.extra will be empty until the file is accepted in WeChat client
-            original_extra = msg.extra or ""
-
-            # Trigger the download
-            ret = await loop.run_in_executor(
-                None,
-                lambda: self.wcf.download_attach(msg.id, thumb, extra)
-            )
-
-            if ret != 0:
-                logger.warning("download_attach returned {} (file may need manual accept in WeChat)", ret)
-
-            # Wait for file to be available
-            await asyncio.sleep(2)  # Wait for download to complete
-
-            # Check WeChat storage again after triggering download
-            wechat_file = self._find_file_in_wechat_storage(filename)
-            if wechat_file:
-                dest_path = media_dir / filename
-                shutil.copy2(wechat_file, dest_path)
-                logger.debug("Found file in WeChat storage after download, copied to {}", dest_path)
-                return str(dest_path), f"[文件: <work_dir>/data/{filename}]"
-
-            # Check if original extra path exists (for small files that auto-download)
-            if original_extra:
-                for _ in range(timeout):
-                    if os.path.exists(original_extra):
-                        dest_path = media_dir / filename
-                        shutil.copy2(original_extra, dest_path)
-                        logger.debug("Downloaded file to {}", dest_path)
-                        return str(dest_path), f"[文件: <work_dir>/data/{filename}]"
-                    await asyncio.sleep(1)
-
-            # Final check in WeChat storage
-            wechat_file = self._find_file_in_wechat_storage(filename)
-            if wechat_file:
-                dest_path = media_dir / filename
-                shutil.copy2(wechat_file, dest_path)
-                logger.debug("Found file in WeChat storage (final check), copied to {}", dest_path)
-                return str(dest_path), f"[文件: <work_dir>/data/{filename}]"
-
-            # For large files (PDF, xlsx), they need manual accept in WeChat
-            # Return a message indicating this
-            logger.info("File '{}' not found in WeChat storage: {}/{}/FileStorage/File/",
-                       filename, self._wechat_home, self.wxid)
-            return None, f"[文件: {filename}] (请在微信中点击接收后重新发送)"
-
-        except Exception as e:
-            logger.error("Error downloading file '{}': {}", filename, e)
-            return None, f"[文件: {filename}] (下载失败)"
-
-    async def _process_app_msg(
-        self,
-        msg: WxMsg,
-        chat_id: str,
-    ) -> tuple[str, list[str], bool]:
-        """
-        Process APP type messages (type=49): files, links, quotes, etc.
-
-        Returns:
-            (text, media_paths, is_reply_to_me)
-        """
-        content = msg.content
-
-        # Detect appmsg type
-        appmsg_type_match = re.search(r'<type>(\d+)</type>', content)
-        if not appmsg_type_match:
-            return "", [], False
-
-        appmsg_type = appmsg_type_match.group(1)
-
-        # Type 57: Quote/Reply message
-        if appmsg_type == "57":
-            return await self._parse_quote_msg(content, chat_id)
-
-        # Type 6: File
-        if appmsg_type == "6":
-            title_match = re.search(r'<title>(.*?)</title>', content)
-            filename = title_match.group(1) if title_match else "file"
-            file_path, content_text = await self._download_file(msg, filename, chat_id)
-            if file_path:
-                return content_text, [file_path], False
-            return content_text, [], False
-
-        # Type 5: Link
-        if appmsg_type == "5":
-            title_match = re.search(r'<title>(.*?)</title>', content)
-            url_match = re.search(r'<url>(.*?)</url>', content)
-            title = html.unescape(title_match.group(1)) if title_match else ""
-            url = html.unescape(url_match.group(1)) if url_match else ""
-            if title and url:
-                return f"[链接: {title}]\n{url}", [], False
-            elif title:
-                return f"[链接: {title}]", [], False
-            return "[链接]", [], False
-
-        # Type 33/36: Mini Program
-        if appmsg_type in ("33", "36"):
-            title_match = re.search(r'<title>(.*?)</title>', content)
-            title = html.unescape(title_match.group(1)) if title_match else "小程序"
-            return f"[小程序: {title}]", [], False
-
-        # Type 19: Chat record forward
-        if appmsg_type == "19":
-            title_match = re.search(r'<title>(.*?)</title>', content)
-            title = html.unescape(title_match.group(1)) if title_match else "聊天记录"
-            return f"[聊天记录: {title}]", [], False
-
-        # Other types: try to extract title
-        title_match = re.search(r'<title>(.*?)</title>', content)
-        if title_match:
-            title = html.unescape(title_match.group(1))
-            return f"[消息: {title}]", [], False
-
-        return "[未知消息类型]", [], False
-
-    async def _parse_quote_msg(self, content: str, chat_id: str) -> tuple[str, list[str], bool]:
-        """
-        Parse quoted/reply message (appmsg type=57).
-
-        Returns:
-            (text, media_paths, is_reply_to_me)
-        """
-        result_parts = []
-        media_paths: list[str] = []
-        is_reply_to_me = False
-
-        # Extract user's new message from <title>
-        title_match = re.search(r'<title>(.*?)</title>', content)
-        if title_match:
-            new_content = html.unescape(title_match.group(1).strip())
-            if new_content:
-                result_parts.append(new_content)
-
-        # Extract quoted content from <refermsg>
-        refermsg_match = re.search(r'<refermsg>(.*?)</refermsg>', content, re.DOTALL)
-        if refermsg_match:
-            refermsg = refermsg_match.group(1)
-
-            # Get quoted sender wxid (chatusr field)
-            chatusr_match = re.search(r'<chatusr>(.*?)</chatusr>', refermsg)
-            quoted_wxid = chatusr_match.group(1) if chatusr_match else ""
-
-            # Check if replying to bot's message
-            if quoted_wxid and quoted_wxid == self.wxid:
-                is_reply_to_me = True
-
-            # Get quoted sender display name
-            displayname_match = re.search(r'<displayname>(.*?)</displayname>', refermsg)
-            quoted_sender = html.unescape(displayname_match.group(1)) if displayname_match else ""
-
-            # Get quoted message type
-            type_match = re.search(r'<type>(\d+)</type>', refermsg)
-            quoted_type = type_match.group(1) if type_match else "1"
-
-            # Get quoted message ID (svrid)
-            svrid_match = re.search(r'<svrid>(\d+)</svrid>', refermsg)
-            quoted_msg_id = svrid_match.group(1) if svrid_match else None
-
-            # Get quoted content
-            content_match = re.search(r'<content>(.*?)</content>', refermsg, re.DOTALL)
-            quoted_raw = content_match.group(1) if content_match else ""
-            quoted_decoded = html.unescape(quoted_raw)
-
-            # Type 3 = image - try to download
-            if quoted_type == "3":
-                file_path, quoted_text = await self._download_quoted_image(
-                    quoted_msg_id, quoted_decoded, chat_id
-                )
-                if file_path:
-                    media_paths.append(file_path)
-            # Type 34 = voice
-            elif quoted_type == "34":
-                quoted_text = "[语音]"
-            # Type 43 = video
-            elif quoted_type == "43":
-                quoted_text = "[视频]"
-            # Type 49 = app message (file, link, etc.)
-            elif quoted_type == "49":
-                # Try to extract title from the quoted app message
-                inner_title = re.search(r'<title>(.*?)</title>', quoted_decoded)
-                if inner_title:
-                    quoted_text = f"[{html.unescape(inner_title.group(1))}]"
-                else:
-                    quoted_text = "[消息]"
-            else:
-                # Text or other
-                quoted_text = re.sub(r'<.*?>', '', quoted_decoded).strip()
-                quoted_text = re.sub(r'\s+', ' ', quoted_text)
-
-            if quoted_sender and quoted_text:
-                result_parts.append(f"[引用 {quoted_sender}: {quoted_text}]")
-            elif quoted_text:
-                result_parts.append(f"[引用: {quoted_text}]")
-
-        return "\n".join(result_parts), media_paths, is_reply_to_me
-
-    async def _download_quoted_image(
-        self, msg_id: str | None, content_xml: str, chat_id: str
-    ) -> tuple[str | None, str]:
-        """
-        Download a quoted image message.
-
-        Args:
-            msg_id: The svrid of the quoted message
-            content_xml: The decoded content XML of the quoted image (raw_content)
-            chat_id: Chat ID for session binding
-
-        Returns:
-            (file_path, content_text)
-        """
-        if not msg_id or not self.wcf:
-            return None, "[图片]"
-
-        # Check session binding
-        media_dir = self._get_media_dir(chat_id)
-        if media_dir is None:
-            return None, "[图片: 请先使用 /session <name> 绑定工作区]"
-
-        # wcferry 下载图片时按 md5 命名落到 data/；quote XML 里 <img md5="..."/>
-        # 就是同一张图。命中本地副本就直接复用，避开旧消息 cdn 已过期导致的
-        # FUNC_DOWNLOAD_ATTACH 超时。
-        md5_match = re.search(r'md5="([0-9a-f]{32})"', content_xml)
-        if md5_match:
-            md5 = md5_match.group(1)
-            for ext in self._IMAGE_EXTS:
-                cached = media_dir / f"{md5}{ext}"
-                if cached.exists():
-                    logger.debug("Reusing cached quoted image: {}", cached)
-                    return str(cached), f"[图片: <work_dir>/data/{md5}{ext}]"
-
-        # Use the decoded content XML directly as extra parameter
-        # wcferry's download_attach can parse this XML to get the image
-        extra = content_xml
-        logger.debug("Attempting to download quoted image: msg_id={}, extra_len={}", msg_id, len(extra))
-
-        try:
-            loop = asyncio.get_running_loop()
-            file_path = await loop.run_in_executor(
-                None,
-                lambda: self.wcf.download_image(int(msg_id), extra, str(media_dir), timeout=30)
-            )
-            if file_path and os.path.exists(file_path):
-                filename = os.path.basename(file_path)
-                logger.debug("Downloaded quoted image to {}", file_path)
-                return file_path, f"[图片: <work_dir>/data/{filename}]"
-            else:
-                logger.warning("download_image returned empty or non-existent path for msg_id={}", msg_id)
-        except Exception as e:
-            logger.warning("Failed to download quoted image {}: {}", msg_id, e)
-
-        return None, "[图片]"
-
-    _IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".gif", ".bmp", ".webp"}
-
     async def send(self, msg: OutboundMessage) -> None:
         """Send a message through WeChat, including media if present."""
         if not self.wcf:
@@ -778,7 +417,7 @@ class WeChatChannel(BaseChannel):
                     logger.warning("Media file not found: {}", file_path)
                     continue
                 ext = os.path.splitext(file_path)[1].lower()
-                if ext in self._IMAGE_EXTS:
+                if ext in IMAGE_EXTS:
                     self.wcf.send_image(file_path, msg.chat_id)
                     logger.debug("Sent image to {}: {}", msg.chat_id, file_path)
                 else:
