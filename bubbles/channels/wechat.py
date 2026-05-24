@@ -78,6 +78,10 @@ class WeChatChannel(BaseChannel):
         self._recv_thread: Thread | None = None
         self._loop: asyncio.AbstractEventLoop | None = None
         self._contacts: dict[str, WeChatContact] = {}  # wxid -> WeChatContact
+        # msg.id -> downloaded image path. Quote messages carry the original
+        # msg.id as <svrid>; this lets us reuse the local copy instead of
+        # re-downloading via wcferry (cdn handles expire fast).
+        self._image_path_by_msg_id: dict[int, str] = {}
 
     async def start(self) -> None:
         """Start WeChat client and begin listening for messages."""
@@ -235,6 +239,7 @@ class WeChatChannel(BaseChannel):
             text, media_paths, is_reply_to_me = await wechat_app.process_app_msg(
                 self.wcf, msg, self._get_media_dir(chat_id),
                 wechat_home=self._wechat_home, bot_wxid=self.wxid,
+                msg_id_to_path=self._image_path_by_msg_id,
             )
             # For quoted messages in groups, check if replying to bot or @mentioned
             if is_group:
@@ -388,6 +393,8 @@ class WeChatChannel(BaseChannel):
 
             if file_path and os.path.exists(file_path):
                 logger.debug("Downloaded {} to {}", media_type, file_path)
+                if media_type == "image":
+                    self._image_path_by_msg_id[msg.id] = file_path
                 return file_path, f"[{media_type}: <work_dir>/data/{filename}]"
             if media_type == "image" and file_path:
                 logger.warning(

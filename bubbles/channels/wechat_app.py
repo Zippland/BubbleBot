@@ -181,20 +181,32 @@ async def download_quoted_image(
     msg_id: str | None,
     content_xml: str,
     media_dir: Path | None,
+    msg_id_to_path: dict[int, str] | None = None,
 ) -> tuple[str | None, str]:
-    """Resolve a quoted image — prefer local md5 cache, fall back to wcferry."""
+    """Resolve a quoted image — prefer in-process msg_id cache, fall back to
+    media_dir scan, finally to wcferry download."""
     if not msg_id or not wcf:
         return None, "[图片]"
     if media_dir is None:
         return None, "[图片: 请先使用 /session <name> 绑定工作区]"
 
-    # wcferry 下载图片时按 md5 命名落到 data/。quote 内层 XML 里的属性名/引号/大小写
-    # 跨 WeChat 版本不一致（不靠谱），反过来：扫一遍本地已下载文件，看哪个文件名 stem
-    # 出现在 quote XML 中——命中即复用，避开旧消息 cdn 已过期导致的
-    # FUNC_DOWNLOAD_ATTACH 超时。
+    # 1. 进程内 msg.id → 路径缓存（最稳：wcferry 的 <svrid> 就是原图 msg.id）
+    if msg_id_to_path:
+        try:
+            mid = int(msg_id)
+        except (TypeError, ValueError):
+            mid = None
+        if mid is not None:
+            hit = msg_id_to_path.get(mid)
+            if hit and os.path.exists(hit):
+                logger.debug("Reusing image by msg_id {}: {}", mid, hit)
+                return hit, f"[图片: <work_dir>/data/{os.path.basename(hit)}]"
+
+    # 2. fallback：扫 media_dir 找文件名 stem 出现在 XML 里的图（重启后老消息
+    #    走这条；命中率取决于 WeChat 版本是否在 quote XML 里写了解密后的 md5）
     cached = _find_cached_quoted_image(media_dir, content_xml)
     if cached:
-        logger.debug("Reusing cached quoted image: {}", cached)
+        logger.debug("Reusing cached quoted image by stem-in-xml: {}", cached)
         return str(cached), f"[图片: <work_dir>/data/{cached.name}]"
 
     extra = content_xml
@@ -227,6 +239,7 @@ async def parse_quote_msg(
     media_dir: Path | None,
     *,
     bot_wxid: str,
+    msg_id_to_path: dict[int, str] | None = None,
 ) -> tuple[str, list[str], bool]:
     """Parse APP appmsg type=57 (quote/reply).
 
@@ -268,6 +281,7 @@ async def parse_quote_msg(
         if quoted_type == "3":
             file_path, quoted_text = await download_quoted_image(
                 wcf, quoted_msg_id, quoted_decoded, media_dir,
+                msg_id_to_path=msg_id_to_path,
             )
             if file_path:
                 media_paths.append(file_path)
@@ -300,6 +314,7 @@ async def process_app_msg(
     *,
     wechat_home: str,
     bot_wxid: str,
+    msg_id_to_path: dict[int, str] | None = None,
 ) -> tuple[str, list[str], bool]:
     """Dispatch APP type=49 messages by inner appmsg <type>.
 
@@ -315,7 +330,10 @@ async def process_app_msg(
 
     # Type 57: Quote/Reply
     if appmsg_type == "57":
-        return await parse_quote_msg(wcf, content, media_dir, bot_wxid=bot_wxid)
+        return await parse_quote_msg(
+            wcf, content, media_dir,
+            bot_wxid=bot_wxid, msg_id_to_path=msg_id_to_path,
+        )
 
     # Type 6: File
     if appmsg_type == "6":
