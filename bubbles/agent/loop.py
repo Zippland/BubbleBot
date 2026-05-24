@@ -501,9 +501,15 @@ class AgentLoop:
         preview = msg.content[:80] + "..." if len(msg.content) > 80 else msg.content
         logger.info("Processing message from {}:{}: {}", msg.channel, msg.sender_id, preview)
 
-        # Parse command first (before session lookup)
-        cmd = msg.content.strip().lower()
-        cmd_parts = msg.content.strip().split(maxsplit=1)
+        # Parse command first (before session lookup). Strip leading <@id>
+        # mentions so "<@bot> /config reset" 等同于 "/config reset"——SPEC §5.2
+        # 已把入站 @ 统一成 <@id>，命令识别不该被 mention 前缀挡住。原 msg.content
+        # 不改：history 与主聊天流程仍需要看到 <@bot> 标记。
+        content_for_cmd = msg.content
+        while m := re.match(r"^\s*<@\S+>\s*", content_for_cmd):
+            content_for_cmd = content_for_cmd[m.end():]
+        cmd = content_for_cmd.strip().lower()
+        cmd_parts = content_for_cmd.strip().split(maxsplit=1)
         cmd_name = cmd_parts[0].lower() if cmd_parts else ""
         cmd_arg = cmd_parts[1] if len(cmd_parts) > 1 else ""
 
