@@ -157,6 +157,25 @@ async def download_file(
         return None, f"[文件: {filename}] (下载失败)"
 
 
+def _find_cached_quoted_image(media_dir: Path, content_xml: str) -> Path | None:
+    """Find a previously-downloaded image whose hex filename stem appears in the
+    quote XML. wcferry names downloaded images by md5; quote messages reference
+    the same image by its hash somewhere in the XML, so a verbatim stem-in-xml
+    match avoids assuming any specific WeChat-version attribute format.
+    """
+    if not media_dir or not media_dir.is_dir():
+        return None
+    xml_lower = content_xml.lower()
+    for p in media_dir.iterdir():
+        if p.suffix.lower() not in IMAGE_EXTS:
+            continue
+        stem = p.stem.lower()
+        # md5 hex is 32 chars; widen to 16–64 so a future hash change still matches.
+        if 16 <= len(stem) <= 64 and stem in xml_lower:
+            return p
+    return None
+
+
 async def download_quoted_image(
     wcf,
     msg_id: str | None,
@@ -169,17 +188,14 @@ async def download_quoted_image(
     if media_dir is None:
         return None, "[图片: 请先使用 /session <name> 绑定工作区]"
 
-    # wcferry 下载图片时按 md5 命名落到 data/；quote XML 里 <img md5="..."/>
-    # 就是同一张图。命中本地副本就直接复用，避开旧消息 cdn 已过期导致的
+    # wcferry 下载图片时按 md5 命名落到 data/。quote 内层 XML 里的属性名/引号/大小写
+    # 跨 WeChat 版本不一致（不靠谱），反过来：扫一遍本地已下载文件，看哪个文件名 stem
+    # 出现在 quote XML 中——命中即复用，避开旧消息 cdn 已过期导致的
     # FUNC_DOWNLOAD_ATTACH 超时。
-    md5_match = re.search(r'md5="([0-9a-f]{32})"', content_xml)
-    if md5_match:
-        md5 = md5_match.group(1)
-        for ext in IMAGE_EXTS:
-            cached = media_dir / f"{md5}{ext}"
-            if cached.exists():
-                logger.debug("Reusing cached quoted image: {}", cached)
-                return str(cached), f"[图片: <work_dir>/data/{md5}{ext}]"
+    cached = _find_cached_quoted_image(media_dir, content_xml)
+    if cached:
+        logger.debug("Reusing cached quoted image: {}", cached)
+        return str(cached), f"[图片: <work_dir>/data/{cached.name}]"
 
     extra = content_xml
     logger.debug(
