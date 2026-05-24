@@ -13,31 +13,27 @@ from typing import TYPE_CHECKING, Any, Awaitable, Callable
 ERROR_REPLY_THROTTLE_SEC = 60.0
 DATA_CLEANUP_THROTTLE_SEC = 24 * 3600.0
 
-HEARTBEAT_MIN_MINUTES = 1
-HEARTBEAT_MAX_MINUTES = 24 * 60
-
-HEARTBEATS_TEMPLATE = """# Heartbeats
-
-Your periodic check-in list. The bot reads this file on every heartbeat tick.
-Add items, remove them, rewrite framing freely.
-
-## Items
-
-- (no items yet — examples:)
-  - Scan MEMORY.md for stale facts.
-  - Light check-in if quiet for 8+ hours during daytime.
-"""
-
-HEARTBEAT_TICK_MESSAGE = (
-    "[心跳触发] 严格按照 <work_dir>/HEARTBEATS.md（上方已加载）里的清单执行。"
-    "不要从历史对话里翻补未完成的旧任务。\n\n"
-    "默认沉默。清单里没有当下应处理的事项就调 stay_silent 结束。"
-)
-
 from loguru import logger
 
-from bubbles.agent.compaction import compact_session, CompactionResult, estimate_messages_tokens
+from bubbles.agent.bindings import (
+    get_bindings_for_session,
+    load_session_bindings,
+    relocate_media_to_session,
+    save_session_bindings,
+)
+from bubbles.agent.commands import (
+    build_heartbeat_info,
+    handle_config_command,
+    handle_heartbeat_command,
+)
 from bubbles.agent.context import ContextBuilder
+from bubbles.agent.turn import (
+    do_compact,
+    mid_loop_compact,
+    process_system_message,
+    save_turn,
+    should_compact,
+)
 from bubbles.agent.subagent import SubagentManager
 from bubbles.agent.tools.cron import CronTool
 from bubbles.agent.tools.filesystem import EditFileTool, ListDirTool, ReadFileTool, WriteFileTool
@@ -53,7 +49,6 @@ from bubbles.bus.queue import MessageBus
 from bubbles.providers.base import LLMProvider
 from bubbles.session.manager import (
     Session,
-    SessionConfig,
     SessionManager,
     cleanup_data_dir,
     prune_old_images_inplace,
@@ -145,8 +140,8 @@ class AgentLoop:
         self._mcp_stack: AsyncExitStack | None = None
         self._mcp_connected = False
         self._mcp_connecting = False
-        self._session_bindings: dict[str, str] = {}  # {channel}:{chat_id} -> custom session key
-        self._load_session_bindings()
+        # {channel}:{chat_id} -> custom session key
+        self._session_bindings: dict[str, str] = load_session_bindings(self.data_dir)
         self._active_tasks: dict[str, list[asyncio.Task]] = {}  # session_key -> tasks
         self._last_error_reply_at: dict[str, float] = {}  # session_key -> monotonic ts of last user-visible error reply
         self._last_data_cleanup_at: dict[str, float] = {}  # session_key -> monotonic ts of last data/ cleanup
@@ -205,82 +200,6 @@ class AgentLoop:
         if session.key not in self._context_cache:
             self._context_cache[session.key] = ContextBuilder(session_dir=session.directory)
         return self._context_cache[session.key]
-
-    def _get_bindings_path(self) -> Path:
-        """Get path to session bindings file."""
-        return self.data_dir / "session_bindings.json"
-
-    def _load_session_bindings(self) -> None:
-        """Load session bindings from file."""
-        path = self._get_bindings_path()
-        if path.exists():
-            try:
-                with open(path, encoding="utf-8") as f:
-                    self._session_bindings = json.load(f)
-                logger.debug("Loaded {} session bindings", len(self._session_bindings))
-            except Exception as e:
-                logger.warning("Failed to load session bindings: {}", e)
-                self._session_bindings = {}
-
-    def _save_session_bindings(self) -> None:
-        """Save session bindings to file."""
-        path = self._get_bindings_path()
-        try:
-            with open(path, "w", encoding="utf-8") as f:
-                json.dump(self._session_bindings, f, indent=2, ensure_ascii=False)
-        except Exception as e:
-            logger.warning("Failed to save session bindings: {}", e)
-
-    def _get_bindings_for_session(self, session_key: str) -> list[str]:
-        """Get all channel:chat_id pairs bound to a session."""
-        return [k for k, v in self._session_bindings.items() if v == session_key]
-
-    def _relocate_media_to_session(
-        self, media_paths: list[str], session: Session
-    ) -> list[str]:
-        """Move media files to the correct session directory if needed.
-
-        Channel layer may download media before knowing the final session binding.
-        This method moves files to session.directory/data/ if they're elsewhere.
-
-        Returns:
-            Updated list of media paths.
-        """
-        if not media_paths or not session.directory:
-            return media_paths
-
-        import shutil
-        target_dir = session.directory / "data"
-        target_dir.mkdir(parents=True, exist_ok=True)
-
-        updated = []
-        for path in media_paths:
-            p = Path(path)
-            if not p.is_file():
-                updated.append(path)
-                continue
-            # Check if already in the correct directory
-            try:
-                p.relative_to(target_dir)
-                updated.append(path)  # Already correct
-            except ValueError:
-                # Move to correct directory
-                new_path = target_dir / p.name
-                # Handle name collision
-                if new_path.exists():
-                    stem, suffix = new_path.stem, new_path.suffix
-                    for i in range(1, 100):
-                        new_path = target_dir / f"{stem}_{i}{suffix}"
-                        if not new_path.exists():
-                            break
-                try:
-                    shutil.move(str(p), str(new_path))
-                    logger.debug("Moved media {} -> {}", p, new_path)
-                    updated.append(str(new_path))
-                except Exception as e:
-                    logger.warning("Failed to move media {}: {}", p, e)
-                    updated.append(path)  # Keep original on failure
-        return updated
 
     async def _connect_mcp(self) -> None:
         """Connect to configured MCP servers (one-time, lazy)."""
@@ -385,8 +304,8 @@ class AgentLoop:
                 break
 
             # Auto-compaction: check if context is overflowing (pre-call estimation)
-            if self._should_compact(messages):
-                messages = await self._mid_loop_compact(session, messages, on_progress)
+            if should_compact(self,messages):
+                messages = await mid_loop_compact(self, session, messages, on_progress)
 
             response = await self._provider_for(model).chat(
                 messages=messages,
@@ -576,46 +495,8 @@ class AgentLoop:
         on_tool_call: Callable[[str, dict, str | None], Awaitable[None]] | None = None,
     ) -> OutboundMessage | None:
         """Process a single inbound message and return the response."""
-        # System messages: chat_id may be a session key directly or "channel:chat_id"
         if msg.channel == "system":
-            if ":" in msg.chat_id:
-                # Standard format: "channel:chat_id"
-                channel, chat_id = msg.chat_id.split(":", 1)
-                key = f"{channel}:{chat_id}"
-            else:
-                # Direct session key (from subagent with session binding)
-                key = msg.chat_id
-                # Find the original channel:chat_id that bound to this session
-                bindings = self._get_bindings_for_session(key)
-                if bindings:
-                    # Use the first binding as reply target
-                    channel, chat_id = bindings[0].split(":", 1)
-                else:
-                    # No binding found, cannot reply
-                    logger.warning("No binding found for session {}, cannot route reply", key)
-                    return None
-            logger.info("Processing system message from {} to session {}", msg.sender_id, key)
-            session = self.sessions.get_or_create(key)
-            # 清理历史图片（每次对话入口只执行一次）
-            prune_old_images_inplace(session.messages)
-            context = self._get_context(session)
-            self._set_tool_context(channel, chat_id, msg.metadata.get("message_id"), session.directory, key, session)
-            history = session.get_history(max_messages=self.memory_window)
-            messages = context.build_messages(
-                history=history,
-                current_message=msg.content, channel=channel, chat_id=chat_id,
-                sender_id=msg.sender_id,
-                sender_name=msg.metadata.get("sender_name"),
-                system_prompt_extra=session.config.system_prompt,
-                session_bindings=self._get_bindings_for_session(session.key),
-                heartbeat_info=self._build_heartbeat_info(session.key),
-            )
-            final_content, _, all_msgs = await self._run_agent_loop(
-                messages, session=session, on_tool_call=on_tool_call)
-            self._save_turn(session, all_msgs, 1 + len(history))
-            self.sessions.save(session)
-            return OutboundMessage(channel=channel, chat_id=chat_id,
-                                  content=final_content or "Background task completed.")
+            return await process_system_message(self, msg, on_tool_call)
 
         preview = msg.content[:80] + "..." if len(msg.content) > 80 else msg.content
         logger.info("Processing message from {}:{}: {}", msg.channel, msg.sender_id, preview)
@@ -665,7 +546,7 @@ class AgentLoop:
                     )
             elif cmd_arg.lower() == "unbind":
                 self._session_bindings.pop(binding_key, None)
-                self._save_session_bindings()
+                save_session_bindings(self.data_dir, self._session_bindings)
                 return OutboundMessage(
                     channel=msg.channel, chat_id=msg.chat_id,
                     content="Session unbound."
@@ -674,7 +555,7 @@ class AgentLoop:
                 # Bind to specified session and create it if new
                 new_session_key = cmd_arg.strip()
                 self._session_bindings[binding_key] = new_session_key
-                self._save_session_bindings()
+                save_session_bindings(self.data_dir, self._session_bindings)
                 # Create session directory immediately
                 new_session = self.sessions.get_or_create(new_session_key)
                 self.sessions.save(new_session)
@@ -709,11 +590,11 @@ class AgentLoop:
 
         # /config command - manage session-specific configuration
         if cmd_name == "/config":
-            return await self._handle_config_command(msg, session, cmd_arg)
+            return await handle_config_command(self, msg, session, cmd_arg)
 
         # /heartbeat - user-controlled periodic auto-wake (AI cannot enable)
         if cmd_name == "/heartbeat":
-            return self._handle_heartbeat_command(msg, session, key, cmd_arg)
+            return handle_heartbeat_command(self, msg, session, key, cmd_arg)
 
         if cmd == "/new":
             session.clear()
@@ -723,7 +604,7 @@ class AgentLoop:
                                   content="New session started.")
 
         if cmd == "/compact":
-            result = await self._do_compact(session)
+            result = await do_compact(self,session)
             if result.success:
                 self.sessions.save(session)
                 return OutboundMessage(
@@ -755,7 +636,7 @@ class AgentLoop:
         # If not responding, just save the message to history and return.
         if not should_respond:
             # Move media files to session directory if present
-            media = self._relocate_media_to_session(msg.media, session) if msg.media else None
+            media = relocate_media_to_session(msg.media, session) if msg.media else None
 
             # Save as a simple user message to session history
             from datetime import datetime
@@ -776,7 +657,7 @@ class AgentLoop:
             return None
 
         # Move media files to correct session directory if needed (handles session binding)
-        media = self._relocate_media_to_session(msg.media, session) if msg.media else None
+        media = relocate_media_to_session(msg.media, session) if msg.media else None
 
         self._set_tool_context(msg.channel, msg.chat_id, msg.metadata.get("message_id"), session.directory, key, session)
         if message_tool := self.tools.get("message"):
@@ -793,13 +674,13 @@ class AgentLoop:
             sender_id=msg.sender_id,
             sender_name=msg.metadata.get("sender_name"),
             system_prompt_extra=session.config.system_prompt,
-            session_bindings=self._get_bindings_for_session(session.key),
+            session_bindings=get_bindings_for_session(self._session_bindings, session.key),
         )
 
         # Entry compaction: check if context is overflowing before entering loop
-        if self._should_compact(initial_messages):
+        if should_compact(self,initial_messages):
             logger.info("Entry compaction triggered for session {}", session.key)
-            await self._do_compact(session)
+            await do_compact(self,session)
             self.sessions.save(session)
             # Rebuild messages with compacted history
             history = session.get_history(max_messages=self.memory_window)
@@ -811,8 +692,8 @@ class AgentLoop:
                 sender_id=msg.sender_id,
                 sender_name=msg.metadata.get("sender_name"),
                 system_prompt_extra=session.config.system_prompt,
-                session_bindings=self._get_bindings_for_session(session.key),
-                heartbeat_info=self._build_heartbeat_info(session.key),
+                session_bindings=get_bindings_for_session(self._session_bindings, session.key),
+                heartbeat_info=build_heartbeat_info(self.cron_service, session.key),
             )
 
         # Track progress messages to detect loops
@@ -848,7 +729,7 @@ class AgentLoop:
         if final_content is None:
             final_content = "I've completed processing but have no response to give."
 
-        self._save_turn(session, all_msgs, 1 + len(history))
+        save_turn(session, all_msgs, 1 + len(history))
         self.sessions.save(session)
 
         if (mt := self.tools.get("message")) and isinstance(mt, MessageTool) and mt._sent_in_turn:
@@ -860,290 +741,6 @@ class AgentLoop:
             channel=msg.channel, chat_id=msg.chat_id, content=final_content,
             metadata=msg.metadata or {},
         )
-
-    async def _handle_config_command(
-        self, msg: InboundMessage, session: Session, cmd_arg: str
-    ) -> OutboundMessage:
-        """Handle /config command for session-specific configuration."""
-        cfg = session.config
-
-        if not cmd_arg:
-            # Show current session config (only the settable keys)
-            model_val = cfg.model or self.model
-            prompt_val = (cfg.system_prompt[:30] + "...") if cfg.system_prompt else "-"
-            config_text = f"""session: {session.key}
-model: {model_val}
-system_prompt: {prompt_val}"""
-            return OutboundMessage(channel=msg.channel, chat_id=msg.chat_id, content=config_text)
-
-        parts = cmd_arg.split(maxsplit=1)
-        key = parts[0].lower()
-        value = parts[1] if len(parts) > 1 else ""
-
-        if key == "reset":
-            session.config = SessionConfig()
-            self.sessions.save(session)
-            return OutboundMessage(
-                channel=msg.channel, chat_id=msg.chat_id,
-                content="Config reset to defaults."
-            )
-
-        if key == "model":
-            if value and self.provider_factory is not None:
-                try:
-                    self.provider_factory(value)
-                except Exception as e:
-                    return OutboundMessage(
-                        channel=msg.channel, chat_id=msg.chat_id,
-                        content=f"无法切换到 `{value}`：{e}",
-                    )
-            cfg.model = value if value else None
-            self.sessions.save(session)
-            return OutboundMessage(
-                channel=msg.channel, chat_id=msg.chat_id,
-                content=f"model = `{value}`" if value else "model reset to default"
-            )
-
-        if key == "system_prompt":
-            cfg.system_prompt = value if value else None
-            self.sessions.save(session)
-            return OutboundMessage(
-                channel=msg.channel, chat_id=msg.chat_id,
-                content=f"system_prompt updated" if value else "system_prompt reset to default"
-            )
-
-        return OutboundMessage(
-            channel=msg.channel, chat_id=msg.chat_id,
-            content=f"Unknown config key: `{key}`\n\nValid keys: model, system_prompt"
-        )
-
-    # ===== Heartbeat (user-controlled periodic auto-wake) =====
-
-    @staticmethod
-    def _heartbeat_job_name(session_key: str) -> str:
-        return f"heartbeat:{session_key}"
-
-    @staticmethod
-    def _parse_heartbeat_interval(s: str) -> int | None:
-        """Parse '30m', '2h', '90s', or bare number (= minutes). Return minutes, or None."""
-        m = re.match(r"^(\d+)\s*([smh]?)$", s.strip().lower())
-        if not m:
-            return None
-        n = int(m.group(1))
-        unit = m.group(2) or "m"
-        if unit == "s":
-            return max(1, (n + 30) // 60)  # round to nearest minute, floor 1
-        if unit == "h":
-            return n * 60
-        return n
-
-    @staticmethod
-    def _humanize_minutes_cn(minutes: int) -> str:
-        if minutes >= 60 and minutes % 60 == 0:
-            return f"{minutes // 60} 小时"
-        return f"{minutes} 分钟"
-
-    @staticmethod
-    def _humanize_minutes_en(minutes: int) -> str:
-        if minutes >= 60 and minutes % 60 == 0:
-            h = minutes // 60
-            return f"{h} hour{'s' if h > 1 else ''}"
-        return f"{minutes} minute{'s' if minutes > 1 else ''}"
-
-    def _get_heartbeat_job(self, session_key: str):
-        """Return the heartbeat cron job for this session, or None."""
-        if not self.cron_service:
-            return None
-        name = self._heartbeat_job_name(session_key)
-        for j in self.cron_service.list_jobs(include_disabled=True):
-            if j.name == name:
-                return j
-        return None
-
-    def _build_heartbeat_info(self, session_key: str) -> str | None:
-        """Return a system-prompt block describing the active heartbeat, or None if off."""
-        job = self._get_heartbeat_job(session_key)
-        if not job or not job.schedule.every_ms:
-            return None
-        minutes = job.schedule.every_ms // 60_000
-        return (
-            f"## Heartbeat: ON\n\n"
-            f"Firing every {self._humanize_minutes_en(minutes)}. HEARTBEATS.md is loaded above. "
-            f"On each tick, scan the checklist and act only when something genuinely warrants "
-            f"attention. Call `stay_silent` to end the turn quietly when nothing applies."
-        )
-
-    def _handle_heartbeat_command(
-        self, msg: InboundMessage, session: Session, session_key: str, arg: str,
-    ) -> OutboundMessage:
-        if not self.cron_service:
-            return OutboundMessage(
-                channel=msg.channel, chat_id=msg.chat_id,
-                content="心跳功能不可用：cron 服务未配置。",
-            )
-
-        arg = (arg or "").strip().lower()
-
-        # No-arg → status
-        if not arg:
-            job = self._get_heartbeat_job(session_key)
-            if not job or not job.schedule.every_ms:
-                return OutboundMessage(
-                    channel=msg.channel, chat_id=msg.chat_id,
-                    content="心跳未开启。",
-                )
-            minutes = job.schedule.every_ms // 60_000
-            line = f"心跳每 {self._humanize_minutes_cn(minutes)} 触发"
-            if job.state.next_run_at_ms:
-                from datetime import datetime as _dt
-                nxt = _dt.fromtimestamp(job.state.next_run_at_ms / 1000)
-                line += f"，下次 {nxt.strftime('%H:%M:%S')}"
-            return OutboundMessage(channel=msg.channel, chat_id=msg.chat_id, content=line + "。")
-
-        # Off
-        if arg == "off":
-            job = self._get_heartbeat_job(session_key)
-            if not job:
-                return OutboundMessage(
-                    channel=msg.channel, chat_id=msg.chat_id, content="心跳本来就没开。",
-                )
-            self.cron_service.remove_job(job.id)
-            return OutboundMessage(
-                channel=msg.channel, chat_id=msg.chat_id, content="心跳已关闭。",
-            )
-
-        # Else: try to parse as interval
-        minutes = self._parse_heartbeat_interval(arg)
-        if minutes is None:
-            return OutboundMessage(
-                channel=msg.channel, chat_id=msg.chat_id,
-                content=(
-                    "格式不对。\n\n"
-                    "示例：`/heartbeat 30m`、`/heartbeat 2h`、`/heartbeat 30`（默认分钟）、`/heartbeat off`"
-                ),
-            )
-        if minutes < HEARTBEAT_MIN_MINUTES or minutes > HEARTBEAT_MAX_MINUTES:
-            return OutboundMessage(
-                channel=msg.channel, chat_id=msg.chat_id,
-                content=f"间隔需在 {HEARTBEAT_MIN_MINUTES} 分钟到 {HEARTBEAT_MAX_MINUTES // 60} 小时之间。",
-            )
-
-        # Drop any existing heartbeat job for this session, then register fresh
-        existing = self._get_heartbeat_job(session_key)
-        if existing:
-            self.cron_service.remove_job(existing.id)
-
-        # Write template if HEARTBEATS.md missing
-        created_template = False
-        if session.directory:
-            hb_path = session.directory / "HEARTBEATS.md"
-            if not hb_path.exists():
-                hb_path.write_text(HEARTBEATS_TEMPLATE, encoding="utf-8")
-                created_template = True
-                logger.info("Created HEARTBEATS.md at {}", hb_path)
-
-        from bubbles.cron.types import CronSchedule
-        self.cron_service.add_job(
-            name=self._heartbeat_job_name(session_key),
-            schedule=CronSchedule(kind="every", every_ms=minutes * 60_000),
-            message=HEARTBEAT_TICK_MESSAGE,
-            deliver=True,
-            channel=msg.channel,
-            to=msg.chat_id,
-            session_key=session_key,
-        )
-
-        body = f"心跳已开启，每 {self._humanize_minutes_cn(minutes)} 触发。"
-        if created_template:
-            body += " 已写入 HEARTBEATS.md 模板。"
-        return OutboundMessage(channel=msg.channel, chat_id=msg.chat_id, content=body)
-
-    def _save_turn(self, session: Session, messages: list[dict], skip: int) -> None:
-        """Save new-turn messages into session."""
-        from datetime import datetime
-        for m in messages[skip:]:
-            entry = {k: v for k, v in m.items() if k != "reasoning_content"}
-            entry.setdefault("timestamp", datetime.now().isoformat())
-            session.messages.append(entry)
-        session.updated_at = datetime.now()
-
-    def _should_compact(self, messages: list[dict[str, Any]]) -> bool:
-        """Check if messages exceed compact threshold based on token estimation."""
-        estimated = estimate_messages_tokens(messages)
-        usable = self.context_limit - self.max_tokens
-        return estimated > usable * self.compact_threshold
-
-    async def _do_compact(self, session: Session) -> CompactionResult:
-        """Compact session history using LLM-powered summarization."""
-        return await compact_session(
-            session=session,
-            provider=self.provider,
-            model=self.model,
-            context_limit=self.context_limit,
-            keep_recent=self.compact_keep_recent,
-            min_messages_to_compact=self.compact_min_messages,
-            use_fallback_on_failure=True,
-        )
-
-    async def _mid_loop_compact(
-        self,
-        session: Session,
-        current_messages: list[dict[str, Any]],
-        on_progress: Callable[..., Awaitable[None]] | None = None,
-    ) -> list[dict[str, Any]]:
-        """Execute compaction mid-loop, return rebuilt messages."""
-        logger.info("Mid-loop compaction triggered for session {}", session.key)
-
-        # 1. Save current progress to session (skip system messages)
-        first_non_system = 0
-        for i, m in enumerate(current_messages):
-            if m.get("role") != "system":
-                first_non_system = i
-                break
-
-        # Append new messages from current loop to session
-        history_len = len(session.get_history(max_messages=self.memory_window))
-        new_messages = current_messages[first_non_system + history_len:]
-        for m in new_messages:
-            if m.get("role") != "system":
-                session.messages.append(m)
-
-        # 2. Execute compaction
-        try:
-            result = await self._do_compact(session)
-            if result.success:
-                msg = "Context overflow, history compacted" if not result.used_fallback else "Context overflow, history truncated"
-                if on_progress:
-                    await on_progress(f"{msg} ({result.tokens_before} → {result.tokens_after} tokens)")
-                logger.info("Mid-loop compaction successful: {} -> {} tokens", result.tokens_before, result.tokens_after)
-                self.sessions.save(session)
-            else:
-                logger.warning("Mid-loop compaction skipped: {}", result.error)
-        except Exception as e:
-            logger.exception("Mid-loop compaction failed: {}", e)
-
-        # 3. Rebuild messages: system prompt + new history + current query
-        new_history = session.get_history(max_messages=self.memory_window)
-
-        # Find current user query (last user message)
-        current_query = None
-        for m in reversed(current_messages):
-            if m.get("role") == "user":
-                current_query = m.get("content", "")
-                break
-
-        # Rebuild complete message list
-        context = self._get_context(session)
-        rebuilt = context.build_messages(
-            history=new_history,
-            current_message=current_query or "",
-            channel="cli",
-            chat_id="direct",
-            heartbeat_info=self._build_heartbeat_info(session.key),
-        )
-
-        return rebuilt
-
     async def process_direct(
         self,
         content: str,
