@@ -28,6 +28,8 @@ from prompt_toolkit.history import FileHistory
 from prompt_toolkit.patch_stdout import patch_stdout
 
 from bubbles import __version__, __logo__
+from bubbles.agent.bindings import get_bindings_for_session, save_session_bindings
+from bubbles.agent.turn import do_compact
 from bubbles.config.schema import Config
 
 app = typer.Typer(
@@ -508,7 +510,7 @@ def _print_debug_info(agent_loop, session_id: str) -> None:
         channel="cli",
         chat_id="direct",
         system_prompt_extra=session.config.system_prompt if session.config else None,
-        session_bindings=agent_loop._get_bindings_for_session(session_id),
+        session_bindings=get_bindings_for_session(agent_loop._session_bindings, session_id),
     )
     # Extract system prompt from messages
     system_prompt = messages[0].get("content", "") if messages else ""
@@ -634,7 +636,7 @@ def agent(
         # If session_id provided via -s, auto-bind to it
         if session_id:
             agent_loop._session_bindings[binding_key] = session_id
-            agent_loop._save_session_bindings()
+            save_session_bindings(agent_loop.data_dir, agent_loop._session_bindings)
             console.print(f"Bound to session: [bold]{session_id}[/bold]\n")
         else:
             # Check if already bound from previous run
@@ -725,7 +727,7 @@ def agent(
                                 continue
                             session = agent_loop.sessions.get_or_create(bound_session)
                             console.print("[dim]Compacting conversation history...[/dim]")
-                            result = await agent_loop._do_compact(session)
+                            result = await do_compact(agent_loop, session)
                             if result.success:
                                 agent_loop.sessions.save(session)
                                 console.print(
