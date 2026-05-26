@@ -70,6 +70,22 @@ class ExecTool(Tool):
                 working_dir = str(self._session_dir / working_dir)
         cwd = working_dir or (str(self._session_dir) if self._session_dir else os.getcwd())
 
+        # Hard sandbox: cwd MUST resolve inside session_dir. This catches the
+        # working_dir-with-..  escape (the alternative would be the agent jumping
+        # to another session's working tree). Symlinks are resolved so a planted
+        # symlink can't break out either.
+        if self._session_dir:
+            try:
+                resolved_cwd = Path(cwd).resolve()
+                session_resolved = self._session_dir.resolve()
+                resolved_cwd.relative_to(session_resolved)
+            except (ValueError, OSError):
+                return (
+                    f"Error: working_dir resolves outside session directory "
+                    f"({cwd!r} ↛ {self._session_dir})"
+                )
+            cwd = str(resolved_cwd)
+
         guard_error = self._guard_command(command, cwd)
         if guard_error:
             return guard_error
@@ -128,7 +144,13 @@ class ExecTool(Tool):
             return f"Error executing command: {str(e)}"
 
     def _guard_command(self, command: str, cwd: str) -> str | None:
-        """Best-effort safety guard for potentially destructive commands."""
+        """Best-effort safety guard for potentially destructive commands.
+
+        Note: This is **application-layer best-effort**. Shell is Turing-complete
+        — variables, command substitution, here-docs, and indirect file access
+        all bypass static checks. For true session isolation, run each session
+        in its own container (see DISTRIBUTED.md).
+        """
         cmd = command.strip()
         lower = cmd.lower()
 
@@ -145,10 +167,34 @@ class ExecTool(Tool):
             if "..\\" in cmd or "../" in cmd:
                 return "Error: Command blocked by safety guard (path traversal detected)"
 
+            # `cd ..` (bare, no trailing slash) is a traversal too — the
+            # `../` check above misses it because the regex needs a slash.
+            if re.search(r"\b(?:cd|pushd|chdir)\s+\.\.(?=\s|;|&|\||$)", cmd, re.IGNORECASE):
+                return "Error: Command blocked by safety guard (cd .. detected)"
+
+            # `cd /...` / `cd ~ ...` / `pushd /...` to absolute paths outside session.
+            # Doesn't catch every escape (env-var indirection, command substitution),
+            # but blocks the obvious cases without false-positives on `cd subdir`.
+            cd_match = re.search(
+                r"\b(?:cd|pushd|chdir)\s+([^;&|`$]+)", cmd, re.IGNORECASE,
+            )
+            if cd_match:
+                target = cd_match.group(1).strip().strip("'\"")
+                if target.startswith(("/", "~")) or re.match(r"^[A-Za-z]:[\\/]", target):
+                    # absolute path — must resolve inside session_dir
+                    try:
+                        resolved = Path(target.replace("~", str(self._session_dir))).resolve()
+                        resolved.relative_to(self._session_dir.resolve())
+                    except (ValueError, OSError):
+                        return f"Error: Command blocked by safety guard (cd target outside session directory: {target})"
+
             session_path = self._session_dir.resolve()
 
             win_paths = re.findall(r"[A-Za-z]:\\[^\\\"']+", cmd)
-            posix_paths = re.findall(r"(?:^|[\s|>])(/[^\s\"'>]+)", cmd)
+            # POSIX absolute paths. Accept many leading separators so we catch
+            # quoted strings, var-assignments (`P='/path'`), and substituted
+            # forms (`"$X"`). Trailing terminators: whitespace, quotes, redirects.
+            posix_paths = re.findall(r"(?:^|[\s|>='\"`(),])(/[^\s\"'>;]+)", cmd)
 
             for raw in win_paths + posix_paths:
                 try:
