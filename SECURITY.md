@@ -87,6 +87,36 @@ File operations have path traversal protection, but:
 - ✅ Regularly audit file operations in logs
 - ❌ Don't give unrestricted access to sensitive files
 
+### 4.1 Cross-Session Isolation
+
+Bubbles uses two cooperating layers inside the framework. The "absolutely
+cannot cross sessions" property is **not** delivered by application code
+alone — to get it, you also need OS / container-level isolation in your
+deployment.
+
+| Layer | What it blocks |
+|-------|----------------|
+| **L1: Application path sandbox** | `read_file` / `write_file` / `edit_file` / `list_dir` paths outside the session directory (incl. via symlinks, absolute paths, `~`). `exec` `working_dir` resolved through `..` or symlinks. Common shell tricks caught: `cat /other-session/...`, `cd /...`, `cd ..`, `find / ...`, variable indirection `P=/...; cat $P/...`, command substitution `$(...)`. |
+| **L2: Shell-trick best-effort** | Static-analyzable bypass attempts in the `exec` tool's command string. Caught: absolute paths in quotes, `cd` to absolute targets outside session, traversal patterns. **NOT caught**: base64-decoded paths, paths constructed at runtime in subshells, write+chmod+exec workflows — anything turing-complete enough to evade static analysis. |
+
+**For the hard guarantee, layer your deployment with OS-level isolation.**
+Any of these work; pick what fits:
+
+- **Per-session UNIX user**: each session under its own `bubbles-<key>`
+  account, with `~/.bubbles/sessions/<key>` owned mode 0700 by that user.
+  Filesystem permissions then block cross-session reads at the kernel level.
+- **`bubblewrap` / `firejail` / `unshare`** wrapping the `exec` tool: confine
+  the subprocess to a mount-namespace where only the current session's
+  directory is visible.
+- **`sandbox-exec`** (macOS): kernel-enforced policy that denies file-read /
+  file-write on other sessions while allowing the current one.
+- **One container per session**: each bubbles process bind-mounts only its
+  own session's working tree.
+
+These are deployment-side hardenings, not framework features. L1 + L2 cover
+the common cases out of the box; the absolute guarantee is something you
+opt into by choosing the right deployment shape.
+
 ### 5. Network Security
 
 **API Calls:**
