@@ -19,15 +19,51 @@ app.add_typer(cron_app, name="cron")
 @cron_app.command("list")
 def cron_list(
     all: bool = typer.Option(False, "--all", "-a", help="Include disabled jobs"),
+    session: str | None = typer.Option(None, "--session", help="Filter by session_key"),
+    channel: str | None = typer.Option(None, "--channel", help="Filter by delivery channel"),
+    as_json: bool = typer.Option(False, "--json", help="Emit machine-readable JSON"),
 ):
     """List scheduled jobs."""
+    import json as _json
+
     from bubbles.config.loader import get_data_dir
+    from bubbles.cron.format import (
+        format_absolute,
+        format_relative,
+        format_schedule,
+        format_status,
+    )
     from bubbles.cron.service import CronService
 
     store_path = get_data_dir() / "cron" / "jobs.json"
     service = CronService(store_path)
 
     jobs = service.list_jobs(include_disabled=all)
+    if session is not None:
+        jobs = [j for j in jobs if j.payload.session_key == session]
+    if channel is not None:
+        jobs = [j for j in jobs if j.payload.channel == channel]
+
+    if as_json:
+        payload = [
+            {
+                "id": j.id,
+                "name": j.name,
+                "enabled": j.enabled,
+                "schedule": format_schedule(j.schedule),
+                "next_run_at_ms": j.state.next_run_at_ms,
+                "next_relative": format_relative(j.state.next_run_at_ms) if j.state.next_run_at_ms else None,
+                "last_status": j.state.last_status,
+                "last_error": j.state.last_error,
+                "backoff_until_ms": j.state.backoff_until_ms,
+                "session_key": j.payload.session_key,
+                "channel": j.payload.channel,
+                "to": j.payload.to,
+            }
+            for j in jobs
+        ]
+        console.print_json(_json.dumps(payload, ensure_ascii=False))
+        return
 
     if not jobs:
         console.print("No scheduled jobs.")
@@ -37,32 +73,30 @@ def cron_list(
     table.add_column("ID", style="cyan")
     table.add_column("Name")
     table.add_column("Schedule")
-    table.add_column("Status")
+    table.add_column("Enabled")
     table.add_column("Next Run")
+    table.add_column("Status")
 
-    import time
-    from datetime import datetime as _dt
-    from zoneinfo import ZoneInfo
     for job in jobs:
-        if job.schedule.kind == "every":
-            sched = f"every {(job.schedule.every_ms or 0) // 1000}s"
-        elif job.schedule.kind == "cron":
-            sched = f"{job.schedule.expr or ''} ({job.schedule.tz})" if job.schedule.tz else (job.schedule.expr or "")
-        else:
-            sched = "one-time"
+        sched = format_schedule(job.schedule)
 
         next_run = ""
         if job.state.next_run_at_ms:
-            ts = job.state.next_run_at_ms / 1000
-            try:
-                tz = ZoneInfo(job.schedule.tz) if job.schedule.tz else None
-                next_run = _dt.fromtimestamp(ts, tz).strftime("%Y-%m-%d %H:%M")
-            except Exception:
-                next_run = time.strftime("%Y-%m-%d %H:%M", time.localtime(ts))
+            abs_str = format_absolute(job.state.next_run_at_ms, job.schedule.tz)
+            rel_str = format_relative(job.state.next_run_at_ms)
+            next_run = f"{abs_str}\n[dim]{rel_str}[/dim]"
 
-        status = "[green]enabled[/green]" if job.enabled else "[dim]disabled[/dim]"
+        enabled_cell = "[green]yes[/green]" if job.enabled else "[dim]no[/dim]"
 
-        table.add_row(job.id, job.name, sched, status, next_run)
+        status_text = format_status(job.state)
+        if job.state.last_status == "error":
+            status_cell = f"[red]{status_text}[/red]"
+        elif job.state.last_status == "ok":
+            status_cell = f"[green]{status_text}[/green]"
+        else:
+            status_cell = f"[dim]{status_text}[/dim]"
+
+        table.add_row(job.id, job.name, sched, enabled_cell, next_run, status_cell)
 
     console.print(table)
 

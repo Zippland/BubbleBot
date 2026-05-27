@@ -3,6 +3,7 @@
 from typing import Any
 
 from bubbles.agent.tools.base import Tool
+from bubbles.cron.format import format_job_block
 from bubbles.cron.service import CronService
 from bubbles.cron.types import CronSchedule
 
@@ -59,11 +60,15 @@ class CronTool(Tool):
                 "job_id": {
                     "type": "string",
                     "description": "Job ID (for remove)"
+                },
+                "include_disabled": {
+                    "type": "boolean",
+                    "description": "For list: include disabled jobs (default false)"
                 }
             },
             "required": ["action"]
         }
-    
+
     async def execute(
         self,
         action: str,
@@ -73,12 +78,13 @@ class CronTool(Tool):
         tz: str | None = None,
         at: str | None = None,
         job_id: str | None = None,
+        include_disabled: bool = False,
         **kwargs: Any
     ) -> str:
         if action == "add":
             return self._add_job(message, every_seconds, cron_expr, tz, at)
         elif action == "list":
-            return self._list_jobs()
+            return self._list_jobs(include_disabled=include_disabled)
         elif action == "remove":
             return self._remove_job(job_id)
         return f"Unknown action: {action}"
@@ -131,16 +137,35 @@ class CronTool(Tool):
         )
         return f"Created job '{job.name}' (id: {job.id})"
     
-    def _list_jobs(self) -> str:
-        jobs = self._cron.list_jobs()
+    def _list_jobs(self, include_disabled: bool = False) -> str:
+        # Session isolation: agent only ever sees jobs created from this session.
+        # Legacy jobs without session_key (e.g. created via CLI) are invisible here.
+        if not self._session_key:
+            return "No scheduled jobs in this session."
+
+        all_jobs = self._cron.list_jobs(include_disabled=include_disabled)
+        jobs = [j for j in all_jobs if j.payload.session_key == self._session_key]
         if not jobs:
-            return "No scheduled jobs."
-        lines = [f"- {j.name} (id: {j.id}, {j.schedule.kind})" for j in jobs]
-        return "Scheduled jobs:\n" + "\n".join(lines)
-    
+            return "No scheduled jobs in this session."
+
+        header = f"Scheduled jobs in this session ({len(jobs)}):\n"
+        blocks = [format_job_block(j, i + 1) for i, j in enumerate(jobs)]
+        return header + "\n\n".join(blocks)
+
     def _remove_job(self, job_id: str | None) -> str:
         if not job_id:
             return "Error: job_id is required for remove"
-        if self._cron.remove_job(job_id):
-            return f"Removed job {job_id}"
+
+        # Session isolation: only allow removing jobs that belong to this session.
+        # To avoid leaking the existence of jobs in other sessions, we return the
+        # same "not found" message for (a) genuinely missing ids and (b) ids that
+        # exist but belong to other sessions.
+        for job in self._cron.list_jobs(include_disabled=True):
+            if job.id != job_id:
+                continue
+            if job.payload.session_key != self._session_key:
+                return f"Job {job_id} not found"
+            if self._cron.remove_job(job_id):
+                return f"Removed job {job_id}"
+            return f"Job {job_id} not found"
         return f"Job {job_id} not found"

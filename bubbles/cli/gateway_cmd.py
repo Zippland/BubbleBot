@@ -74,26 +74,24 @@ def gateway(
     async def on_cron_job(job: CronJob) -> str | None:
         """Execute a cron job through the agent.
 
-        Registers ``stay_silent`` for the duration of the turn so the model can
-        opt out of delivery when the cron's condition isn't met. If the model
-        calls it, nothing is sent regardless of ``deliver``.
+        Uses the system-triggered tool-set for the duration of the turn:
+        - ``stay_silent`` is added so the model can opt out of delivery.
+        - ``cron`` is removed so a triggered turn cannot schedule more jobs
+          (no recursive job creation; see SPEC §5.6).
         """
-        from bubbles.agent.tools.stay_silent import StaySilentTool
+        from bubbles.agent.system_turn import system_triggered_toolset
         from bubbles.bus.events import OutboundMessage
 
         # Use the saved session_key to inject history, fallback to cron:{job.id}
         session_key = job.payload.session_key or f"cron:{job.id}"
 
-        agent.tools.register(StaySilentTool())
-        try:
+        with system_triggered_toolset(agent):
             response, tools_used = await agent.process_direct(
                 job.payload.message,
                 session_key=session_key,
                 channel=job.payload.channel or "cli",
                 chat_id=job.payload.to or "direct",
             )
-        finally:
-            agent.tools.unregister("stay_silent")
 
         if "stay_silent" in tools_used:
             logger.info("cron: stay_silent for job {} ({})", job.id, job.name)
