@@ -251,6 +251,8 @@ Bubbles 以**单一二进制 CLI（`bubbles`）**对外暴露能力，没有 GUI
 - 任务可声明"投递目标"（渠道 + chat_id）：助手响应除了写回会话历史，还会主动发到目标渠道。
 - 任务有启用/禁用开关；禁用任务不会自动执行，但可被 `cron run -f` 手动触发。
 - 任务列表持久化在 `~/.bubbles/cron/jobs.json`，与会话目录平级。
+- **会话隔离（仅 agent 工具）**：模型可调用的 `cron` 工具的 `list` / `remove` 严格限定在当前会话——只看得到、只删得掉本会话创建的 job。其他会话的 job 既不出现在 `list` 返回中，对 `remove` 也一律返回与"不存在"完全相同的错误文案（不通过错误信息泄露其他会话的 job id）。CLI（`bubbles cron …`）保持全局视角不受此限，是跨会话运维入口。
+- **系统触发 turn 不可用 `cron` 工具**：cron job 与心跳触发的 agent turn（即"系统触发 turn"，与 `stay_silent` 同款判断）期间，模型完全看不到 `cron` 工具——无论 add / list / remove 都不可用。防止"一次触发 → 注册更多 job → 雪崩"的嵌套；triggered turn 想表达"完成后自删"等语义请走声明式字段（如 `delete_after_run`），不要走运行时再调度。
 - **沉默信号 `stay_silent`**：cron job 触发的 agent turn（以及任何系统触发的周期/事件 turn，如群聊心跳）可调 `stay_silent` 工具表达"本轮判断无需动作"——调后不向 channel 发出任何 outbound，也不写回会话历史。这是"看一眼条件、不满足就别说话"模式的标准实现方式。该工具仅在系统触发的 turn 里注册，用户直接发问的 turn 看不到。
 - **崩溃安全**：服务按 `next_run_at_ms` 锚点对齐持久化（每个 `every` job 在创建时锁定 anchor，重启后按原节奏继续不漂移）；执行前 pre-advance + 写盘，崩溃也不会重发。
 - **失败退避**：连续失败按 30s / 1m / 5m / 15m / 60m 指数退避，避开 API rate-limit 风暴；成功后自动清零。一次性 `at` 任务失败不进退避（一次性，下次也不会跑）。
