@@ -84,6 +84,8 @@ Bubbles 以**单一二进制 CLI（`bubbles`）**对外暴露能力，没有 GUI
 
 > **注**：`bubbles onboard` 是唯一的初始化命令，幂等可重入；任何"重置"操作不会自动删除已有会话数据。
 
+> **`bubbles status` 的产品契约**：展示装机级基线（默认 model、已配置 provider、启用渠道）。会话维度只在该会话**与默认不同**时才出现——例如 model override、绑定了 cron job、开了心跳。沿用默认的会话在 status 里保持安静，避免把命令撑成会话审计。一直没有 session 维度的子命令；所有会话级细节通过此差异视图与交互模式的 `/config` / `/prompt` 暴露。
+
 ### 4.2 部署形态
 
 - **本地直跑**：`pip install -e .` + `bubbles onboard` + `bubbles gateway`。
