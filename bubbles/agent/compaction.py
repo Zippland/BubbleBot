@@ -145,6 +145,21 @@ def find_last_compaction_index(messages: list[dict[str, Any]]) -> int:
     return -1
 
 
+def _align_split_to_user_boundary(
+    to_summarize: list[dict[str, Any]],
+    to_keep: list[dict[str, Any]],
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    """切分点对齐到 turn 边界：to_keep 必须以 user 消息开头。
+
+    Why: 原按 "最后 N 条" 硬切，可能让 to_keep 起头是孤立 tool_result，或
+    assistant.tool_calls 的部分 tool_result 留在 to_summarize、其余在 to_keep——
+    compaction marker 之后的历史返给 provider 时会因 tool block 不配对而 400。
+    """
+    while to_keep and to_keep[0].get("role") != "user":
+        to_summarize.append(to_keep.pop(0))
+    return to_summarize, to_keep
+
+
 def format_message_for_summary(msg: dict[str, Any], max_content_len: int = 1500) -> str | None:
     """Format a single message for summarization."""
     if is_compaction_marker(msg):
@@ -316,6 +331,9 @@ async def compact_session(
     to_summarize = active_messages[:-keep_recent]
     to_keep = active_messages[-keep_recent:]
 
+    # 切分点对齐到 turn 边界，避免 to_keep 起头是孤立 tool block。
+    to_summarize, to_keep = _align_split_to_user_boundary(to_summarize, to_keep)
+
     if len(to_summarize) < min_messages_to_compact:
         return CompactionResult(
             success=False,
@@ -346,8 +364,8 @@ async def compact_session(
                 error="Summarization failed and fallback disabled"
             )
 
-    # Create compaction marker
-    first_kept_index = len(messages) - keep_recent
+    # Create compaction marker — 用对齐后的 to_keep 长度，保证 marker 紧挨 to_keep 前。
+    first_kept_index = len(messages) - len(to_keep)
     marker = create_compaction_marker(
         summary=summary,
         first_kept_index=first_kept_index,
