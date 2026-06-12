@@ -46,6 +46,57 @@ def _is_compaction_marker(msg: dict[str, Any]) -> bool:
     return msg.get("_type") == "compaction"
 
 
+def _sanitize_for_api(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """剔除会让 LLM API 拒绝的不配对 tool_calls/tool_result。
+
+    Why: session.jsonl 历史上可能含半截 turn（崩溃中断、旧 compact 切错残留）。
+    Provider 协议要求 assistant.tool_calls 的每个 id 都有后续 role=tool 配对；
+    任一不配对都会让下一次 chat() 返回 400。本函数 O(n) 扫描，扔掉：
+    - 任何末尾尚未配齐 tool_result 的 assistant.tool_calls（连同已配对的局部 result）；
+    - 任何孤立的 role=tool（前面没有匹配 assistant.tool_calls）。
+    单条消息内部结构不动。
+    """
+    out: list[dict[str, Any]] = []
+    pending: dict[str, int] = {}
+    pending_assistant_idx: int | None = None
+
+    def _drop_pending_turn() -> None:
+        nonlocal pending_assistant_idx
+        if pending_assistant_idx is not None:
+            del out[pending_assistant_idx:]
+        pending.clear()
+        pending_assistant_idx = None
+
+    for m in messages:
+        role = m.get("role")
+        if role == "assistant" and m.get("tool_calls"):
+            if pending:
+                _drop_pending_turn()
+            pending_assistant_idx = len(out)
+            for tc in m["tool_calls"]:
+                tid = tc.get("id")
+                if tid is not None:
+                    pending[tid] = pending_assistant_idx
+            out.append(m)
+        elif role == "tool":
+            tid = m.get("tool_call_id")
+            if tid is not None and tid in pending:
+                pending.pop(tid)
+                out.append(m)
+                if not pending:
+                    pending_assistant_idx = None
+            # else: 孤立 tool_result，跳过
+        else:
+            if pending:
+                _drop_pending_turn()
+            out.append(m)
+
+    if pending:
+        _drop_pending_turn()
+
+    return out
+
+
 # Default number of recent images to retain when building history for LLM
 DEFAULT_KEEP_LAST_IMAGES = 10
 
@@ -190,11 +241,16 @@ class Session:
         active = [m for m in active if not _is_compaction_marker(m)]
         sliced = active[-max_messages:]
 
+        # Sanitize：兜底剔除任何残留的不配对 tool_calls/tool_result。
+        sliced = _sanitize_for_api(sliced)
+
         # Drop leading non-user messages to avoid orphaned tool_result blocks
         for i, m in enumerate(sliced):
             if m.get("role") == "user":
                 sliced = sliced[i:]
                 break
+        else:
+            sliced = []
 
         out: list[dict[str, Any]] = []
 
