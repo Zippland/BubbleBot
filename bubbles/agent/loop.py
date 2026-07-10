@@ -701,6 +701,7 @@ class AgentLoop:
             sender_name=msg.metadata.get("sender_name"),
             system_prompt_extra=session.config.system_prompt,
             session_bindings=get_bindings_for_session(self._session_bindings, session.key),
+            work_dir=sandbox.root,
         )
 
         # Entry compaction: check if context is overflowing before entering loop
@@ -720,6 +721,7 @@ class AgentLoop:
                 system_prompt_extra=session.config.system_prompt,
                 session_bindings=get_bindings_for_session(self._session_bindings, session.key),
                 heartbeat_info=build_heartbeat_info(self.cron_service, session.key),
+                work_dir=sandbox.root,
             )
 
         # Track progress messages to detect loops

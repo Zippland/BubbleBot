@@ -51,9 +51,10 @@ async def process_system_message(
     session = loop.sessions.get_or_create(key)
     prune_old_images_inplace(session.messages)
     context = loop._get_context(session)
+    sandbox = await loop._sandboxes.get(key, session.directory, session.config.sandbox)
     loop._set_tool_context(
         channel, chat_id, msg.metadata.get("message_id"),
-        session.directory, key, session,
+        session.directory, key, session, sandbox=sandbox,
     )
     history = session.get_history(max_messages=loop.memory_window)
     messages = context.build_messages(
@@ -64,6 +65,7 @@ async def process_system_message(
         system_prompt_extra=session.config.system_prompt,
         session_bindings=get_bindings_for_session(loop._session_bindings, session.key),
         heartbeat_info=build_heartbeat_info(loop.cron_service, session.key),
+        work_dir=sandbox.root,
     )
     final_content, _, all_msgs = await loop._run_agent_loop(
         messages, session=session, on_tool_call=on_tool_call,
@@ -160,10 +162,12 @@ async def mid_loop_compact(
             break
 
     context = loop._get_context(session)
+    sandbox = await loop._sandboxes.get(session.key, session.directory, session.config.sandbox)
     return context.build_messages(
         history=new_history,
         current_message=current_query or "",
         channel="cli",
         chat_id="direct",
         heartbeat_info=build_heartbeat_info(loop.cron_service, session.key),
+        work_dir=sandbox.root,
     )

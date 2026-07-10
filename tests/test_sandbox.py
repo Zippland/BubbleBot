@@ -218,3 +218,22 @@ async def test_two_sessions_have_separate_homes(tmp_path: Path, monkeypatch) -> 
     res_a = await sa.exec("cat $HOME/.token", cwd=sa.root, timeout=10)
     assert res_a.stdout.strip() == "tokenA"
     await mgr.close_all()
+
+
+# ---- model sees sandbox root as <work_dir>, never the host path ----
+
+def test_system_prompt_uses_sandbox_root_not_host_path(tmp_path: Path) -> None:
+    from bubbles.agent.context import ContextBuilder
+
+    session_dir = tmp_path / "sessions" / "s"
+    session_dir.mkdir(parents=True)
+    ctx = ContextBuilder(session_dir=session_dir)
+
+    # No sandbox root → falls back to the session dir (debug / legacy path).
+    assert str(session_dir.resolve()) in ctx.build_system_prompt()
+
+    # With a sandbox-internal root, the model sees THAT, and the host path
+    # must not leak into the prompt.
+    sandboxed = ctx.build_system_prompt(work_dir="/workspace")
+    assert "<work_dir>: /workspace" in sandboxed
+    assert str(session_dir.resolve()) not in sandboxed
