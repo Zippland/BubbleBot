@@ -4,7 +4,7 @@ import asyncio
 import json
 import uuid
 from pathlib import Path
-from typing import Any
+from typing import Any, TYPE_CHECKING
 
 from loguru import logger
 
@@ -15,6 +15,10 @@ from bubbles.agent.tools.registry import ToolRegistry
 from bubbles.agent.tools.filesystem import ReadFileTool, WriteFileTool, EditFileTool, ListDirTool
 from bubbles.agent.tools.shell import ExecTool
 from bubbles.agent.tools.web import WebSearchTool, WebFetchTool
+
+if TYPE_CHECKING:
+    from bubbles.config.schema import ExecToolConfig
+    from bubbles.sandbox.manager import SandboxManager
 
 
 class SubagentManager:
@@ -29,6 +33,7 @@ class SubagentManager:
         max_tokens: int = 4096,
         tavily_api_key: str | None = None,
         exec_config: "ExecToolConfig | None" = None,
+        sandbox_manager: "SandboxManager | None" = None,
     ):
         from bubbles.config.schema import ExecToolConfig
         self.provider = provider
@@ -38,6 +43,7 @@ class SubagentManager:
         self.max_tokens = max_tokens
         self.tavily_api_key = tavily_api_key
         self.exec_config = exec_config or ExecToolConfig()
+        self.sandbox_manager = sandbox_manager
         self._running_tasks: dict[str, asyncio.Task[None]] = {}
         self._session_tasks: dict[str, set[str]] = {}  # session_key -> {task_id, ...}
     
@@ -87,18 +93,24 @@ class SubagentManager:
         logger.info("Subagent [{}] starting task: {}", task_id, label)
 
         try:
+            # Resolve the sandbox for this session (shares the parent session's
+            # working dir + credential home — subagent = same identity).
+            sandbox = None
+            if self.sandbox_manager is not None and session_dir is not None:
+                sandbox = await self.sandbox_manager.get(
+                    session_key or f"{origin['channel']}:{origin['chat_id']}",
+                    session_dir,
+                )
+
             # Build subagent tools (no message tool, no spawn tool)
             tools = ToolRegistry()
-            # File tools with session_dir restriction
+            # File tools bound to the session sandbox
             for cls in (ReadFileTool, WriteFileTool, EditFileTool, ListDirTool):
                 tool = cls()
-                tool.set_session_dir(session_dir)
+                tool.set_sandbox(sandbox)
                 tools.register(tool)
-            exec_tool = ExecTool(
-                timeout=self.exec_config.timeout,
-                path_append=self.exec_config.path_append,
-            )
-            exec_tool.set_session_dir(session_dir)
+            exec_tool = ExecTool(timeout=self.exec_config.timeout)
+            exec_tool.set_sandbox(sandbox)
             tools.register(exec_tool)
             tools.register(WebSearchTool(api_key=self.tavily_api_key))
             tools.register(WebFetchTool())

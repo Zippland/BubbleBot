@@ -112,9 +112,11 @@ async def handle_config_command(
     if not cmd_arg:
         model_val = cfg.model or loop.model
         prompt_val = (cfg.system_prompt[:30] + "...") if cfg.system_prompt else "-"
+        sandbox_val = cfg.sandbox or f"{loop.sandbox_config.default} (default)"
         config_text = f"""session: {session.key}
 model: {model_val}
-system_prompt: {prompt_val}"""
+system_prompt: {prompt_val}
+sandbox: {sandbox_val}"""
         return OutboundMessage(channel=msg.channel, chat_id=msg.chat_id, content=config_text)
 
     parts = cmd_arg.split(maxsplit=1)
@@ -153,9 +155,25 @@ system_prompt: {prompt_val}"""
             content="system_prompt updated" if value else "system_prompt reset to default",
         )
 
+    if key == "sandbox":
+        valid = ("local", "local_isolated")
+        if value and value.lower() not in valid:
+            return OutboundMessage(
+                channel=msg.channel, chat_id=msg.chat_id,
+                content=f"Unknown sandbox backend `{value}`. Valid: {', '.join(valid)}",
+            )
+        cfg.sandbox = value.lower() if value else None
+        loop.sessions.save(session)
+        # Drop the cached sandbox so the new backend is built on the next turn.
+        await loop._sandboxes.close(session.key)
+        return OutboundMessage(
+            channel=msg.channel, chat_id=msg.chat_id,
+            content=f"sandbox = `{value.lower()}`" if value else "sandbox reset to default",
+        )
+
     return OutboundMessage(
         channel=msg.channel, chat_id=msg.chat_id,
-        content=f"Unknown config key: `{key}`\n\nValid keys: model, system_prompt",
+        content=f"Unknown config key: `{key}`\n\nValid keys: model, system_prompt, sandbox",
     )
 
 

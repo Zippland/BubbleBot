@@ -286,6 +286,22 @@ class ExecToolConfig(Base):
     path_append: str = ""
 
 
+class SandboxConfig(Base):
+    """Sandbox backend selection for exec + file tools.
+
+    ``default`` is the global backend; a session may override it via
+    ``/config sandbox <backend>``. ``local`` reproduces the historical
+    behavior (shared host $HOME). ``local_isolated`` gives each session its own
+    $HOME for per-session CLI identity (gh/aws/gcloud/… credentials isolated).
+    """
+
+    default: str = "local"  # local | local_isolated (container/remote backends land later)
+    # Extra host env vars to pass through to isolated shells (beyond the
+    # platform essentials). Use for things like NODE_EXTRA_CA_CERTS.
+    env_passthrough: list[str] = Field(default_factory=list)
+    home_strategy: str = "session"  # session | host (reserved for future backends)
+
+
 class MCPServerConfig(Base):
     """MCP server connection configuration (stdio or HTTP)."""
 
@@ -302,6 +318,7 @@ class ToolsConfig(Base):
 
     web: WebToolsConfig = Field(default_factory=WebToolsConfig)
     exec: ExecToolConfig = Field(default_factory=ExecToolConfig)
+    sandbox: SandboxConfig = Field(default_factory=SandboxConfig)
     mcp_servers: dict[str, MCPServerConfig] = Field(default_factory=dict)
 
 

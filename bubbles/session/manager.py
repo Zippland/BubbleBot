@@ -162,6 +162,7 @@ class SessionConfig:
     temperature: float | None = None
     max_tokens: int | None = None
     system_prompt: str | None = None
+    sandbox: str | None = None  # per-session sandbox backend override (None = global default)
 
     def to_dict(self) -> dict[str, Any]:
         """Convert to dict, excluding None values."""
@@ -171,6 +172,7 @@ class SessionConfig:
             "temperature": self.temperature,
             "max_tokens": self.max_tokens,
             "system_prompt": self.system_prompt,
+            "sandbox": self.sandbox,
         }.items() if v is not None}
 
     @classmethod
@@ -182,6 +184,7 @@ class SessionConfig:
             temperature=data.get("temperature"),
             max_tokens=data.get("max_tokens"),
             system_prompt=data.get("system_prompt"),
+            sandbox=data.get("sandbox"),
         )
 
 

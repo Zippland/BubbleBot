@@ -1,45 +1,16 @@
-"""File system tools: read, write, edit, list_dir."""
+"""File system tools: read, write, edit, list_dir.
+
+These tools own *presentation* (line numbers, image base64, diff-matching, size
+limits) but delegate all raw I/O to the session's ``Sandbox``. The sandbox
+decides where bytes actually live (host disk, container, remote) and enforces
+path containment. See ``bubbles/sandbox/``.
+"""
 
 import difflib
-from pathlib import Path
 from typing import Any
 
 from bubbles.agent.tools.base import Tool
-
-
-def _resolve_path(path: str, base_dir: Path | None = None, restrict_to_base: bool = False) -> Path:
-    """Resolve path against base_dir and optionally enforce directory restriction.
-
-    Path handling:
-    - `~` refers to base_dir (NOT the system $HOME)
-    - Relative paths are resolved relative to base_dir
-    - If restrict_to_base is True, paths outside base_dir will raise PermissionError
-    """
-    raw = (path or "").strip()
-    if not raw:
-        raise ValueError("empty path")
-
-    # Handle ~ as base_dir (not system $HOME)
-    if raw.startswith("~"):
-        if base_dir:
-            raw = str(base_dir / raw[1:].lstrip("/\\"))
-        else:
-            raw = raw[1:].lstrip("/\\") or "."
-
-    p = Path(raw)
-    if not p.is_absolute() and base_dir:
-        p = base_dir / p
-
-    resolved = p.resolve()
-
-    if restrict_to_base and base_dir:
-        base = base_dir.resolve()
-        try:
-            resolved.relative_to(base)
-        except ValueError:
-            raise PermissionError(f"Path '{path}' is outside allowed directory")
-
-    return resolved
+from bubbles.sandbox.base import Sandbox
 
 
 def _with_line_numbers(content: str, *, start_line: int = 1) -> str:
@@ -51,27 +22,21 @@ def _with_line_numbers(content: str, *, start_line: int = 1) -> str:
     return "\n".join(f"{start_line + i:>{width}}|{line}" for i, line in enumerate(lines))
 
 
-class ReadFileTool(Tool):
+class _SandboxFileTool(Tool):
+    """Base for file tools: holds the per-turn sandbox handle."""
+
+    def __init__(self):
+        self._sandbox: Sandbox | None = None
+
+    def set_sandbox(self, sandbox: Sandbox | None) -> None:
+        """Set the sandbox for file operations (called per turn)."""
+        self._sandbox = sandbox
+
+
+class ReadFileTool(_SandboxFileTool):
     """Tool to read file contents. Automatically handles images and text files."""
 
     _IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".gif", ".bmp", ".webp", ".ico", ".tiff", ".tif"}
-
-    def __init__(self):
-        self._session_dir: Path | None = None
-
-    def set_session_dir(self, session_dir: Path | None) -> None:
-        """Set session directory for file operations."""
-        self._session_dir = session_dir
-
-    @property
-    def _base_dir(self) -> Path | None:
-        """Get base directory (session dir)."""
-        return self._session_dir
-
-    @property
-    def _restrict(self) -> bool:
-        """Whether to restrict paths to session directory."""
-        return self._session_dir is not None
 
     @property
     def name(self) -> str:
@@ -94,21 +59,27 @@ class ReadFileTool(Tool):
     ) -> str | list[dict[str, Any]]:
         import base64
         import mimetypes
+        from pathlib import PurePosixPath, PureWindowsPath
+
+        if self._sandbox is None:
+            return "Error: no sandbox bound"
 
         try:
-            file_path = _resolve_path(path, self._base_dir, restrict_to_base=self._restrict)
-            if not file_path.exists():
+            st = await self._sandbox.stat(path)
+            if st is None:
                 return f"Error: File not found: {path}"
-            if not file_path.is_file():
+            if st.is_dir:
                 return f"Error: Not a file: {path}"
 
-            ext = file_path.suffix.lower()
+            # Determine extension without touching the host FS.
+            name = PureWindowsPath(path).name if "\\" in path else PurePosixPath(path).name
+            ext = ("." + name.rsplit(".", 1)[1].lower()) if "." in name else ""
 
             # Handle image files - return as image_url for model to see
             if ext in self._IMAGE_EXTENSIONS:
-                image_data = file_path.read_bytes()
+                image_data = await self._sandbox.read_bytes(path)
                 b64 = base64.b64encode(image_data).decode()
-                mime, _ = mimetypes.guess_type(str(file_path))
+                mime, _ = mimetypes.guess_type(name)
                 if not mime:
                     mime = "image/jpeg"
                 return [
@@ -117,7 +88,7 @@ class ReadFileTool(Tool):
                 ]
 
             # Handle text files
-            content = file_path.read_text(encoding="utf-8")
+            content = (await self._sandbox.read_bytes(path)).decode("utf-8", errors="replace")
             all_lines = content.splitlines()
             total_lines = len(all_lines)
 
@@ -149,25 +120,8 @@ class ReadFileTool(Tool):
             return f"Error reading file: {str(e)}"
 
 
-class WriteFileTool(Tool):
+class WriteFileTool(_SandboxFileTool):
     """Tool to write content to a file."""
-
-    def __init__(self):
-        self._session_dir: Path | None = None
-
-    def set_session_dir(self, session_dir: Path | None) -> None:
-        """Set session directory for file operations."""
-        self._session_dir = session_dir
-
-    @property
-    def _base_dir(self) -> Path | None:
-        """Get base directory (session dir)."""
-        return self._session_dir
-
-    @property
-    def _restrict(self) -> bool:
-        """Whether to restrict paths to session directory."""
-        return self._session_dir is not None
 
     @property
     def name(self) -> str:
@@ -185,37 +139,20 @@ class WriteFileTool(Tool):
         }
 
     async def execute(self, path: str, content: str, **kwargs: Any) -> str:
+        if self._sandbox is None:
+            return "Error: no sandbox bound"
         try:
-            file_path = _resolve_path(path, self._base_dir, restrict_to_base=self._restrict)
-            file_path.parent.mkdir(parents=True, exist_ok=True)
-            bytes_written = len(content.encode("utf-8", errors="replace"))
-            file_path.write_text(content, encoding="utf-8")
-            return f"Successfully wrote {bytes_written} bytes to {file_path}"
+            data = content.encode("utf-8", errors="replace")
+            await self._sandbox.write_bytes(path, data)
+            return f"Successfully wrote {len(data)} bytes to {path}"
         except PermissionError as e:
             return f"Error: {e}"
         except Exception as e:
             return f"Error writing file: {str(e)}"
 
 
-class EditFileTool(Tool):
+class EditFileTool(_SandboxFileTool):
     """Tool to edit a file by replacing text."""
-
-    def __init__(self):
-        self._session_dir: Path | None = None
-
-    def set_session_dir(self, session_dir: Path | None) -> None:
-        """Set session directory for file operations."""
-        self._session_dir = session_dir
-
-    @property
-    def _base_dir(self) -> Path | None:
-        """Get base directory (session dir)."""
-        return self._session_dir
-
-    @property
-    def _restrict(self) -> bool:
-        """Whether to restrict paths to session directory."""
-        return self._session_dir is not None
 
     @property
     def name(self) -> str:
@@ -241,12 +178,13 @@ class EditFileTool(Tool):
     async def execute(
         self, path: str, old_text: str, new_text: str, replace_mode: str, **kwargs: Any
     ) -> str:
+        if self._sandbox is None:
+            return "Error: no sandbox bound"
         try:
-            file_path = _resolve_path(path, self._base_dir, restrict_to_base=self._restrict)
-            if not file_path.exists():
+            if not await self._sandbox.exists(path):
                 return f"Error: File not found: {path}"
 
-            content = file_path.read_text(encoding="utf-8")
+            content = (await self._sandbox.read_bytes(path)).decode("utf-8", errors="replace")
 
             if old_text not in content:
                 return self._not_found_message(old_text, content, path)
@@ -267,8 +205,8 @@ class EditFileTool(Tool):
             else:
                 return f"Error: Invalid replace_mode '{replace_mode}'. Use ALL, FIRST, or LAST."
 
-            file_path.write_text(new_content, encoding="utf-8")
-            return f"Successfully edited {file_path} (replaced {replaced} occurrence(s))"
+            await self._sandbox.write_bytes(path, new_content.encode("utf-8", errors="replace"))
+            return f"Successfully edited {path} (replaced {replaced} occurrence(s))"
         except PermissionError as e:
             return f"Error: {e}"
         except Exception as e:
@@ -301,25 +239,8 @@ class EditFileTool(Tool):
         return f"Error: old_text not found in {path}. No similar text found. Verify the file content."
 
 
-class ListDirTool(Tool):
+class ListDirTool(_SandboxFileTool):
     """Tool to list directory contents."""
-
-    def __init__(self):
-        self._session_dir: Path | None = None
-
-    def set_session_dir(self, session_dir: Path | None) -> None:
-        """Set session directory for file operations."""
-        self._session_dir = session_dir
-
-    @property
-    def _base_dir(self) -> Path | None:
-        """Get base directory (session dir)."""
-        return self._session_dir
-
-    @property
-    def _restrict(self) -> bool:
-        """Whether to restrict paths to session directory."""
-        return self._session_dir is not None
 
     @property
     def name(self) -> str:
@@ -336,17 +257,17 @@ class ListDirTool(Tool):
         }
 
     async def execute(self, path: str, **kwargs: Any) -> str:
+        if self._sandbox is None:
+            return "Error: no sandbox bound"
         try:
-            dir_path = _resolve_path(path, self._base_dir, restrict_to_base=self._restrict)
-            if not dir_path.exists():
+            st = await self._sandbox.stat(path)
+            if st is None:
                 return f"Error: Directory not found: {path}"
-            if not dir_path.is_dir():
+            if not st.is_dir:
                 return f"Error: Not a directory: {path}"
 
-            items = []
-            for item in sorted(dir_path.iterdir()):
-                prefix = "📁 " if item.is_dir() else "📄 "
-                items.append(f"{prefix}{item.name}")
+            entries = await self._sandbox.list_dir(path)
+            items = [f"{'📁 ' if e.is_dir else '📄 '}{e.name}" for e in entries]
 
             if not items:
                 return f"Directory {path} is empty"

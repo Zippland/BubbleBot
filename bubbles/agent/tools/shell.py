@@ -1,12 +1,19 @@
-"""Shell execution tool."""
+"""Shell execution tool.
 
-import asyncio
-import os
+Delegates the actual subprocess to the session's ``Sandbox`` (see
+``bubbles/sandbox/``). This tool keeps the best-effort safety guard
+(dangerous-command patterns + path-containment for non-isolated backends) and
+the output formatting; *where and how* the command runs is the sandbox's job.
+The historical ``$HOME`` handling now lives in the sandbox's env construction,
+so ``local_isolated`` gives each session its own credential home.
+"""
+
 import re
 from pathlib import Path
 from typing import Any
 
 from bubbles.agent.tools.base import Tool
+from bubbles.sandbox.base import Sandbox
 
 
 class ExecTool(Tool):
@@ -17,10 +24,9 @@ class ExecTool(Tool):
         timeout: int = 60,
         deny_patterns: list[str] | None = None,
         allow_patterns: list[str] | None = None,
-        path_append: str = "",
     ):
         self.timeout = timeout
-        self._session_dir: Path | None = None
+        self._sandbox: Sandbox | None = None
         self.deny_patterns = deny_patterns or [
             r"\brm\s+-[rf]{1,2}\b",          # rm -r, rm -rf, rm -fr
             r"\bdel\s+/[fq]\b",              # del /f, del /q
@@ -33,12 +39,11 @@ class ExecTool(Tool):
             r":\(\)\s*\{.*\};\s*:",          # fork bomb
         ]
         self.allow_patterns = allow_patterns or []
-        self.path_append = path_append
 
-    def set_session_dir(self, session_dir: Path | None) -> None:
-        """Set session directory for command execution."""
-        self._session_dir = session_dir
-    
+    def set_sandbox(self, sandbox: Sandbox | None) -> None:
+        """Set the sandbox for command execution (called per turn)."""
+        self._sandbox = sandbox
+
     @property
     def name(self) -> str:
         return "exec"
@@ -59,97 +64,67 @@ class ExecTool(Tool):
             },
             "required": ["command"]
         }
-    
+
     async def execute(self, command: str, working_dir: str | None = None, **kwargs: Any) -> str:
-        # Resolve working directory relative to session_dir
-        if working_dir and self._session_dir:
-            # Handle ~ as session_dir
-            if working_dir.startswith("~"):
-                working_dir = str(self._session_dir / working_dir[1:].lstrip("/\\"))
-            elif not Path(working_dir).is_absolute():
-                working_dir = str(self._session_dir / working_dir)
-        cwd = working_dir or (str(self._session_dir) if self._session_dir else os.getcwd())
+        if self._sandbox is None:
+            return "Error: no sandbox bound"
 
-        # Hard sandbox: cwd MUST resolve inside session_dir. This catches the
-        # working_dir-with-..  escape (the alternative would be the agent jumping
-        # to another session's working tree). Symlinks are resolved so a planted
-        # symlink can't break out either.
-        if self._session_dir:
-            try:
-                resolved_cwd = Path(cwd).resolve()
-                session_resolved = self._session_dir.resolve()
-                resolved_cwd.relative_to(session_resolved)
-            except (ValueError, OSError):
-                return (
-                    f"Error: working_dir resolves outside session directory "
-                    f"({cwd!r} ↛ {self._session_dir})"
-                )
-            cwd = str(resolved_cwd)
+        # Resolve the working directory to a sandbox-internal path, enforcing
+        # containment within the sandbox root (catches working_dir-with-..
+        # escapes and planted symlinks — backend's half of the guarantee).
+        try:
+            if working_dir:
+                cwd = await self._sandbox.resolve_within_root(working_dir)
+            else:
+                cwd = self._sandbox.root
+        except PermissionError:
+            return (
+                f"Error: working_dir resolves outside session directory "
+                f"({working_dir!r})"
+            )
+        except (ValueError, OSError) as e:
+            return f"Error resolving working_dir: {e}"
 
-        guard_error = self._guard_command(command, cwd)
+        guard_error = self._guard_command(command)
         if guard_error:
             return guard_error
-        
-        env = os.environ.copy()
-        if self.path_append:
-            env["PATH"] = env.get("PATH", "") + os.pathsep + self.path_append
 
         try:
-            process = await asyncio.create_subprocess_shell(
-                command,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
-                cwd=cwd,
-                env=env,
-            )
-            
-            try:
-                stdout, stderr = await asyncio.wait_for(
-                    process.communicate(),
-                    timeout=self.timeout
-                )
-            except asyncio.TimeoutError:
-                process.kill()
-                # Wait for the process to fully terminate so pipes are
-                # drained and file descriptors are released.
-                try:
-                    await asyncio.wait_for(process.wait(), timeout=5.0)
-                except asyncio.TimeoutError:
-                    pass
-                return f"Error: Command timed out after {self.timeout} seconds"
-            
-            output_parts = []
-            
-            if stdout:
-                output_parts.append(stdout.decode("utf-8", errors="replace"))
-            
-            if stderr:
-                stderr_text = stderr.decode("utf-8", errors="replace")
-                if stderr_text.strip():
-                    output_parts.append(f"STDERR:\n{stderr_text}")
-            
-            if process.returncode != 0:
-                output_parts.append(f"\nExit code: {process.returncode}")
-            
-            result = "\n".join(output_parts) if output_parts else "(no output)"
-            
-            # Truncate very long output
-            max_len = 10000
-            if len(result) > max_len:
-                result = result[:max_len] + f"\n... (truncated, {len(result) - max_len} more chars)"
-            
-            return result
-            
+            result = await self._sandbox.exec(command, cwd=cwd, timeout=self.timeout)
         except Exception as e:
             return f"Error executing command: {str(e)}"
 
-    def _guard_command(self, command: str, cwd: str) -> str | None:
+        if result.timed_out:
+            return f"Error: Command timed out after {self.timeout} seconds"
+
+        output_parts = []
+        if result.stdout:
+            output_parts.append(result.stdout)
+        if result.stderr and result.stderr.strip():
+            output_parts.append(f"STDERR:\n{result.stderr}")
+        if result.returncode != 0:
+            output_parts.append(f"\nExit code: {result.returncode}")
+
+        output = "\n".join(output_parts) if output_parts else "(no output)"
+
+        # Truncate very long output
+        max_len = 10000
+        if len(output) > max_len:
+            output = output[:max_len] + f"\n... (truncated, {len(output) - max_len} more chars)"
+
+        return output
+
+    def _guard_command(self, command: str) -> str | None:
         """Best-effort safety guard for potentially destructive commands.
 
-        Note: This is **application-layer best-effort**. Shell is Turing-complete
-        — variables, command substitution, here-docs, and indirect file access
-        all bypass static checks. For true session isolation, run each session
-        in its own container (see DISTRIBUTED.md).
+        Two layers: dangerous-command patterns (always applied), and
+        path-containment on the command string (only for backends that are not
+        structurally isolated — a container/VM contains escapes at the kernel).
+
+        This is **application-layer best-effort**. Shell is Turing-complete —
+        variables, command substitution, here-docs, and indirect file access
+        all bypass static checks. For a hard guarantee, use a sandbox backend
+        with ``provides_hard_isolation`` (see SECURITY.md §4.1).
         """
         cmd = command.strip()
         lower = cmd.lower()
@@ -162,46 +137,52 @@ class ExecTool(Tool):
             if not any(re.search(p, lower) for p in self.allow_patterns):
                 return "Error: Command blocked by safety guard (not in allowlist)"
 
-        # Restrict to session directory if set
-        if self._session_dir:
-            if "..\\" in cmd or "../" in cmd:
-                return "Error: Command blocked by safety guard (path traversal detected)"
+        # Structurally-isolated backends contain path escapes at the kernel —
+        # the static path checks below would false-positive on legit absolute
+        # paths inside the container, so skip them there.
+        if self._sandbox is None or self._sandbox.provides_hard_isolation:
+            return None
 
-            # `cd ..` (bare, no trailing slash) is a traversal too — the
-            # `../` check above misses it because the regex needs a slash.
-            if re.search(r"\b(?:cd|pushd|chdir)\s+\.\.(?=\s|;|&|\||$)", cmd, re.IGNORECASE):
-                return "Error: Command blocked by safety guard (cd .. detected)"
+        session_dir = Path(self._sandbox.root)
 
-            # `cd /...` / `cd ~ ...` / `pushd /...` to absolute paths outside session.
-            # Doesn't catch every escape (env-var indirection, command substitution),
-            # but blocks the obvious cases without false-positives on `cd subdir`.
-            cd_match = re.search(
-                r"\b(?:cd|pushd|chdir)\s+([^;&|`$]+)", cmd, re.IGNORECASE,
-            )
-            if cd_match:
-                target = cd_match.group(1).strip().strip("'\"")
-                if target.startswith(("/", "~")) or re.match(r"^[A-Za-z]:[\\/]", target):
-                    # absolute path — must resolve inside session_dir
-                    try:
-                        resolved = Path(target.replace("~", str(self._session_dir))).resolve()
-                        resolved.relative_to(self._session_dir.resolve())
-                    except (ValueError, OSError):
-                        return f"Error: Command blocked by safety guard (cd target outside session directory: {target})"
+        if "..\\" in cmd or "../" in cmd:
+            return "Error: Command blocked by safety guard (path traversal detected)"
 
-            session_path = self._session_dir.resolve()
+        # `cd ..` (bare, no trailing slash) is a traversal too — the
+        # `../` check above misses it because the regex needs a slash.
+        if re.search(r"\b(?:cd|pushd|chdir)\s+\.\.(?=\s|;|&|\||$)", cmd, re.IGNORECASE):
+            return "Error: Command blocked by safety guard (cd .. detected)"
 
-            win_paths = re.findall(r"[A-Za-z]:\\[^\\\"']+", cmd)
-            # POSIX absolute paths. Accept many leading separators so we catch
-            # quoted strings, var-assignments (`P='/path'`), and substituted
-            # forms (`"$X"`). Trailing terminators: whitespace, quotes, redirects.
-            posix_paths = re.findall(r"(?:^|[\s|>='\"`(),])(/[^\s\"'>;]+)", cmd)
-
-            for raw in win_paths + posix_paths:
+        # `cd /...` / `cd ~ ...` / `pushd /...` to absolute paths outside session.
+        # Doesn't catch every escape (env-var indirection, command substitution),
+        # but blocks the obvious cases without false-positives on `cd subdir`.
+        cd_match = re.search(
+            r"\b(?:cd|pushd|chdir)\s+([^;&|`$]+)", cmd, re.IGNORECASE,
+        )
+        if cd_match:
+            target = cd_match.group(1).strip().strip("'\"")
+            if target.startswith(("/", "~")) or re.match(r"^[A-Za-z]:[\\/]", target):
+                # absolute path — must resolve inside session_dir
                 try:
-                    p = Path(raw.strip()).resolve()
-                except Exception:
-                    continue
-                if p.is_absolute() and session_path not in p.parents and p != session_path:
-                    return "Error: Command blocked by safety guard (path outside session directory)"
+                    resolved = Path(target.replace("~", str(session_dir))).resolve()
+                    resolved.relative_to(session_dir.resolve())
+                except (ValueError, OSError):
+                    return f"Error: Command blocked by safety guard (cd target outside session directory: {target})"
+
+        session_path = session_dir.resolve()
+
+        win_paths = re.findall(r"[A-Za-z]:\\[^\\\"']+", cmd)
+        # POSIX absolute paths. Accept many leading separators so we catch
+        # quoted strings, var-assignments (`P='/path'`), and substituted
+        # forms (`"$X"`). Trailing terminators: whitespace, quotes, redirects.
+        posix_paths = re.findall(r"(?:^|[\s|>='\"`(),])(/[^\s\"'>;]+)", cmd)
+
+        for raw in win_paths + posix_paths:
+            try:
+                p = Path(raw.strip()).resolve()
+            except Exception:
+                continue
+            if p.is_absolute() and session_path not in p.parents and p != session_path:
+                return "Error: Command blocked by safety guard (path outside session directory)"
 
         return None
