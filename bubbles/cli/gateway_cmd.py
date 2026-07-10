@@ -63,6 +63,7 @@ def gateway(
         memory_window=config.agents.defaults.memory_window,
         tavily_api_key=config.tools.web.search.api_key or None,
         exec_config=config.tools.exec,
+        sandbox_config=config.tools.sandbox,
         cron_service=cron,
         session_manager=session_manager,
         channel_manager=channels,
@@ -126,6 +127,7 @@ def gateway(
             console.print("\nShutting down...")
         finally:
             await agent.close_mcp()
+            await agent.close_sandboxes()
             cron.stop()
             agent.stop()
             await channels.stop_all()

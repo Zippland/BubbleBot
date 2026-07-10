@@ -44,6 +44,7 @@ from bubbles.agent.tools.shell import ExecTool
 from bubbles.agent.tools.spawn import SpawnTool
 from bubbles.agent.tools.task import TaskListTool, TaskGetTool, TaskCreateTool, TaskUpdateTool
 from bubbles.agent.tools.web import WebFetchTool, WebSearchTool
+from bubbles.sandbox.manager import SandboxManager
 from bubbles.bus.events import InboundMessage, OutboundMessage
 from bubbles.bus.queue import MessageBus
 from bubbles.providers.base import LLMProvider
@@ -55,7 +56,8 @@ from bubbles.session.manager import (
 )
 
 if TYPE_CHECKING:
-    from bubbles.config.schema import ChannelsConfig, ExecToolConfig
+    from bubbles.config.schema import ChannelsConfig, ExecToolConfig, SandboxConfig
+    from bubbles.sandbox.base import Sandbox
     from bubbles.cron.service import CronService
 
 
@@ -83,6 +85,7 @@ class AgentLoop:
         temperature: float = 0.1,
         tavily_api_key: str | None = None,
         exec_config: ExecToolConfig | None = None,
+        sandbox_config: "SandboxConfig | None" = None,
         cron_service: CronService | None = None,
         session_manager: SessionManager | None = None,
         channel_manager: Any = None,
@@ -95,7 +98,7 @@ class AgentLoop:
         compact_keep_recent: int = 20,
         compact_min_messages: int = 5,
     ):
-        from bubbles.config.schema import ExecToolConfig
+        from bubbles.config.schema import ExecToolConfig, SandboxConfig
         from bubbles.utils.helpers import get_data_path
         self.bus = bus
         self.channels_config = channels_config
@@ -109,6 +112,7 @@ class AgentLoop:
         self.context_limit = context_limit
         self.tavily_api_key = tavily_api_key
         self.exec_config = exec_config or ExecToolConfig()
+        self.sandbox_config = sandbox_config or SandboxConfig()
         self.cron_service = cron_service
         self.channel_manager = channel_manager
         self.provider_factory = provider_factory
@@ -125,6 +129,10 @@ class AgentLoop:
         self._context_cache: dict[str, ContextBuilder] = {}  # session_key -> ContextBuilder
         self.sessions = session_manager or SessionManager()
         self.tools = ToolRegistry()
+        self._sandboxes = SandboxManager(
+            config=self.sandbox_config,
+            path_append=self.exec_config.path_append,
+        )
         self.subagents = SubagentManager(
             provider=provider,
             bus=bus,
@@ -133,6 +141,7 @@ class AgentLoop:
             max_tokens=self.max_tokens,
             tavily_api_key=tavily_api_key,
             exec_config=self.exec_config,
+            sandbox_manager=self._sandboxes,
         )
 
         self._running = False
@@ -151,14 +160,11 @@ class AgentLoop:
 
     def _register_default_tools(self) -> None:
         """Register the default set of tools."""
-        # File tools: session_dir is set dynamically via set_session_dir()
+        # File tools: sandbox is set dynamically via set_sandbox()
         for cls in (ReadFileTool, WriteFileTool, EditFileTool, ListDirTool):
             self.tools.register(cls())
-        # Exec tool: working_dir is set per session via set_session_dir()
-        self.tools.register(ExecTool(
-            timeout=self.exec_config.timeout,
-            path_append=self.exec_config.path_append,
-        ))
+        # Exec tool: sandbox is set per session via set_sandbox()
+        self.tools.register(ExecTool(timeout=self.exec_config.timeout))
         self.tools.register(WebSearchTool(api_key=self.tavily_api_key))
         self.tools.register(WebFetchTool())
         self.tools.register(MessageTool(send_callback=self.bus.publish_outbound))
@@ -226,7 +232,7 @@ class AgentLoop:
     def _set_tool_context(
         self, channel: str, chat_id: str, message_id: str | None = None,
         session_dir: Path | None = None, session_key: str | None = None,
-        session: Session | None = None,
+        session: Session | None = None, sandbox: "Sandbox | None" = None,
     ) -> None:
         """Update context for all tools that need routing info."""
         for name in ("message", "spawn", "cron", "find_person"):
@@ -239,8 +245,14 @@ class AgentLoop:
                     else:
                         tool.set_context(channel, chat_id)
 
-        # Set session directory for file, exec, spawn, and message tools
-        for tool_name in ("read_file", "write_file", "edit_file", "list_dir", "exec", "spawn", "message"):
+        # File + exec tools run against the session's sandbox.
+        for tool_name in ("read_file", "write_file", "edit_file", "list_dir", "exec"):
+            if tool := self.tools.get(tool_name):
+                if hasattr(tool, "set_sandbox"):
+                    tool.set_sandbox(sandbox)
+
+        # message/spawn still resolve outbound media paths on the harness host.
+        for tool_name in ("spawn", "message"):
             if tool := self.tools.get(tool_name):
                 if hasattr(tool, "set_session_dir"):
                     tool.set_session_dir(session_dir)
@@ -482,6 +494,10 @@ class AgentLoop:
                 pass  # MCP SDK cancel scope cleanup is noisy but harmless
             self._mcp_stack = None
 
+    async def close_sandboxes(self) -> None:
+        """Tear down all per-session sandboxes."""
+        await self._sandboxes.close_all()
+
     def stop(self) -> None:
         """Stop the agent loop."""
         self._running = False
@@ -633,7 +649,7 @@ class AgentLoop:
 /session [<id>|unbind]
   绑定 / 解绑会话
 /config [<key> <value>|reset]
-  key: model | system_prompt；reset 还原默认
+  key: model | system_prompt | sandbox；reset 还原默认
 /heartbeat [<间隔>|off]
   开启（30m / 2h…）/ 关闭定时唤醒"""
             return OutboundMessage(channel=msg.channel, chat_id=msg.chat_id, content=help_text)
@@ -665,7 +681,11 @@ class AgentLoop:
         # Move media files to correct session directory if needed (handles session binding)
         media = relocate_media_to_session(msg.media, session) if msg.media else None
 
-        self._set_tool_context(msg.channel, msg.chat_id, msg.metadata.get("message_id"), session.directory, key, session)
+        sandbox = await self._sandboxes.get(key, session.directory, session.config.sandbox)
+        self._set_tool_context(
+            msg.channel, msg.chat_id, msg.metadata.get("message_id"),
+            session.directory, key, session, sandbox=sandbox,
+        )
         if message_tool := self.tools.get("message"):
             if isinstance(message_tool, MessageTool):
                 message_tool.start_turn()

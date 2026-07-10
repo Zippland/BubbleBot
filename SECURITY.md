@@ -99,6 +99,22 @@ deployment.
 | **L1: Application path sandbox** | `read_file` / `write_file` / `edit_file` / `list_dir` paths outside the session directory (incl. via symlinks, absolute paths, `~`). `exec` `working_dir` resolved through `..` or symlinks. Common shell tricks caught: `cat /other-session/...`, `cd /...`, `cd ..`, `find / ...`, variable indirection `P=/...; cat $P/...`, command substitution `$(...)`. |
 | **L2: Shell-trick best-effort** | Static-analyzable bypass attempts in the `exec` tool's command string. Caught: absolute paths in quotes, `cd` to absolute targets outside session, traversal patterns. **NOT caught**: base64-decoded paths, paths constructed at runtime in subshells, write+chmod+exec workflows — anything turing-complete enough to evade static analysis. |
 
+### Sandbox backends (`tools.sandbox`, per-session via `/config sandbox`)
+
+Exec + file tools run against a **sandbox backend** bound to each session. This
+is where the isolation strength is chosen:
+
+| Backend | Isolation | Notes |
+|---------|-----------|-------|
+| `local` (default) | L1 + L2 above | Shares the host environment, incl. `$HOME` and any logged-in CLI credentials. Historical behavior. |
+| `local_isolated` | L1 + L2, **plus per-session `$HOME`** | Each session gets its own `$HOME` / XDG / `APPDATA`, built from an env **allowlist**, so host credential-pointer vars (`GH_CONFIG_DIR`, `AWS_*`, `KUBECONFIG`, `DOCKER_CONFIG`, `CLOUDSDK_CONFIG`, …) never reach the child. CLI tools (`gh`/`aws`/`gcloud`/`kubectl`/git) then store & read credentials **per session**. The per-session home lives OUTSIDE the session working dir (`~/.bubbles/session_homes/<key>/`), so the model's own file tools cannot read the stored credentials — only the exec subprocess can. |
+
+**`local_isolated` honesty boundary**: it isolates *environment-directed
+credential lookup only*, NOT the whole filesystem. A command reading an
+absolute path (`cat /home/other/.ssh/id_rsa`) is unaffected — that's a shell
+var-expansion / absolute-path read, the same L2-evading class documented above.
+For the hard cross-session guarantee, layer OS-level isolation as below.
+
 **For the hard guarantee, layer your deployment with OS-level isolation.**
 Any of these work; pick what fits:
 

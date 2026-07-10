@@ -116,6 +116,7 @@ def agent(
         memory_window=config.agents.defaults.memory_window,
         tavily_api_key=config.tools.web.search.api_key or None,
         exec_config=config.tools.exec,
+        sandbox_config=config.tools.sandbox,
         cron_service=cron,
         mcp_servers=config.tools.mcp_servers,
         channels_config=config.channels,
@@ -174,6 +175,7 @@ def agent(
                 )
             _print_agent_response(response, render_markdown=markdown)
             await agent_loop.close_mcp()
+            await agent_loop.close_sandboxes()
 
         asyncio.run(run_once())
     else:
@@ -342,5 +344,6 @@ def agent(
                 outbound_task.cancel()
                 await asyncio.gather(bus_task, outbound_task, return_exceptions=True)
                 await agent_loop.close_mcp()
+                await agent_loop.close_sandboxes()
 
         asyncio.run(run_interactive())
