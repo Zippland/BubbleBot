@@ -31,9 +31,16 @@ class ContextBuilder:
         self.session_dir = session_dir
         self.skills = SkillsLoader(session_dir)
     
-    def build_system_prompt(self, skill_names: list[str] | None = None) -> str:
-        """Build the system prompt from identity, bootstrap files, and skills."""
-        parts = [self._get_identity()]
+    def build_system_prompt(
+        self, skill_names: list[str] | None = None, work_dir: str | None = None
+    ) -> str:
+        """Build the system prompt from identity, bootstrap files, and skills.
+
+        ``work_dir`` is the path the model should see as its workspace — the
+        sandbox-internal root when a sandbox is bound, so the model never learns
+        the harness host's real path. Falls back to the session directory.
+        """
+        parts = [self._get_identity(work_dir)]
 
         bootstrap = self._load_bootstrap_files()
         if bootstrap:
@@ -51,9 +58,9 @@ class ContextBuilder:
 
         return "\n\n---\n\n".join(parts)
     
-    def _get_identity(self) -> str:
+    def _get_identity(self, work_dir: str | None = None) -> str:
         """Get the core identity section."""
-        session_path = str(self.session_dir.expanduser().resolve())
+        session_path = work_dir or str(self.session_dir.expanduser().resolve())
         system = platform.system()
         runtime = f"{'macOS' if system == 'Darwin' else system} {platform.machine()}, Python {platform.python_version()}"
 
@@ -183,6 +190,7 @@ The user can enable a periodic auto-wake with `/heartbeat <interval>` (e.g. `30m
         system_prompt_extra: str | None = None,
         session_bindings: list[str] | None = None,
         heartbeat_info: str | None = None,
+        work_dir: str | None = None,
     ) -> list[dict[str, Any]]:
         """
         Build the complete message list for an LLM call.
@@ -205,7 +213,7 @@ The user can enable a periodic auto-wake with `/heartbeat <interval>` (e.g. `30m
         messages = []
 
         # System prompt
-        system_prompt = self.build_system_prompt(skill_names)
+        system_prompt = self.build_system_prompt(skill_names, work_dir=work_dir)
 
         # Heartbeat ON block (only present when enabled for this session)
         if heartbeat_info:
