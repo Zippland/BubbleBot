@@ -26,7 +26,8 @@ def make_bus(config: "Config | None" = None, *, consumer_name: str = "default") 
     if backend == "redis":
         from bubbles.bus.redis_bus import RemoteBus
         redis_url = config.bus.redis_url  # type: ignore[union-attr]
-        return RemoteBus(redis_url, consumer_name=consumer_name)
+        inline_max = getattr(config.bus, "inline_media_max_bytes", 1_048_576)  # type: ignore[union-attr]
+        return RemoteBus(redis_url, consumer_name=consumer_name, inline_media_max_bytes=inline_max)
 
     if backend != "local":
         logger.warning("Unknown bus backend {!r}; falling back to 'local'", backend)
