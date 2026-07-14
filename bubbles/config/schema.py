@@ -266,6 +266,20 @@ class GatewayConfig(Base):
     port: int = 18790
 
 
+class BusConfig(Base):
+    """Message bus transport (Phase 2 split deployment).
+
+    ``local`` (default) = in-process asyncio queues, single-process gateway.
+    ``redis`` = cross-machine Redis Streams so channels (Windows) and harness
+    (Linux) can run as separate processes.
+    """
+
+    default: str = "local"  # local | redis
+    redis_url: str = ""  # e.g. redis://:pass@host:6379/0 (required for redis backend)
+    inline_media_max_bytes: int = 1_048_576  # ≤ this → inline base64 on the wire; above → blob store (2c)
+
+
+
 class WebSearchConfig(Base):
     """Web search tool configuration."""
 
@@ -329,6 +343,7 @@ class Config(BaseSettings):
     channels: ChannelsConfig = Field(default_factory=ChannelsConfig)
     providers: ProvidersConfig = Field(default_factory=ProvidersConfig)
     gateway: GatewayConfig = Field(default_factory=GatewayConfig)
+    bus: BusConfig = Field(default_factory=BusConfig)
     tools: ToolsConfig = Field(default_factory=ToolsConfig)
 
     def _match_provider(self, model: str | None = None) -> tuple["ProviderConfig | None", str | None]:

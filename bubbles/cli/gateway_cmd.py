@@ -19,7 +19,7 @@ def gateway(
     """Start the bubbles gateway."""
     from loguru import logger
     from bubbles.config.loader import load_config, get_data_dir
-    from bubbles.bus.queue import MessageBus
+    from bubbles.bus.factory import make_bus
     from bubbles.agent.loop import AgentLoop
     from bubbles.channels.manager import ChannelManager
     from bubbles.session.manager import SessionManager
@@ -35,7 +35,7 @@ def gateway(
     console.print(f"{__logo__} Starting bubbles gateway on port {port}...")
 
     config = load_config()
-    bus = MessageBus()
+    bus = make_bus(config)
     provider = _make_provider(config)
     default_provider_name = config.get_provider_name(config.agents.defaults.model)
     provider_factory = lambda m: _make_provider_for_model(config, m)
