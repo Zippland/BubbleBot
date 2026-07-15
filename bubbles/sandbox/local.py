@@ -191,4 +191,8 @@ class LocalIsolatedSandbox(LocalSandbox):
         env["XDG_STATE_HOME"] = str(self._home / ".local" / "state")
         env["APPDATA"] = str(self._home / "AppData" / "Roaming")
         env["LOCALAPPDATA"] = str(self._home / "AppData" / "Local")
+        # lark-cli reads this var directly (it does NOT honor XDG); set it
+        # explicitly so per-session Feishu identity holds on every platform
+        # regardless of how the CLI derives its default data dir from HOME.
+        env["LARKSUITE_CLI_DATA_DIR"] = str(self._home / ".local" / "share" / "lark-cli")
         return env

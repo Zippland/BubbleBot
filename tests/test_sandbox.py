@@ -159,6 +159,14 @@ async def test_isolated_passthrough_extra_var(tmp_path: Path, monkeypatch) -> No
     assert res.stdout.strip() == "/host/ca.pem"
 
 
+async def test_isolated_lark_cli_data_dir_in_session_home(tmp_path: Path) -> None:
+    home = tmp_path / "home"
+    sb = LocalIsolatedSandbox("s", tmp_path, home_dir=home)
+    env = sb._build_env()
+    # lark-cli does not honor XDG — it needs its own var pointed per-session.
+    assert env["LARKSUITE_CLI_DATA_DIR"] == str(home / ".local" / "share" / "lark-cli")
+
+
 # ---- SandboxManager: backend selection, caching, per-session isolation ----
 
 async def test_manager_default_backend_is_local(tmp_path: Path) -> None:
