@@ -94,14 +94,14 @@ async def download_file(
         dest_path = media_dir / filename
         shutil.copy2(extra, dest_path)
         logger.debug("File already exists, copied to {}", dest_path)
-        return str(dest_path), f"[文件: <work_dir>/data/{filename}]"
+        return str(dest_path), "[文件]"
 
     wechat_file = find_file_in_wechat_storage(wechat_home, wxid, filename)
     if wechat_file:
         dest_path = media_dir / filename
         shutil.copy2(wechat_file, dest_path)
         logger.debug("Found file in WeChat storage, copied to {}", dest_path)
-        return str(dest_path), f"[文件: <work_dir>/data/{filename}]"
+        return str(dest_path), "[文件]"
 
     try:
         loop = asyncio.get_running_loop()
@@ -126,7 +126,7 @@ async def download_file(
             logger.debug(
                 "Found file in WeChat storage after download, copied to {}", dest_path,
             )
-            return str(dest_path), f"[文件: <work_dir>/data/{filename}]"
+            return str(dest_path), "[文件]"
 
         if original_extra:
             for _ in range(timeout):
@@ -134,7 +134,7 @@ async def download_file(
                     dest_path = media_dir / filename
                     shutil.copy2(original_extra, dest_path)
                     logger.debug("Downloaded file to {}", dest_path)
-                    return str(dest_path), f"[文件: <work_dir>/data/{filename}]"
+                    return str(dest_path), "[文件]"
                 await asyncio.sleep(1)
 
         wechat_file = find_file_in_wechat_storage(wechat_home, wxid, filename)
@@ -144,7 +144,7 @@ async def download_file(
             logger.debug(
                 "Found file in WeChat storage (final check), copied to {}", dest_path,
             )
-            return str(dest_path), f"[文件: <work_dir>/data/{filename}]"
+            return str(dest_path), "[文件]"
 
         logger.info(
             "File '{}' not found in WeChat storage: {}/{}/FileStorage/File/",
@@ -200,14 +200,14 @@ async def download_quoted_image(
             hit = msg_id_to_path.get(mid)
             if hit and os.path.exists(hit):
                 logger.debug("Reusing image by msg_id {}: {}", mid, hit)
-                return hit, f"[图片: <work_dir>/data/{os.path.basename(hit)}]"
+                return hit, "[图片]"
 
     # 2. fallback：扫 media_dir 找文件名 stem 出现在 XML 里的图（重启后老消息
     #    走这条；命中率取决于 WeChat 版本是否在 quote XML 里写了解密后的 md5）
     cached = _find_cached_quoted_image(media_dir, content_xml)
     if cached:
         logger.debug("Reusing cached quoted image by stem-in-xml: {}", cached)
-        return str(cached), f"[图片: <work_dir>/data/{cached.name}]"
+        return str(cached), "[图片]"
 
     extra = content_xml
     logger.debug(
@@ -223,7 +223,7 @@ async def download_quoted_image(
         if file_path and os.path.exists(file_path):
             filename = os.path.basename(file_path)
             logger.debug("Downloaded quoted image to {}", file_path)
-            return file_path, f"[图片: <work_dir>/data/{filename}]"
+            return file_path, "[图片]"
         logger.warning(
             "download_image returned empty or non-existent path for msg_id={}", msg_id,
         )

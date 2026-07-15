@@ -395,7 +395,7 @@ class WeChatChannel(BaseChannel):
                 logger.debug("Downloaded {} to {}", media_type, file_path)
                 if media_type == "image":
                     self._image_path_by_msg_id[msg.id] = file_path
-                return file_path, f"[{media_type}: <work_dir>/data/{filename}]"
+                return file_path, f"[{media_type}]"
             if media_type == "image" and file_path:
                 logger.warning(
                     "wcf.download_image returned path but file not found: {}", file_path,

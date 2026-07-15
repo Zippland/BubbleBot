@@ -165,7 +165,12 @@ class BaseChannel(ABC):
         return self._running
 
     def _get_session_binding(self, chat_id: str) -> str | None:
-        """Get the bound session key for this channel:chat_id, if any."""
+        """Get the bound session key for this channel:chat_id, if any.
+
+        Only meaningful in single-process (LocalBus) mode where the channel and
+        harness share ``~/.bubbles``. In split mode the bindings live on the
+        harness host, so this returns None there — see ``_get_media_dir``.
+        """
         bindings_path = get_data_path() / "session_bindings.json"
         if not bindings_path.exists():
             return None
@@ -176,11 +181,32 @@ class BaseChannel(ABC):
         except Exception:
             return None
 
-    def _get_media_dir(self, chat_id: str) -> Path | None:
-        """Get the media directory for this chat, respecting session bindings.
+    def _is_split_mode(self) -> bool:
+        """True when running as a channels-only process over a networked bus.
 
-        Returns None if no session binding exists (media should not be saved).
+        In that mode the channel host does NOT share a filesystem with the
+        harness, so media must be downloaded locally and shipped by value over
+        the bus (the RemoteBus dehydrates it); the harness decides final
+        placement. Detected from the bus type to avoid a new constructor arg,
+        keeping single-process (LocalBus) behavior byte-identical.
         """
+        return type(self.bus).__name__ == "RemoteBus"
+
+    def _get_media_dir(self, chat_id: str) -> Path | None:
+        """Directory to download inbound media into.
+
+        - Single-process (LocalBus): the session's ``data/`` dir, gated by an
+          existing session binding (returns None if unbound — unchanged).
+        - Split mode (RemoteBus): a per-channel local temp dir, always
+          available. The bus ships the bytes to the harness, which relocates
+          them into the real session dir; the local copy is transient.
+        """
+        if self._is_split_mode():
+            import tempfile
+            d = Path(tempfile.gettempdir()) / "bubbles-inbound" / self.name / str(chat_id).replace("/", "_")
+            d.mkdir(parents=True, exist_ok=True)
+            return d
+
         bound_key = self._get_session_binding(chat_id)
         if not bound_key:
             return None

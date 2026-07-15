@@ -266,6 +266,19 @@ class AgentLoop:
 
 
     @staticmethod
+    def _media_ref(media: list[str]) -> str:
+        """Model-visible reference to media files, derived from their FINAL
+        on-disk names under <work_dir>/data/.
+
+        The harness is the single source of truth for this reference: only it
+        knows the final filename after relocate/rehydrate (which may rename on
+        collision). Channels must NOT embed media paths in content — they only
+        carry files in `media`. See tests/test_media.py + the Phase 2c media
+        contract.
+        """
+        return ", ".join(f"<work_dir>/data/{Path(p).name}" for p in media)
+
+    @staticmethod
     def _strip_think(text: str | None) -> str | None:
         """Remove <think>…</think> blocks that some models embed in content."""
         if not text:
@@ -666,8 +679,7 @@ class AgentLoop:
             content = f"[{sender_name}]: {msg.content}"
             # Append media paths to content if present
             if media:
-                media_desc = ", ".join(f"<work_dir>/data/{Path(p).name}" for p in media)
-                content = f"{content}\n[媒体文件: {media_desc}]"
+                content = f"{content}\n[媒体文件: {self._media_ref(media)}]"
             entry = {
                 "role": "user",
                 "content": content,
@@ -680,6 +692,12 @@ class AgentLoop:
 
         # Move media files to correct session directory if needed (handles session binding)
         media = relocate_media_to_session(msg.media, session) if msg.media else None
+
+        # Media reference is authored HERE from the final on-disk names, not by
+        # the channel — so it stays valid across relocate/rehydrate renames.
+        current_message = msg.content
+        if media:
+            current_message = f"{current_message}\n[媒体文件: {self._media_ref(media)}]"
 
         sandbox = await self._sandboxes.get(key, session.directory, session.config.sandbox)
         self._set_tool_context(
@@ -694,7 +712,7 @@ class AgentLoop:
         history = session.get_history(max_messages=self.memory_window)
         initial_messages = context.build_messages(
             history=history,
-            current_message=msg.content,
+            current_message=current_message,
             media=media,
             channel=msg.channel, chat_id=msg.chat_id,
             sender_id=msg.sender_id,
@@ -713,7 +731,7 @@ class AgentLoop:
             history = session.get_history(max_messages=self.memory_window)
             initial_messages = context.build_messages(
                 history=history,
-                current_message=msg.content,
+                current_message=current_message,
                 media=media,
                 channel=msg.channel, chat_id=msg.chat_id,
                 sender_id=msg.sender_id,

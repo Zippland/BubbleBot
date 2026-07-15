@@ -33,7 +33,6 @@ TYPING_NOTICE_TIMEOUT_MS = 30_000
 # Must stay below TYPING_NOTICE_TIMEOUT_MS so the indicator doesn't expire mid-processing.
 TYPING_KEEPALIVE_INTERVAL_MS = 20_000
 MATRIX_HTML_FORMAT = "org.matrix.custom.html"
-_ATTACH_MARKER = "[attachment: {}]"
 _ATTACH_TOO_LARGE = "[attachment: {} - too large]"
 _ATTACH_FAILED = "[attachment: {} - download failed]"
 _ATTACH_UPLOAD_FAILED = "[attachment: {} - upload failed]"
@@ -640,7 +639,7 @@ class MatrixChannel(BaseChannel):
             "encrypted": encrypted, "size_bytes": len(data),
             "path": str(path), "mxc_url": mxc_url,
         }
-        return attachment, _ATTACH_MARKER.format(path)
+        return attachment, "[attachment]"
 
     def _base_metadata(self, room: MatrixRoom, event: RoomMessage) -> dict[str, Any]:
         """Build common metadata for text and media handlers."""

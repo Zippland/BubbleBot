@@ -108,3 +108,54 @@ async def test_multiple_media_mixed(tmp_path: Path) -> None:
     paths = await rehydrate_media(descs, dest_dir=dest, get_blob=get)
     assert Path(paths[0]).read_bytes() == b"hi"
     assert Path(paths[1]).read_bytes() == b"y" * 4000
+
+
+# ---- media reference contract (harness is the single source of truth) ----
+# The harness authors the model-visible "<work_dir>/data/{name}" reference from
+# the FINAL on-disk name (post-rehydrate). rehydrate MAY rename on collision;
+# the reference must follow the real file, never a channel-frozen name.
+
+def _media_ref(paths: list[str]) -> str:
+    # mirrors AgentLoop._media_ref (loop.py)
+    return ", ".join(f"<work_dir>/data/{Path(p).name}" for p in paths)
+
+
+async def test_reference_tracks_rehydrated_name_on_collision(tmp_path: Path) -> None:
+    store, put, get = _mem_blob_store()
+    dest = tmp_path / "data"
+    dest.mkdir()
+    (dest / "report.pdf").write_bytes(b"OLD existing")  # pre-existing collision
+
+    src = tmp_path / "report.pdf"
+    src.write_bytes(b"NEW incoming bytes")
+    descs = await dehydrate_media([str(src)], inline_max_bytes=1, put_blob=put)  # force blob
+    assert descs[0]["name"] == "report.pdf"  # descriptor still says the original name
+
+    paths = await rehydrate_media(descs, dest_dir=dest, get_blob=get)
+    # rehydrate renamed to avoid clobbering the existing file
+    assert Path(paths[0]).name != "report.pdf"
+    assert Path(paths[0]).read_bytes() == b"NEW incoming bytes"
+
+    # The harness reference derived from the RETURN VALUE points at the real file;
+    # one derived from the descriptor name would dangle. This is the desync the fix kills.
+    ref = _media_ref(paths)
+    assert Path(paths[0]).name in ref
+    assert "report.pdf," not in ref and not ref.endswith("report.pdf")  # not the stale name
+
+
+async def test_batch_colliding_names_stay_distinct(tmp_path: Path) -> None:
+    store, put, get = _mem_blob_store()
+    a = tmp_path / "a" / "image.png"; a.parent.mkdir(); a.write_bytes(b"AAAA")
+    b = tmp_path / "b" / "image.png"; b.parent.mkdir(); b.write_bytes(b"BBBB")
+    descs = await dehydrate_media([str(a), str(b)], inline_max_bytes=1, put_blob=put)
+    dest = tmp_path / "data"
+    paths = await rehydrate_media(descs, dest_dir=dest, get_blob=get)
+    assert len(paths) == 2
+    assert paths[0] != paths[1]  # two distinct files, no clobber
+    assert Path(paths[0]).read_bytes() == b"AAAA"
+    assert Path(paths[1]).read_bytes() == b"BBBB"
+
+
+def test_media_ref_from_final_paths() -> None:
+    ref = _media_ref(["/s/data/a.png", "/s/data/a_1.png"])
+    assert ref == "<work_dir>/data/a.png, <work_dir>/data/a_1.png"

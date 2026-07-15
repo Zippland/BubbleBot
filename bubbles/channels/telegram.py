@@ -390,9 +390,9 @@ class TelegramChannel(BaseChannel):
                             logger.info("Transcribed {}: {}...", media_type, transcription[:50])
                             content_parts.append(f"[transcription: {transcription}]")
                         else:
-                            content_parts.append(f"[{media_type}: {file_path}]")
+                            content_parts.append(f"[{media_type}]")
                     else:
-                        content_parts.append(f"[{media_type}: {file_path}]")
+                        content_parts.append(f"[{media_type}]")
 
                     logger.debug("Downloaded {} to {}", media_type, file_path)
                 except Exception as e:
