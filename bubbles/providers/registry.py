@@ -13,7 +13,6 @@ Every entry writes out all fields so you can copy-paste as a template.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any
 
 
 @dataclass(frozen=True)
@@ -48,8 +47,9 @@ class ProviderSpec:
     # gateway behavior
     strip_model_prefix: bool = False         # strip "provider/" before re-prefixing
 
-    # per-model param overrides, e.g. (("kimi-k2.5", {"temperature": 1.0}),)
-    model_overrides: tuple[tuple[str, dict[str, Any]], ...] = ()
+    # params the vendor fixes server-side — passing them explicitly is an error.
+    # e.g. Moonshot Kimi K series: ("temperature", "top_p", ...)
+    omit_params: tuple[str, ...] = ()
 
     # OAuth-based providers (e.g., OpenAI Codex) don't use API keys
     is_oauth: bool = False                   # if True, uses OAuth flow instead of API key
@@ -99,7 +99,7 @@ PROVIDERS: tuple[ProviderSpec, ...] = (
         detect_by_base_keyword="openrouter",
         default_api_base="https://openrouter.ai/api/v1",
         strip_model_prefix=False,
-        model_overrides=(),
+        omit_params=(),
         supports_prompt_caching=True,
     ),
 
@@ -120,7 +120,7 @@ PROVIDERS: tuple[ProviderSpec, ...] = (
         detect_by_base_keyword="aihubmix",
         default_api_base="https://aihubmix.com/v1",
         strip_model_prefix=True,            # anthropic/claude-3 → claude-3 → openai/claude-3
-        model_overrides=(),
+        omit_params=(),
     ),
 
     # SiliconFlow (硅基流动): OpenAI-compatible gateway, model names keep org prefix
@@ -138,7 +138,7 @@ PROVIDERS: tuple[ProviderSpec, ...] = (
         detect_by_base_keyword="siliconflow",
         default_api_base="https://api.siliconflow.cn/v1",
         strip_model_prefix=False,
-        model_overrides=(),
+        omit_params=(),
     ),
 
     # VolcEngine (火山引擎): OpenAI-compatible gateway
@@ -156,7 +156,7 @@ PROVIDERS: tuple[ProviderSpec, ...] = (
         detect_by_base_keyword="volces",
         default_api_base="https://ark.cn-beijing.volces.com/api/v3",
         strip_model_prefix=False,
-        model_overrides=(),
+        omit_params=(),
     ),
 
     # === Standard providers (matched by model-name keywords) ===============
@@ -176,7 +176,7 @@ PROVIDERS: tuple[ProviderSpec, ...] = (
         detect_by_base_keyword="",
         default_api_base="",
         strip_model_prefix=False,
-        model_overrides=(),
+        omit_params=(),
         supports_prompt_caching=True,
     ),
 
@@ -195,7 +195,7 @@ PROVIDERS: tuple[ProviderSpec, ...] = (
         detect_by_base_keyword="",
         default_api_base="",
         strip_model_prefix=False,
-        model_overrides=(),
+        omit_params=(),
     ),
 
     # OpenAI Codex: uses OAuth, not API key.
@@ -213,7 +213,7 @@ PROVIDERS: tuple[ProviderSpec, ...] = (
         detect_by_base_keyword="codex",
         default_api_base="https://chatgpt.com/backend-api",
         strip_model_prefix=False,
-        model_overrides=(),
+        omit_params=(),
         is_oauth=True,                      # OAuth-based authentication
     ),
 
@@ -232,7 +232,7 @@ PROVIDERS: tuple[ProviderSpec, ...] = (
         detect_by_base_keyword="",
         default_api_base="",
         strip_model_prefix=False,
-        model_overrides=(),
+        omit_params=(),
         is_oauth=True,                      # OAuth-based authentication
     ),
 
@@ -251,7 +251,7 @@ PROVIDERS: tuple[ProviderSpec, ...] = (
         detect_by_base_keyword="",
         default_api_base="",
         strip_model_prefix=False,
-        model_overrides=(),
+        omit_params=(),
     ),
 
     # Gemini: needs "gemini/" prefix for LiteLLM.
@@ -269,7 +269,7 @@ PROVIDERS: tuple[ProviderSpec, ...] = (
         detect_by_base_keyword="",
         default_api_base="",
         strip_model_prefix=False,
-        model_overrides=(),
+        omit_params=(),
     ),
 
     # Zhipu: LiteLLM uses "zai/" prefix.
@@ -291,7 +291,7 @@ PROVIDERS: tuple[ProviderSpec, ...] = (
         detect_by_base_keyword="",
         default_api_base="",
         strip_model_prefix=False,
-        model_overrides=(),
+        omit_params=(),
     ),
 
     # DashScope: Qwen models, needs "dashscope/" prefix.
@@ -309,12 +309,15 @@ PROVIDERS: tuple[ProviderSpec, ...] = (
         detect_by_base_keyword="",
         default_api_base="",
         strip_model_prefix=False,
-        model_overrides=(),
+        omit_params=(),
     ),
 
     # Moonshot: Kimi models, needs "moonshot/" prefix.
     # LiteLLM requires MOONSHOT_API_BASE env var to find the endpoint.
-    # Kimi K2.5 API enforces temperature >= 1.0.
+    # International accounts use https://api.moonshot.ai/v1 — .cn and .ai are
+    # separate platforms and their keys are NOT interchangeable.
+    # The Kimi K series fixes sampling params server-side: passing temperature /
+    # top_p / n / penalties returns an error, so we never send them.
     ProviderSpec(
         name="moonshot",
         keywords=("moonshot", "kimi"),
@@ -331,8 +334,9 @@ PROVIDERS: tuple[ProviderSpec, ...] = (
         detect_by_base_keyword="",
         default_api_base="https://api.moonshot.cn/v1",
         strip_model_prefix=False,
-        model_overrides=(
-            ("kimi-k2.5", {"temperature": 1.0}),
+        omit_params=(
+            "temperature", "top_p", "n",
+            "presence_penalty", "frequency_penalty",
         ),
     ),
 
@@ -352,7 +356,7 @@ PROVIDERS: tuple[ProviderSpec, ...] = (
         detect_by_base_keyword="",
         default_api_base="https://api.minimax.io/v1",
         strip_model_prefix=False,
-        model_overrides=(),
+        omit_params=(),
     ),
 
     # === Local deployment (matched by config key, NOT by api_base) =========
@@ -373,7 +377,7 @@ PROVIDERS: tuple[ProviderSpec, ...] = (
         detect_by_base_keyword="",
         default_api_base="",                # user must provide in config
         strip_model_prefix=False,
-        model_overrides=(),
+        omit_params=(),
     ),
 
     # === Auxiliary (not a primary LLM provider) ============================
@@ -394,7 +398,7 @@ PROVIDERS: tuple[ProviderSpec, ...] = (
         detect_by_base_keyword="",
         default_api_base="",
         strip_model_prefix=False,
-        model_overrides=(),
+        omit_params=(),
     ),
 )
 

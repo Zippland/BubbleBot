@@ -144,15 +144,18 @@ class LiteLLMProvider(LLMProvider):
 
         return new_messages, new_tools
 
-    def _apply_model_overrides(self, model: str, kwargs: dict[str, Any]) -> None:
-        """Apply model-specific parameter overrides from the registry."""
-        model_lower = model.lower()
+    def _apply_param_policy(self, model: str, kwargs: dict[str, Any]) -> None:
+        """Drop request params the provider fixes server-side.
+
+        Some vendors (Moonshot's Kimi K series) pin sampling params and reject
+        requests that set them explicitly. The registry declares them per
+        provider, so a new model from the same vendor needs no code change.
+        """
         spec = find_by_model(model)
-        if spec:
-            for pattern, overrides in spec.model_overrides:
-                if pattern in model_lower:
-                    kwargs.update(overrides)
-                    return
+        if not spec:
+            return
+        for name in spec.omit_params:
+            kwargs.pop(name, None)
 
     @staticmethod
     def _sanitize_messages(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -209,8 +212,8 @@ class LiteLLMProvider(LLMProvider):
             "temperature": temperature,
         }
 
-        # Apply model-specific overrides (e.g. kimi-k2.5 temperature)
-        self._apply_model_overrides(model, kwargs)
+        # Drop params the provider fixes server-side (e.g. Kimi temperature)
+        self._apply_param_policy(model, kwargs)
 
         # Pass api_key directly — more reliable than env vars alone
         if self.api_key:
