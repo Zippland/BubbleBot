@@ -225,3 +225,38 @@ class TestGetHistoryUsesSanitize:
         assert [m["role"] for m in out] == ["user", "assistant", "tool", "assistant"]
         assert out[1].get("tool_calls") == clean[1]["tool_calls"]
         assert out[2].get("tool_call_id") == "c1"
+
+
+# ---- 压缩后仍能找回原文的指引（模型的自救手段）----
+
+def test_compaction_marker_points_at_the_log(tmp_path) -> None:
+    """压缩只影响自动带进上下文的部分；原文仍在 session.jsonl。
+
+    模型必须被告知这件事，否则压缩后它会对着一句摘要说"我不记得了"，
+    而答案其实一 grep 就有。
+    """
+    from bubbles.session.manager import SessionManager
+
+    sm = SessionManager(sessions_dir=tmp_path)
+    s = sm.get_or_create("cli:t")
+    s.messages = [
+        {"_type": "compaction", "summary": "聊过生日", "first_kept_index": 0},
+        {"role": "user", "content": "hi"},
+    ]
+
+    system = [m for m in s.get_history() if m["role"] == "system"]
+    assert system, "压缩摘要要以 system 消息注入"
+    blob = system[0]["content"]
+    assert "聊过生日" in blob
+    assert "session.jsonl" in blob, "必须指向原文位置"
+    assert "grep" in blob
+
+
+def test_system_prompt_teaches_history_recall(tmp_path) -> None:
+    from bubbles.agent.context import ContextBuilder
+
+    prompt = ContextBuilder(session_dir=tmp_path).build_system_prompt(work_dir="/w")
+    assert "session.jsonl" in prompt
+    assert "grep" in prompt
+    # 整读 JSONL 会撑爆上下文，而且会被单条工具结果上限截断
+    assert "Never `read_file` the whole log" in prompt
