@@ -95,7 +95,7 @@ class AgentLoop:
         channels_config: ChannelsConfig | None = None,
         # Auto-compaction settings
         compact_threshold: float = 0.85,
-        compact_keep_recent: int = 20,
+        compact_keep_max_tokens: int = 40_000,
         compact_min_messages: int = 5,
     ):
         from bubbles.config.schema import ExecToolConfig, SandboxConfig
@@ -123,7 +123,7 @@ class AgentLoop:
 
         # Auto-compaction settings
         self.compact_threshold = compact_threshold
-        self.compact_keep_recent = compact_keep_recent
+        self.compact_keep_max_tokens = compact_keep_max_tokens
         self.compact_min_messages = compact_min_messages
 
         self._context_cache: dict[str, ContextBuilder] = {}  # session_key -> ContextBuilder

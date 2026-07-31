@@ -1,7 +1,8 @@
 """Session compaction for context management.
 
 Compaction flow:
-1. Collect messages to summarize (before keep_recent threshold)
+1. Pick the keep-window by token budget (see _select_keep_split); everything
+   older gets summarized
 2. Call LLM to generate summary (staged if needed for large conversations)
 3. Insert compaction marker into session
 4. On load, get_history() skips messages before marker and injects summary
@@ -48,6 +49,9 @@ If you need information from earlier in the conversation, please ask the user to
 
 SAFETY_MARGIN = 1.2  # 20% buffer for estimation inaccuracy
 TOKENS_PER_IMAGE = 1000  # Approximate tokens per image (medium resolution)
+
+# 保留窗口按 token 预算选取，不按固定条数。见 _select_keep_split。
+KEEP_MAX_TOKENS = 40_000
 
 # Token estimation ratios - CONSERVATIVE to avoid context overflow
 # Actual values are lower, but we overestimate for safety
@@ -143,6 +147,44 @@ def find_last_compaction_index(messages: list[dict[str, Any]]) -> int:
         if is_compaction_marker(messages[i]):
             return i
     return -1
+
+
+def _select_keep_split(
+    active: list[dict[str, Any]],
+    keep_max_tokens: int = KEEP_MAX_TOKENS,
+) -> int:
+    """选出保留窗口的起点下标，按 token 预算而非固定条数。
+
+    Why: 固定 "最后 N 条" 在长工具输出下会失效——20 条 exec 日志可能有 600k
+    token，压完仍然超上限，而下一次 compaction 又会因条数不足被拒绝，会话
+    卡死在超限状态。按 token 选取让 "几轮长工具调用" 和 "数十轮短对话" 收敛
+    到同一个上下文预算：前者可能只留 2 轮，后者能留几十轮。
+
+    规则（从最新往回累加）：
+    - ``keep_max_tokens`` 是预算上限；
+    - 起点回退到最近的 user 消息，保证 to_keep 以完整 turn 开头。不这么做时，
+      窗口可能只剩一条孤立 tool 结果，随后被 turn 边界对齐清空，模型会连当前
+      任务都看不到。
+    - 因此当最近一个 turn 自身就超预算（单条巨型 tool 结果）时会突破上限——
+      保住当前任务优先。根治要靠工具结果截断，不属于 compaction 的职责。
+
+    返回 ``active`` 中保留窗口的起始下标（0 表示全部保留）。
+    """
+    tokens = 0
+    start = len(active)
+
+    for i in range(len(active) - 1, -1, -1):
+        msg_tokens = estimate_message_tokens(active[i])
+        if start < len(active) and tokens + msg_tokens > keep_max_tokens:
+            break
+        tokens += msg_tokens
+        start = i
+
+    # 回退到最近的 user 边界，保证窗口非空且以完整 turn 开头。
+    while start > 0 and active[start].get("role") != "user":
+        start -= 1
+
+    return start
 
 
 def _align_split_to_user_boundary(
@@ -294,7 +336,7 @@ async def compact_session(
     provider: LLMProvider,
     model: str,
     context_limit: int,
-    keep_recent: int,
+    keep_max_tokens: int = KEEP_MAX_TOKENS,
     min_messages_to_compact: int = 5,
     use_fallback_on_failure: bool = True,
 ) -> CompactionResult:
@@ -305,7 +347,7 @@ async def compact_session(
         provider: LLM provider for generating summary
         model: Model to use for summarization
         context_limit: Max tokens to process (older messages truncated)
-        keep_recent: Number of recent messages to keep (not summarize)
+        keep_max_tokens: Token budget for the keep-window (see _select_keep_split)
         min_messages_to_compact: Minimum messages required to trigger compaction
         use_fallback_on_failure: If True, use fallback summary when LLM fails
 
@@ -321,15 +363,16 @@ async def compact_session(
     # Get messages since last compaction (excluding markers)
     active_messages = [m for m in messages[start_idx:] if not is_compaction_marker(m)]
 
-    if len(active_messages) < min_messages_to_compact + keep_recent:
+    if len(active_messages) < min_messages_to_compact:
         return CompactionResult(
             success=False,
-            error=f"Not enough messages to compact (have {len(active_messages)}, need {min_messages_to_compact + keep_recent})"
+            error=f"Not enough messages to compact (have {len(active_messages)}, need {min_messages_to_compact})"
         )
 
-    # Split into messages to summarize and messages to keep
-    to_summarize = active_messages[:-keep_recent]
-    to_keep = active_messages[-keep_recent:]
+    # 保留窗口按 token 选取（不是固定条数），见 _select_keep_split。
+    split = _select_keep_split(active_messages, keep_max_tokens=keep_max_tokens)
+    to_summarize = active_messages[:split]
+    to_keep = active_messages[split:]
 
     # 切分点对齐到 turn 边界，避免 to_keep 起头是孤立 tool block。
     to_summarize, to_keep = _align_split_to_user_boundary(to_summarize, to_keep)
