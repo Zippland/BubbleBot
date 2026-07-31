@@ -52,9 +52,12 @@ async def process_system_message(
     prune_old_images_inplace(session.messages)
     context = loop._get_context(session)
     sandbox = await loop._sandboxes.get(key, session.directory, session.config.sandbox)
-    loop._set_tool_context(
-        channel, chat_id, msg.metadata.get("message_id"),
-        session.directory, key, session, sandbox=sandbox,
+    turn_tools = loop.build_turn_tools(
+        channel=channel, chat_id=chat_id,
+        message_id=msg.metadata.get("message_id"),
+        session_dir=session.directory, session_key=key,
+        session=session, sandbox=sandbox,
+        system_triggered=True,
     )
     history = session.get_history(max_messages=loop.memory_window)
     messages = context.build_messages(
@@ -68,7 +71,7 @@ async def process_system_message(
         work_dir=sandbox.root,
     )
     final_content, _, all_msgs = await loop._run_agent_loop(
-        messages, session=session, on_tool_call=on_tool_call,
+        messages, session=session, on_tool_call=on_tool_call, tools=turn_tools,
     )
     save_turn(session, all_msgs, 1 + len(history))
     loop.sessions.save(session)

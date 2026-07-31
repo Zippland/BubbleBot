@@ -218,6 +218,7 @@ def cron_run(
         memory_window=config.agents.defaults.memory_window,
         compact_keep_max_tokens=config.agents.defaults.compact_keep_max_tokens,
         max_api_retries=config.agents.defaults.max_api_retries,
+        max_concurrent_sessions=config.agents.defaults.max_concurrent_sessions,
         tavily_api_key=config.tools.web.search.api_key or None,
         exec_config=config.tools.exec,
         mcp_servers=config.tools.mcp_servers,

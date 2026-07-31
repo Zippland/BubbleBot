@@ -276,6 +276,28 @@ The user can enable a periodic auto-wake with `/heartbeat <interval>` (e.g. `30m
         messages.append({"role": "tool", "tool_call_id": tool_call_id, "name": tool_name, "content": result})
         return messages
     
+    def add_user_messages(
+        self, messages: list[dict[str, Any]], inbound: list[Any],
+    ) -> list[dict[str, Any]]:
+        """Append messages the user sent while the turn was still running.
+
+        The framing has to tell the model three things, or the feature backfires:
+        the message arrived mid-task (not a fresh turn), the original task still
+        needs an answer, and a course-correction is allowed to abandon it. Only
+        the model can judge which of those applies, so we state the situation and
+        let it decide rather than encoding a rule here.
+        """
+        for msg in inbound:
+            sender = (msg.metadata or {}).get("sender_name") or msg.sender_id
+            note = (
+                f"[用户在你执行任务期间发来新消息 — 来自 {sender}（{msg.channel}）]\n"
+                f"{msg.content}\n\n"
+                "[如果这是补充信息：继续原任务，并在最终回复里一并交代原任务的结果。"
+                "如果这是让你停下或改方向：放弃当前路径，按新指示做，并说明你放弃了什么。]"
+            )
+            messages.append({"role": "user", "content": note})
+        return messages
+
     def add_assistant_message(
         self, messages: list[dict[str, Any]],
         content: str | None,
