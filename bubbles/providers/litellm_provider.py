@@ -8,7 +8,7 @@ import litellm
 from litellm import acompletion
 from loguru import logger
 
-from bubbles.providers.base import LLMProvider, LLMResponse, ToolCallRequest
+from bubbles.providers.base import LLMProvider, LLMResponse, ToolCallRequest, to_llm_call_error
 from bubbles.providers.registry import find_by_model, find_gateway
 
 
@@ -33,10 +33,12 @@ class LiteLLMProvider(LLMProvider):
         default_model: str = "anthropic/claude-opus-4-5",
         extra_headers: dict[str, str] | None = None,
         provider_name: str | None = None,
+        timeout: float = 180.0,
     ):
         super().__init__(api_key, api_base)
         self.default_model = default_model
         self.extra_headers = extra_headers or {}
+        self.timeout = timeout
 
         # Detect gateway / local deployment.
         # provider_name (from config key) is the primary signal;
@@ -210,6 +212,12 @@ class LiteLLMProvider(LLMProvider):
             "messages": self._sanitize_messages(self._sanitize_empty_content(messages)),
             "max_tokens": max_tokens,
             "temperature": temperature,
+            # 重试统一由 AgentLoop 负责。不关掉 SDK 的隐式重试，实际请求数会
+            # 变成两层相乘（openai 系默认 2 次，anthropic/gemini 系 0 次），
+            # 既不可控也不一致。
+            "num_retries": 0,
+            "max_retries": 0,
+            "timeout": self.timeout,
         }
 
         # Drop params the provider fixes server-side (e.g. Kimi temperature)
@@ -235,11 +243,9 @@ class LiteLLMProvider(LLMProvider):
             response = await acompletion(**kwargs)
             return self._parse_response(response)
         except Exception as e:
-            # Return error as content for graceful handling
-            return LLMResponse(
-                content=f"Error calling LLM: {str(e)}",
-                finish_reason="error",
-            )
+            # 分类后抛出，由 AgentLoop 决定重试与用户可见文案。
+            # 绝不把错误伪装成模型回复——那会让它进历史、被 compaction 当摘要。
+            raise to_llm_call_error(e) from e
 
     def _parse_response(self, response: Any) -> LLMResponse:
         """Parse LiteLLM response into our standard format."""

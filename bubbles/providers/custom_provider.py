@@ -7,15 +7,17 @@ from typing import Any
 import json_repair
 from openai import AsyncOpenAI
 
-from bubbles.providers.base import LLMProvider, LLMResponse, ToolCallRequest
+from bubbles.providers.base import LLMProvider, LLMResponse, ToolCallRequest, to_llm_call_error
 
 
 class CustomProvider(LLMProvider):
 
-    def __init__(self, api_key: str = "no-key", api_base: str = "http://localhost:8000/v1", default_model: str = "default"):
+    def __init__(self, api_key: str = "no-key", api_base: str = "http://localhost:8000/v1",
+                 default_model: str = "default", timeout: float = 180.0):
         super().__init__(api_key, api_base)
         self.default_model = default_model
-        self._client = AsyncOpenAI(api_key=api_key, base_url=api_base)
+        # max_retries=0：重试统一由 AgentLoop 负责，避免两层相乘。
+        self._client = AsyncOpenAI(api_key=api_key, base_url=api_base, max_retries=0, timeout=timeout)
 
     async def chat(self, messages: list[dict[str, Any]], tools: list[dict[str, Any]] | None = None,
                    model: str | None = None, max_tokens: int = 4096, temperature: float = 0.7) -> LLMResponse:
@@ -30,7 +32,7 @@ class CustomProvider(LLMProvider):
         try:
             return self._parse(await self._client.chat.completions.create(**kwargs))
         except Exception as e:
-            return LLMResponse(content=f"Error: {e}", finish_reason="error")
+            raise to_llm_call_error(e) from e
 
     def _parse(self, response: Any) -> LLMResponse:
         choice = response.choices[0]

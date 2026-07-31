@@ -115,6 +115,7 @@ def agent(
         max_iterations=config.agents.defaults.max_tool_iterations,
         memory_window=config.agents.defaults.memory_window,
         compact_keep_max_tokens=config.agents.defaults.compact_keep_max_tokens,
+        max_api_retries=config.agents.defaults.max_api_retries,
         tavily_api_key=config.tools.web.search.api_key or None,
         exec_config=config.tools.exec,
         sandbox_config=config.tools.sandbox,
@@ -166,17 +167,23 @@ def agent(
             console.print("[red]Error:[/red] Session ID required for -m mode. Use -s <session_id>")
             raise typer.Exit(1)
         async def run_once():
+            from bubbles.providers.base import LLMCallError
             if debug:
                 _print_debug_info(agent_loop, session_id)
-            with _thinking_ctx():
-                response, _tools_used = await agent_loop.process_direct(
-                    message, session_id,
-                    on_progress=_cli_progress,
-                    on_tool_call=_debug_tool_call if debug else None,
-                )
-            _print_agent_response(response, render_markdown=markdown)
-            await agent_loop.close_mcp()
-            await agent_loop.close_sandboxes()
+            try:
+                with _thinking_ctx():
+                    response, _tools_used = await agent_loop.process_direct(
+                        message, session_id,
+                        on_progress=_cli_progress,
+                        on_tool_call=_debug_tool_call if debug else None,
+                    )
+                _print_agent_response(response, render_markdown=markdown)
+            except LLMCallError as e:
+                # -m 是直调路径，没有 bus 上的错误处理；不要把堆栈丢给用户。
+                console.print(f"[red]{e.user_message(e.attempts)}[/red]")
+            finally:
+                await agent_loop.close_mcp()
+                await agent_loop.close_sandboxes()
 
         asyncio.run(run_once())
     else:

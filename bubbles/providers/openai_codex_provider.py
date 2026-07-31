@@ -11,7 +11,7 @@ import httpx
 from loguru import logger
 
 from oauth_cli_kit import get_token as get_codex_token
-from bubbles.providers.base import LLMProvider, LLMResponse, ToolCallRequest
+from bubbles.providers.base import LLMProvider, LLMResponse, ToolCallRequest, to_llm_call_error
 
 DEFAULT_CODEX_URL = "https://chatgpt.com/backend-api/codex/responses"
 DEFAULT_ORIGINATOR = "bubbles"
@@ -70,10 +70,7 @@ class OpenAICodexProvider(LLMProvider):
                 finish_reason=finish_reason,
             )
         except Exception as e:
-            return LLMResponse(
-                content=f"Error calling Codex: {str(e)}",
-                finish_reason="error",
-            )
+            raise to_llm_call_error(e) from e
 
     def get_default_model(self) -> str:
         return self.default_model

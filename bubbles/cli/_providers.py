@@ -124,6 +124,7 @@ def _make_provider_for_model(config: Config, model: str):
             api_key=p.api_key if p else "no-key",
             api_base=config.get_api_base(model) or "http://localhost:8000/v1",
             default_model=model,
+            timeout=float(config.agents.defaults.api_timeout),
         )
 
     return provider_name, LiteLLMProvider(
@@ -132,6 +133,7 @@ def _make_provider_for_model(config: Config, model: str):
         default_model=model,
         extra_headers=p.extra_headers if p else None,
         provider_name=provider_name,
+        timeout=float(config.agents.defaults.api_timeout),
     )
 
 

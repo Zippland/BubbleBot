@@ -224,6 +224,10 @@ class AgentDefaults(Base):
     # Compaction 保留窗口的 token 预算（不按固定条数）。长工具输出可能只留 2 轮，
     # 短对话能留几十轮。最近一个 turn 自身超预算时会突破，以保住当前任务。
     compact_keep_max_tokens: int = 40000
+    # API 调用失败后的重试次数（限流 / 5xx / 超时 / 上下文超限）。
+    # 认证失败、请求非法等重试无意义的错误立即放弃。
+    max_api_retries: int = 2
+    api_timeout: int = 180  # 单次 LLM 请求超时（秒）
 
 
 class AgentsConfig(Base):
