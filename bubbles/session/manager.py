@@ -261,7 +261,12 @@ class Session:
         if compaction_summary:
             out.append({
                 "role": "system",
-                "content": f"## Previous conversation summary:\n{compaction_summary}",
+                "content": (
+                    f"## Previous conversation summary:\n{compaction_summary}\n\n"
+                    "(Older turns were compacted into the summary above. The full "
+                    "verbatim history is still in <work_dir>/session.jsonl — grep it "
+                    "before telling the user you don't remember something.)"
+                ),
             })
 
         for m in sliced:
