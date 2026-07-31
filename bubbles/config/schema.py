@@ -228,6 +228,9 @@ class AgentDefaults(Base):
     # 认证失败、请求非法等重试无意义的错误立即放弃。
     max_api_retries: int = 2
     api_timeout: int = 180  # 单次 LLM 请求超时（秒）
+    # 跨 session 并发上限；0 = 按 CPU 核数自动（min(4, max(2, cores//2))）。
+    # 同一个 session 内部始终串行。
+    max_concurrent_sessions: int = 0
 
 
 class AgentsConfig(Base):

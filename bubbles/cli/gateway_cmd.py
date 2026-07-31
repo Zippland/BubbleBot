@@ -63,6 +63,7 @@ def gateway(
         memory_window=config.agents.defaults.memory_window,
         compact_keep_max_tokens=config.agents.defaults.compact_keep_max_tokens,
         max_api_retries=config.agents.defaults.max_api_retries,
+        max_concurrent_sessions=config.agents.defaults.max_concurrent_sessions,
         tavily_api_key=config.tools.web.search.api_key or None,
         exec_config=config.tools.exec,
         sandbox_config=config.tools.sandbox,
@@ -82,19 +83,18 @@ def gateway(
         - ``cron`` is removed so a triggered turn cannot schedule more jobs
           (no recursive job creation; see SPEC §5.6).
         """
-        from bubbles.agent.system_turn import system_triggered_toolset
         from bubbles.bus.events import OutboundMessage
 
         # Use the saved session_key to inject history, fallback to cron:{job.id}
         session_key = job.payload.session_key or f"cron:{job.id}"
 
-        with system_triggered_toolset(agent):
-            response, tools_used = await agent.process_direct(
-                job.payload.message,
-                session_key=session_key,
-                channel=job.payload.channel or "cli",
-                chat_id=job.payload.to or "direct",
-            )
+        response, tools_used = await agent.process_direct(
+            job.payload.message,
+            session_key=session_key,
+            channel=job.payload.channel or "cli",
+            chat_id=job.payload.to or "direct",
+            system_triggered=True,
+        )
 
         if "stay_silent" in tools_used:
             logger.info("cron: stay_silent for job {} ({})", job.id, job.name)

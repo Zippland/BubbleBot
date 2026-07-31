@@ -16,6 +16,18 @@ DATA_CLEANUP_THROTTLE_SEC = 24 * 3600.0
 API_RETRY_BASE_DELAY_SEC = 1.0
 API_RETRY_MAX_DELAY_SEC = 30.0
 
+
+def _default_concurrency() -> int:
+    """跨 session 的并发上限。
+
+    LLM 调用是 IO 等待，不吃 CPU；真正吃 CPU 的是 exec（本机 subprocess）和
+    沙箱启动，所以留一半核给它们。封顶 4：再往上主要是推高同一 provider 的
+    限流概率，而个人 bot 场景里 "同时有 >4 个 session 在等" 基本不出现。
+    """
+    import os
+
+    return min(4, max(2, (os.cpu_count() or 2) // 2))
+
 from loguru import logger
 
 from bubbles.agent.bindings import (
@@ -101,6 +113,7 @@ class AgentLoop:
         compact_keep_max_tokens: int = 40_000,
         compact_min_messages: int = 5,
         max_api_retries: int = 2,
+        max_concurrent_sessions: int = 0,
     ):
         from bubbles.config.schema import ExecToolConfig, SandboxConfig
         from bubbles.utils.helpers import get_data_path
@@ -159,16 +172,27 @@ class AgentLoop:
         self._active_tasks: dict[str, list[asyncio.Task]] = {}  # session_key -> tasks
         self._last_error_reply_at: dict[str, float] = {}  # session_key -> monotonic ts of last user-visible error reply
         self._last_data_cleanup_at: dict[str, float] = {}  # session_key -> monotonic ts of last data/ cleanup
-        self._processing_lock = asyncio.Lock()
+        # 同 session 串行；跨 session 并发，上限由 semaphore 控。
+        self._session_locks: dict[str, asyncio.Lock] = {}
+        self._concurrency = asyncio.Semaphore(max_concurrent_sessions or _default_concurrency())
+        # session_key -> 等着插进当前 turn 的用户消息
+        self._pending_injections: dict[str, list[InboundMessage]] = {}
         self.on_tool_call: Callable[[str, dict, str | None], Awaitable[None]] | None = None  # Debug callback
         self._register_default_tools()
 
     def _register_default_tools(self) -> None:
-        """Register the default set of tools."""
-        # File tools: sandbox is set dynamically via set_sandbox()
+        """Register the stateless, session-independent tools.
+
+        These carry no per-turn state, so a single shared instance is safe even
+        with several sessions running concurrently. Session-scoped tools are
+        built per turn by :meth:`build_turn_tools`.
+
+        ``self.tools`` remains the template registry: it backs
+        ``get_definitions()`` (the schema list is identical for every session)
+        and is where MCP servers register their tools on connect.
+        """
         for cls in (ReadFileTool, WriteFileTool, EditFileTool, ListDirTool):
             self.tools.register(cls())
-        # Exec tool: sandbox is set per session via set_sandbox()
         self.tools.register(ExecTool(timeout=self.exec_config.timeout))
         self.tools.register(WebSearchTool(api_key=self.tavily_api_key))
         self.tools.register(WebFetchTool())
@@ -180,9 +204,95 @@ class AgentLoop:
             find_person = FindPersonTool()
             find_person.set_channel_manager(self.channel_manager)
             self.tools.register(find_person)
-        # Task tools: session is set dynamically via _set_tool_context()
         for cls in (TaskListTool, TaskGetTool, TaskCreateTool, TaskUpdateTool):
             self.tools.register(cls())
+
+    def build_turn_tools(
+        self,
+        channel: str,
+        chat_id: str,
+        message_id: str | None,
+        session_dir: Path | None,
+        session_key: str,
+        session: Session | None,
+        sandbox: "Sandbox | None",
+        system_triggered: bool = False,
+    ) -> ToolRegistry:
+        """Build a registry owned by one turn.
+
+        Why: tools used to be shared singletons whose sandbox / channel /
+        session were rewritten before each turn. That is only correct while a
+        global lock serializes every turn — under per-session concurrency,
+        session A's ``exec`` would run in session B's sandbox, and A's
+        ``message`` would deliver into B's chat. Constructing per turn removes
+        the shared mutable state instead of guarding it, which is also how
+        subagents already build their tools.
+
+        Stateless tools (web, MCP) are shared by reference — they read nothing
+        but their call arguments.
+        """
+        reg = ToolRegistry()
+
+        for cls in (ReadFileTool, WriteFileTool, EditFileTool, ListDirTool):
+            tool = cls()
+            tool.set_sandbox(sandbox)
+            reg.register(tool)
+
+        exec_tool = ExecTool(timeout=self.exec_config.timeout)
+        exec_tool.set_sandbox(sandbox)
+        reg.register(exec_tool)
+
+        message = MessageTool(send_callback=self.bus.publish_outbound)
+        message.set_context(channel, chat_id, message_id)
+        message.set_session_dir(session_dir)
+        message.start_turn()
+        reg.register(message)
+
+        spawn = SpawnTool(manager=self.subagents)
+        spawn.set_context(channel, chat_id, session_key)
+        spawn.set_session_dir(session_dir)
+        reg.register(spawn)
+
+        # System-triggered turns may not schedule further jobs (SPEC §5.6),
+        # and get stay_silent so the model can opt out of delivery.
+        if system_triggered:
+            from bubbles.agent.tools.stay_silent import StaySilentTool
+            reg.register(StaySilentTool())
+        elif self.cron_service:
+            cron = CronTool(self.cron_service)
+            cron.set_context(channel, chat_id, session_key)
+            reg.register(cron)
+
+        if self.channel_manager is not None:
+            find_person = FindPersonTool()
+            find_person.set_channel_manager(self.channel_manager)
+            find_person.set_context(channel, chat_id)
+            reg.register(find_person)
+
+        for cls in (TaskListTool, TaskGetTool, TaskCreateTool, TaskUpdateTool):
+            tool = cls()
+            if session is not None:
+                tool.set_session(session)
+            reg.register(tool)
+
+        # Stateless: safe to share the same instances across concurrent turns.
+        for name in ("web_search", "web_fetch"):
+            if tool := self.tools.get(name):
+                reg.register(tool)
+        for name, tool in self._mcp_tools().items():
+            reg.register(tool)
+
+        return reg
+
+    def _mcp_tools(self) -> dict[str, Any]:
+        """MCP-provided tools from the template registry (stateless, shared)."""
+        builtin = {
+            "read_file", "write_file", "edit_file", "list_dir", "exec",
+            "web_search", "web_fetch", "message", "spawn", "cron",
+            "find_person", "task_list", "task_get", "task_create",
+            "task_update", "stay_silent",
+        }
+        return {n: t for n, t in self.tools._tools.items() if n not in builtin}
 
     def _provider_for(self, model: str | None) -> LLMProvider:
         """Resolve the provider that should handle this model.
@@ -234,40 +344,6 @@ class AgentLoop:
         finally:
             self._mcp_connecting = False
 
-    def _set_tool_context(
-        self, channel: str, chat_id: str, message_id: str | None = None,
-        session_dir: Path | None = None, session_key: str | None = None,
-        session: Session | None = None, sandbox: "Sandbox | None" = None,
-    ) -> None:
-        """Update context for all tools that need routing info."""
-        for name in ("message", "spawn", "cron", "find_person"):
-            if tool := self.tools.get(name):
-                if hasattr(tool, "set_context"):
-                    if name == "message":
-                        tool.set_context(channel, chat_id, message_id)
-                    elif name in ("cron", "spawn"):
-                        tool.set_context(channel, chat_id, session_key or f"{channel}:{chat_id}")
-                    else:
-                        tool.set_context(channel, chat_id)
-
-        # File + exec tools run against the session's sandbox.
-        for tool_name in ("read_file", "write_file", "edit_file", "list_dir", "exec"):
-            if tool := self.tools.get(tool_name):
-                if hasattr(tool, "set_sandbox"):
-                    tool.set_sandbox(sandbox)
-
-        # message/spawn still resolve outbound media paths on the harness host.
-        for tool_name in ("spawn", "message"):
-            if tool := self.tools.get(tool_name):
-                if hasattr(tool, "set_session_dir"):
-                    tool.set_session_dir(session_dir)
-
-        # Set session for task tools
-        if session:
-            for tool_name in ("task_list", "task_get", "task_create", "task_update"):
-                if tool := self.tools.get(tool_name):
-                    if hasattr(tool, "set_session"):
-                        tool.set_session(session)
 
 
     @staticmethod
@@ -294,6 +370,7 @@ class AgentLoop:
         temperature: float,
         max_tokens: int,
         session: Session,
+        tools: ToolRegistry | None = None,
         on_progress: Callable[..., Awaitable[None]] | None = None,
     ) -> tuple[Any, list[dict]]:
         """调一次 LLM，可重试的失败按类别退避重试。
@@ -312,7 +389,7 @@ class AgentLoop:
             try:
                 response = await self._provider_for(model).chat(
                     messages=messages,
-                    tools=self.tools.get_definitions(),
+                    tools=(tools or self.tools).get_definitions(),
                     model=model,
                     temperature=temperature,
                     max_tokens=max_tokens,
@@ -356,12 +433,15 @@ class AgentLoop:
         session: Session | None = None,
         should_stop: Callable[[], bool] | None = None,
         on_tool_call: Callable[[str, dict, str | None], Awaitable[None]] | None = None,
+        tools: ToolRegistry | None = None,
     ) -> tuple[str | None, list[str], list[dict]]:
         """Run the agent iteration loop. Returns (final_content, tools_used, messages)."""
         messages = initial_messages
         iteration = 0
         final_content = None
         tools_used: list[str] = []
+        # 每轮自己的工具集；缺省回落到模板 registry（测试与旧调用方）。
+        tools = tools if tools is not None else self.tools
 
         # Get context for this session (session is required in new architecture)
         if not session:
@@ -382,6 +462,16 @@ class AgentLoop:
                 logger.warning("External stop signal received, ending agent loop")
                 break
 
+            # 把 turn 进行期间到达的用户消息插进来。位置只能是这里：
+            # assistant(tool_calls) 与它的 tool_result 之间不允许插 user 消息，
+            # 所以「下一次工具调用之前」就是循环顶部。放在 compaction 之前，
+            # 注入的内容才会被计入 token 估算。
+            if injected := self._take_injections(session.key):
+                messages = context.add_user_messages(messages, injected)
+                logger.info(
+                    "Injected {} mid-turn message(s) into session {}", len(injected), session.key,
+                )
+
             # Auto-compaction: check if context is overflowing (pre-call estimation)
             if should_compact(self,messages):
                 messages = await mid_loop_compact(self, session, messages, on_progress)
@@ -392,6 +482,7 @@ class AgentLoop:
                 temperature=temperature,
                 max_tokens=max_tokens,
                 session=session,
+                tools=tools,
                 on_progress=on_progress,
             )
 
@@ -424,7 +515,7 @@ class AgentLoop:
                     logger.info("Tool call: {}({})", tool_call.name, args_str[:200])
                     if on_tool_call:
                         await on_tool_call(tool_call.name, tool_call.arguments, None)
-                    result = await self.tools.execute(tool_call.name, tool_call.arguments)
+                    result = await tools.execute(tool_call.name, tool_call.arguments)
                     if on_tool_call:
                         await on_tool_call(tool_call.name, tool_call.arguments, result)
                     messages = context.add_tool_result(
@@ -432,7 +523,7 @@ class AgentLoop:
                     )
 
                 # Check for duplicate message sends (loop detection)
-                if message_tool := self.tools.get("message"):
+                if message_tool := tools.get("message"):
                     if isinstance(message_tool, MessageTool) and message_tool._duplicate_detected:
                         logger.warning("Duplicate message detected, stopping agent loop")
                         final_content = None  # Already sent via message tool
@@ -472,46 +563,111 @@ class AgentLoop:
 
             if msg.content.strip().lower() == "/stop":
                 await self._handle_stop(msg)
-            else:
-                task = asyncio.create_task(self._dispatch(msg))
-                self._active_tasks.setdefault(msg.session_key, []).append(task)
-                task.add_done_callback(lambda t, k=msg.session_key: self._active_tasks.get(k, []) and self._active_tasks[k].remove(t) if t in self._active_tasks.get(k, []) else None)
+                continue
+
+            key = self._resolve_session_key(msg)
+
+            # 该 session 正在跑 turn 且这条不是命令 → 插进当前 turn，而不是
+            # 排队等它跑完（最多 40 轮迭代，用户可能要等几分钟）。
+            if self._has_active_turn(key) and not self._is_command(msg):
+                self._pending_injections.setdefault(key, []).append(msg)
+                logger.info("Queued mid-turn injection for session {}", key)
+                continue
+
+            task = asyncio.create_task(self._dispatch(msg))
+            self._active_tasks.setdefault(key, []).append(task)
+            task.add_done_callback(lambda t, k=key: self._forget_task(k, t))
+
+    def _forget_task(self, key: str, task: asyncio.Task) -> None:
+        tasks = self._active_tasks.get(key)
+        if tasks and task in tasks:
+            tasks.remove(task)
+        if tasks == []:
+            self._active_tasks.pop(key, None)
+
+    def _has_active_turn(self, key: str) -> bool:
+        return any(not t.done() for t in self._active_tasks.get(key, []))
+
+    @staticmethod
+    def _is_command(msg: InboundMessage) -> bool:
+        """命令（/new、/compact、/config…）要走完整的命令解析，不能当文本注入。"""
+        text = msg.content
+        while m := re.match(r"^\s*<@\S+>\s*", text):
+            text = text[m.end():]
+        return text.strip().startswith("/")
+
+    def _take_injections(self, key: str) -> list[InboundMessage]:
+        return self._pending_injections.pop(key, [])
 
     async def _handle_stop(self, msg: InboundMessage) -> None:
         """Cancel all active tasks and subagents for the session."""
-        tasks = self._active_tasks.pop(msg.session_key, [])
+        key = self._resolve_session_key(msg)
+        self._pending_injections.pop(key, None)
+        tasks = self._active_tasks.pop(key, [])
         cancelled = sum(1 for t in tasks if not t.done() and t.cancel())
         for t in tasks:
             try:
                 await t
             except (asyncio.CancelledError, Exception):
                 pass
-        sub_cancelled = await self.subagents.cancel_by_session(msg.session_key)
+        sub_cancelled = await self.subagents.cancel_by_session(key)
         total = cancelled + sub_cancelled
         content = f"⏹ Stopped {total} task(s)." if total else "No active task to stop."
         await self.bus.publish_outbound(OutboundMessage(
             channel=msg.channel, chat_id=msg.chat_id, content=content,
         ))
 
+    def _resolve_session_key(self, msg: InboundMessage, session_key: str | None = None) -> str:
+        """The session a message actually lands in, honoring /session bindings.
+
+        Why this matters for locking: ``msg.session_key`` is ``channel:chat_id``,
+        but two different chats (even on different channels) can be bound to the
+        same session. Serializing on ``msg.session_key`` would let both write the
+        same session's history concurrently.
+        """
+        if session_key is not None:
+            return session_key
+        if msg.channel == "system":
+            chat = msg.chat_id
+            return chat if ":" not in chat else chat
+        return self._session_bindings.get(f"{msg.channel}:{msg.chat_id}") or msg.session_key
+
+    def _session_lock(self, key: str) -> asyncio.Lock:
+        """Per-session lock: turns within one session stay strictly serialized."""
+        lock = self._session_locks.get(key)
+        if lock is None:
+            lock = asyncio.Lock()
+            self._session_locks[key] = lock
+        return lock
+
     async def _dispatch(self, msg: InboundMessage) -> None:
-        """Process a message under the global lock."""
-        self._maybe_cleanup_session_data(msg.session_key)
-        async with self._processing_lock:
-            try:
-                response = await self._process_message(msg, on_tool_call=self.on_tool_call)
-                if response is not None:
-                    await self.bus.publish_outbound(response)
-                elif msg.channel == "cli":
-                    await self.bus.publish_outbound(OutboundMessage(
-                        channel=msg.channel, chat_id=msg.chat_id,
-                        content="", metadata=msg.metadata or {},
-                    ))
-            except asyncio.CancelledError:
-                logger.info("Task cancelled for session {}", msg.session_key)
-                raise
-            except Exception as e:
-                logger.exception("Error processing message for session {}", msg.session_key)
-                await self._emit_error_reply(msg, e)
+        """Process a message: serialized per session, concurrent across sessions.
+
+        Two gates instead of the old single global lock:
+        - a per-session lock, because concurrent turns in one session would
+          interleave writes to the same ``session.messages``;
+        - a global semaphore, so N sessions don't fan out into N simultaneous
+          provider calls (the real ceiling is the provider's rate limit, not CPU).
+        """
+        key = self._resolve_session_key(msg)
+        self._maybe_cleanup_session_data(key)
+        async with self._session_lock(key):
+            async with self._concurrency:
+                try:
+                    response = await self._process_message(msg, on_tool_call=self.on_tool_call)
+                    if response is not None:
+                        await self.bus.publish_outbound(response)
+                    elif msg.channel == "cli":
+                        await self.bus.publish_outbound(OutboundMessage(
+                            channel=msg.channel, chat_id=msg.chat_id,
+                            content="", metadata=msg.metadata or {},
+                        ))
+                except asyncio.CancelledError:
+                    logger.info("Task cancelled for session {}", key)
+                    raise
+                except Exception as e:
+                    logger.exception("Error processing message for session {}", key)
+                    await self._emit_error_reply(msg, e)
 
     def _maybe_cleanup_session_data(self, session_key: str) -> None:
         """Sweep stale files in this session's data/ once per DATA_CLEANUP_THROTTLE_SEC (SPEC §5.4)."""
@@ -585,6 +741,7 @@ class AgentLoop:
         session_key: str | None = None,
         on_progress: Callable[[str], Awaitable[None]] | None = None,
         on_tool_call: Callable[[str, dict, str | None], Awaitable[None]] | None = None,
+        system_triggered: bool = False,
     ) -> OutboundMessage | None:
         """Process a single inbound message and return the response."""
         if msg.channel == "system":
@@ -758,13 +915,13 @@ class AgentLoop:
         media = relocate_media_to_session(msg.media, session) if msg.media else None
 
         sandbox = await self._sandboxes.get(key, session.directory, session.config.sandbox)
-        self._set_tool_context(
-            msg.channel, msg.chat_id, msg.metadata.get("message_id"),
-            session.directory, key, session, sandbox=sandbox,
+        turn_tools = self.build_turn_tools(
+            channel=msg.channel, chat_id=msg.chat_id,
+            message_id=msg.metadata.get("message_id"),
+            session_dir=session.directory, session_key=key,
+            session=session, sandbox=sandbox,
+            system_triggered=system_triggered,
         )
-        if message_tool := self.tools.get("message"):
-            if isinstance(message_tool, MessageTool):
-                message_tool.start_turn()
 
         context = self._get_context(session)
         history = session.get_history(max_messages=self.memory_window)
@@ -828,6 +985,7 @@ class AgentLoop:
             session=session,
             should_stop=lambda: _progress_loop_detected,
             on_tool_call=on_tool_call,
+            tools=turn_tools,
         )
 
         if final_content is None:
@@ -836,7 +994,7 @@ class AgentLoop:
         save_turn(session, all_msgs, 1 + len(history))
         self.sessions.save(session)
 
-        if (mt := self.tools.get("message")) and isinstance(mt, MessageTool) and mt._sent_in_turn:
+        if (mt := turn_tools.get("message")) and isinstance(mt, MessageTool) and mt._sent_in_turn:
             return None
 
         preview = final_content[:120] + "..." if len(final_content) > 120 else final_content
@@ -853,12 +1011,17 @@ class AgentLoop:
         chat_id: str = "direct",
         on_progress: Callable[[str], Awaitable[None]] | None = None,
         on_tool_call: Callable[[str, dict, str | None], Awaitable[None]] | None = None,
+        system_triggered: bool = False,
     ) -> tuple[str, list[str]]:
         """Process a message directly (for CLI or cron usage).
 
         If session_key is None, the session will be determined by:
         1. User's session binding (if exists)
         2. Default: f"{channel}:{chat_id}"
+
+        ``system_triggered=True`` marks a turn the user didn't ask for (cron /
+        heartbeat): the model gains ``stay_silent`` and loses ``cron`` (no
+        recursive job creation, SPEC §5.6), and failures stay silent.
 
         Returns ``(response_text, tools_used)``. ``tools_used`` lists tool names
         invoked during the turn — callers can check for sentinel tools like
@@ -878,5 +1041,6 @@ class AgentLoop:
 
         response = await self._process_message(
             msg, session_key=session_key, on_progress=on_progress, on_tool_call=_capture,
+            system_triggered=system_triggered,
         )
         return (response.content if response else ""), tools_used
