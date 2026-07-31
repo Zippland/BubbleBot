@@ -12,6 +12,9 @@ from typing import TYPE_CHECKING, Any, Awaitable, Callable
 
 ERROR_REPLY_THROTTLE_SEC = 60.0
 DATA_CLEANUP_THROTTLE_SEC = 24 * 3600.0
+# API 重试退避：1s → 2s → 4s…，封顶 30s（服务端给了 Retry-After 时优先用它）。
+API_RETRY_BASE_DELAY_SEC = 1.0
+API_RETRY_MAX_DELAY_SEC = 30.0
 
 from loguru import logger
 
@@ -47,7 +50,7 @@ from bubbles.agent.tools.web import WebFetchTool, WebSearchTool
 from bubbles.sandbox.manager import SandboxManager
 from bubbles.bus.events import InboundMessage, OutboundMessage
 from bubbles.bus.queue import MessageBus
-from bubbles.providers.base import LLMProvider
+from bubbles.providers.base import LLMCallError, LLMErrorKind, LLMProvider
 from bubbles.session.manager import (
     Session,
     SessionManager,
@@ -97,6 +100,7 @@ class AgentLoop:
         compact_threshold: float = 0.85,
         compact_keep_max_tokens: int = 40_000,
         compact_min_messages: int = 5,
+        max_api_retries: int = 2,
     ):
         from bubbles.config.schema import ExecToolConfig, SandboxConfig
         from bubbles.utils.helpers import get_data_path
@@ -106,6 +110,7 @@ class AgentLoop:
         self.data_dir = get_data_path()  # ~/.bubbles/
         self.model = model or provider.get_default_model()
         self.max_iterations = max_iterations
+        self.max_api_retries = max_api_retries
         self.temperature = temperature
         self.max_tokens = max_tokens
         self.memory_window = memory_window
@@ -282,6 +287,68 @@ class AgentLoop:
             return f'{tc.name}("{val[:40]}…")' if len(val) > 40 else f'{tc.name}("{val}")'
         return ", ".join(_fmt(tc) for tc in tool_calls)
 
+    async def _chat_with_retry(
+        self,
+        model: str | None,
+        messages: list[dict],
+        temperature: float,
+        max_tokens: int,
+        session: Session,
+        on_progress: Callable[..., Awaitable[None]] | None = None,
+    ) -> tuple[Any, list[dict]]:
+        """调一次 LLM，可重试的失败按类别退避重试。
+
+        返回 ``(response, messages)`` —— messages 可能被 context_overflow 恢复
+        路径重建过，调用方必须用返回的这份。
+
+        重试放在这一层而不是 provider：只有这里能做 context_overflow 的恢复
+        动作（压缩历史后重试），provider 看不到 session。
+        """
+        attempt = 0
+        compacted_once = False
+
+        while True:
+            attempt += 1
+            try:
+                response = await self._provider_for(model).chat(
+                    messages=messages,
+                    tools=self.tools.get_definitions(),
+                    model=model,
+                    temperature=temperature,
+                    max_tokens=max_tokens,
+                )
+                return response, messages
+            except LLMCallError as e:
+                e.attempts = attempt  # 供上层文案说明"已重试 N 次"
+                last_attempt = attempt > self.max_api_retries
+                if not e.retryable or last_attempt:
+                    logger.error(
+                        "LLM call failed ({}) after {} attempt(s) for session {}: {}",
+                        e.kind.value, attempt, session.key, e.detail,
+                    )
+                    raise
+
+                if e.kind is LLMErrorKind.CONTEXT_OVERFLOW:
+                    # 压缩一次就够：压完还超说明不是历史长度的问题，
+                    # 再压只会把上下文越削越少却仍然失败。
+                    if compacted_once:
+                        logger.error(
+                            "Context still overflowing after compaction for session {}", session.key,
+                        )
+                        raise
+                    compacted_once = True
+                    logger.warning("Context overflow for session {}; compacting and retrying", session.key)
+                    messages = await mid_loop_compact(self, session, messages, on_progress)
+                    continue
+
+                delay = e.retry_after if e.retry_after is not None else API_RETRY_BASE_DELAY_SEC * (2 ** (attempt - 1))
+                delay = min(delay, API_RETRY_MAX_DELAY_SEC)
+                logger.warning(
+                    "LLM call failed ({}) attempt {}/{} for session {}; retrying in {:.1f}s: {}",
+                    e.kind.value, attempt, self.max_api_retries + 1, session.key, delay, e.detail,
+                )
+                await asyncio.sleep(delay)
+
     async def _run_agent_loop(
         self,
         initial_messages: list[dict],
@@ -319,12 +386,13 @@ class AgentLoop:
             if should_compact(self,messages):
                 messages = await mid_loop_compact(self, session, messages, on_progress)
 
-            response = await self._provider_for(model).chat(
-                messages=messages,
-                tools=self.tools.get_definitions(),
+            response, messages = await self._chat_with_retry(
                 model=model,
+                messages=messages,
                 temperature=temperature,
                 max_tokens=max_tokens,
+                session=session,
+                on_progress=on_progress,
             )
 
             if response.has_tool_calls:
@@ -441,9 +509,9 @@ class AgentLoop:
             except asyncio.CancelledError:
                 logger.info("Task cancelled for session {}", msg.session_key)
                 raise
-            except Exception:
+            except Exception as e:
                 logger.exception("Error processing message for session {}", msg.session_key)
-                await self._emit_error_reply(msg)
+                await self._emit_error_reply(msg, e)
 
     def _maybe_cleanup_session_data(self, session_key: str) -> None:
         """Sweep stale files in this session's data/ once per DATA_CLEANUP_THROTTLE_SEC (SPEC §5.4)."""
@@ -459,24 +527,32 @@ class AgentLoop:
         except Exception as e:
             logger.warning("Runtime data/ cleanup failed for session {}: {}", session_key, e)
 
-    async def _emit_error_reply(self, msg: InboundMessage) -> None:
+    async def _emit_error_reply(self, msg: InboundMessage, exc: BaseException | None = None) -> None:
         """Send a user-visible error reply per SPEC §5.1 error policy.
 
-        Group chats stay silent; private chats get one fixed message, throttled per
-        session_key. CLI always publishes something so the interactive turn can finish.
+        判据是"这一轮是不是用户主动触发的"，不是群聊/私聊：
+        - 用户触发（私聊、群里 @ 机器人、CLI）→ 回一条，用户在等回应，静默才是坏体验；
+        - 非用户触发（cron、心跳、subagent 汇报等 system turn，或群里没 @ 的旁听
+          消息）→ 完全静默，只进日志。没人在等的消息不该让机器人在群里叫。
+
+        ``exc`` 是 LLMCallError 时给出错误类别与重试次数（不含异常类型、堆栈、
+        内部路径）；其他异常沿用固定文案。同一 session 60 秒内只发一条。
         """
-        is_group = bool(msg.metadata and (
-            msg.metadata.get("is_group")
-            or msg.metadata.get("chat_type") == "group"
-        ))
+        user_triggered = (
+            msg.channel != "system"
+            and bool(msg.metadata.get("respond", True) if msg.metadata else True)
+        )
         now = time.monotonic()
         throttled = (now - self._last_error_reply_at.get(msg.session_key, 0.0)) < ERROR_REPLY_THROTTLE_SEC
 
-        if not is_group and not throttled:
+        if user_triggered and not throttled:
             self._last_error_reply_at[msg.session_key] = now
+            if isinstance(exc, LLMCallError):
+                content = exc.user_message(getattr(exc, "attempts", 1))
+            else:
+                content = "Sorry, I encountered an error."
             await self.bus.publish_outbound(OutboundMessage(
-                channel=msg.channel, chat_id=msg.chat_id,
-                content="Sorry, I encountered an error.",
+                channel=msg.channel, chat_id=msg.chat_id, content=content,
             ))
         elif msg.channel == "cli":
             # Unblock the interactive prompt's turn_done waiter even when silent.
