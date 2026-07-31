@@ -221,6 +221,9 @@ class AgentDefaults(Base):
     temperature: float = 1.0
     max_tool_iterations: int = 40
     memory_window: int = 100
+    # Compaction 保留窗口的 token 预算（不按固定条数）。长工具输出可能只留 2 轮，
+    # 短对话能留几十轮。最近一个 turn 自身超预算时会突破，以保住当前任务。
+    compact_keep_max_tokens: int = 40000
 
 
 class AgentsConfig(Base):

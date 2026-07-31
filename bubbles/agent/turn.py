@@ -101,7 +101,7 @@ async def do_compact(loop: "AgentLoop", session: Session) -> CompactionResult:
         provider=loop.provider,
         model=loop.model,
         context_limit=loop.context_limit,
-        keep_recent=loop.compact_keep_recent,
+        keep_max_tokens=loop.compact_keep_max_tokens,
         min_messages_to_compact=loop.compact_min_messages,
         use_fallback_on_failure=True,
     )
