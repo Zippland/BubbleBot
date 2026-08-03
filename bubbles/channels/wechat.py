@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import os
 import re
+import time
 from dataclasses import dataclass, field
 from queue import Empty
 from threading import Thread
@@ -34,6 +35,11 @@ MSG_TYPE_VIDEO = 43
 MSG_TYPE_EMOJI = 47
 MSG_TYPE_APP = 49  # 文件、链接、小程序、引用等
 MSG_TYPE_SYSTEM = 10000
+
+# 联系人名单缓存：TTL 到点重读（抓改名），遇到未知 wxid 也重读一次（抓新好友），
+# 但两次重读之间至少隔 MIN_REFRESH，避免未知发送者连发消息时反复查库。
+CONTACTS_TTL_SEC = 30 * 60.0
+CONTACTS_MIN_REFRESH_INTERVAL_SEC = 60.0
 
 
 @dataclass
@@ -78,6 +84,7 @@ class WeChatChannel(BaseChannel):
         self._recv_thread: Thread | None = None
         self._loop: asyncio.AbstractEventLoop | None = None
         self._contacts: dict[str, WeChatContact] = {}  # wxid -> WeChatContact
+        self._contacts_loaded_at: float = 0.0  # monotonic ts of last roster load
         # msg.id -> downloaded image path. Quote messages carry the original
         # msg.id as <svrid>; this lets us reuse the local copy instead of
         # re-downloading via wcferry (cdn handles expire fast).
@@ -132,9 +139,37 @@ class WeChatChannel(BaseChannel):
                 )
                 for c in contacts
             }
+            self._contacts_loaded_at = time.monotonic()
             logger.info("Loaded {} contacts", len(self._contacts))
         except Exception as e:
             logger.warning("Failed to load contacts: {}", e)
+
+    def _refresh_contacts_if_stale(self, missing_wxid: str | None = None) -> None:
+        """Re-read the roster when it can't answer, or when it's simply old.
+
+        Why: the roster used to be read once at startup and never again, so a
+        contact added after launch had no name at all — the model would only see
+        ``Sender ID: wxid_xxx`` — and a renamed 备注名 stayed stale until restart.
+        Group 群昵称 was unaffected (queried live per message), which is why this
+        mostly bit private chats and name-based lookups.
+
+        Two triggers: an unknown wxid (refresh now, the answer may exist), and a
+        TTL (catch renames of contacts we already know). Both are rate-limited so
+        a burst of messages from one unknown sender can't hammer the DB.
+        """
+        if not self.wcf:
+            return
+        now = time.monotonic()
+        age = now - self._contacts_loaded_at
+        unknown = missing_wxid is not None and missing_wxid not in self._contacts
+
+        if unknown:
+            if age < CONTACTS_MIN_REFRESH_INTERVAL_SEC:
+                return  # 已经刚查过；这个 wxid 大概确实不在名单里
+        elif age < CONTACTS_TTL_SEC:
+            return
+
+        self._load_contacts()
 
     def _get_sender_name(self, sender_id: str, room_id: str | None = None) -> str | None:
         """Resolve display name: 群昵称 → 备注名 → 微信昵称 → 微信号."""
@@ -150,6 +185,7 @@ class WeChatChannel(BaseChannel):
             except Exception:
                 pass
 
+        self._refresh_contacts_if_stale(sender_id)
         contact = self._contacts.get(sender_id)
         return contact.primary() if contact else None
 
@@ -451,6 +487,8 @@ class WeChatChannel(BaseChannel):
         """
         if not self.wcf or not chat_id.endswith("@chatroom"):
             return []
+        # 名字搜索要按备注名/昵称匹配，命中率直接取决于名单新旧。
+        self._refresh_contacts_if_stale()
         loop = asyncio.get_running_loop()
         try:
             members = await loop.run_in_executor(None, self.wcf.get_chatroom_members, chat_id)
