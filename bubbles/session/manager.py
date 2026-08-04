@@ -2,6 +2,7 @@
 
 import json
 import shutil
+import stat
 import time
 from pathlib import Path
 from dataclasses import dataclass, field
@@ -22,6 +23,15 @@ def cleanup_data_dir(session_dir: Path, max_age_seconds: float = DATA_DIR_TTL_SE
 
     Returns the number of files removed. Errors are logged and swallowed —
     cleanup must never break message processing.
+
+    Why the read-only retry: WeChat marks its own stored media read-only, and
+    wcferry moves those files here verbatim (``shutil.move`` → ``copystat``
+    carries the attribute across drives). On Windows ``unlink()`` on a
+    read-only file raises ``PermissionError`` (WinError 5), so the TTL sweep
+    silently gave up on them forever — the §5.4 "cleaned after 3 days" promise
+    did not hold and the files accumulated unbounded (observed: 166 files /
+    1.0 GB stuck on one host). Clearing the attribute and retrying once fixes
+    it; anything still undeletable is a genuine lock and stays logged.
     """
     data_dir = session_dir / "data"
     if not data_dir.is_dir():
@@ -29,15 +39,27 @@ def cleanup_data_dir(session_dir: Path, max_age_seconds: float = DATA_DIR_TTL_SE
 
     cutoff = time.time() - max_age_seconds
     removed = 0
+    failed = 0
     for path in data_dir.rglob("*"):
         if not path.is_file():
             continue
         try:
             if path.stat().st_mtime < cutoff:
-                path.unlink()
+                try:
+                    path.unlink()
+                except PermissionError:
+                    # Read-only attribute (Windows) — clear it and retry once.
+                    path.chmod(path.stat().st_mode | stat.S_IWRITE)
+                    path.unlink()
                 removed += 1
         except OSError as e:
-            logger.warning("Failed to remove stale data file {}: {}", path, e)
+            # One line per sweep, not per file: a wedged dir used to emit
+            # hundreds of identical warnings every pass.
+            failed += 1
+            if failed == 1:
+                logger.warning("Failed to remove stale data file {}: {}", path, e)
+    if failed > 1:
+        logger.warning("{} more stale data files under {} could not be removed", failed - 1, data_dir)
     return removed
 
 
