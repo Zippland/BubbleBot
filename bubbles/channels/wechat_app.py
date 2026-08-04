@@ -20,6 +20,10 @@ from loguru import logger
 
 IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".gif", ".bmp", ".webp"}
 
+# 引用图走 cdn 重新下载，老消息的句柄通常已过期。等太久没意义——这是同步阻塞
+# 调用，会占住 executor 线程。见 download_quoted_image。
+QUOTED_IMAGE_TIMEOUT_SEC = 5
+
 
 def find_file_in_wechat_storage(
     wechat_home: str, wxid: str, filename: str
@@ -209,23 +213,27 @@ async def download_quoted_image(
         logger.debug("Reusing cached quoted image by stem-in-xml: {}", cached)
         return str(cached), f"[图片: <work_dir>/data/{cached.name}]"
 
-    extra = content_xml
-    logger.debug(
-        "Attempting to download quoted image: msg_id={}, extra_len={}",
-        msg_id, len(extra),
-    )
+    # 3. 最后一招：让 wcferry 下载。extra 必须是**加密文件的磁盘路径**，
+    #    quote XML 里没有这个路径，所以这里只传 msg_id、把 extra 留空——
+    #    wcferry 会自己向微信要附件，落盘后再解密。
+    #
+    #    以前这里传的是整段 content_xml。wcferry 拿它当路径去 os.path.exists()，
+    #    自然为假；native 层每秒打一条 `文件不存在: <?xml version="1.0"?>`，
+    #    连打 30 次（timeout=30）才返回空。既白等 30 秒，又刷 30 行错误日志，
+    #    而且成功率是零——路径不可能等于一段 XML。
+    logger.debug("Downloading quoted image via wcferry: msg_id={}", msg_id)
     try:
         loop = asyncio.get_running_loop()
         file_path = await loop.run_in_executor(
             None,
-            lambda: wcf.download_image(int(msg_id), extra, str(media_dir), timeout=30),
+            lambda: wcf.download_image(int(msg_id), "", str(media_dir), timeout=QUOTED_IMAGE_TIMEOUT_SEC),
         )
         if file_path and os.path.exists(file_path):
             filename = os.path.basename(file_path)
             logger.debug("Downloaded quoted image to {}", file_path)
             return file_path, f"[图片: <work_dir>/data/{filename}]"
-        logger.warning(
-            "download_image returned empty or non-existent path for msg_id={}", msg_id,
+        logger.debug(
+            "Quoted image unavailable for msg_id={} (cdn handle likely expired)", msg_id,
         )
     except Exception as e:
         logger.warning("Failed to download quoted image {}: {}", msg_id, e)
