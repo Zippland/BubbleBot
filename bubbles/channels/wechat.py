@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 import os
 import re
 import time
@@ -46,6 +47,71 @@ CONTACTS_MIN_REFRESH_INTERVAL_SEC = 60.0
 # 详见 _download_image_with_retry。
 IMAGE_DOWNLOAD_ATTEMPTS = 4
 IMAGE_DOWNLOAD_RETRY_DELAY_SEC = 1.5
+
+
+class _WcferryLoguruHandler(logging.Handler):
+    """Route wcferry's stdlib logs into Loguru, demoting expected retry noise.
+
+    Why this exists: wcferry logs through ``logging.getLogger("WCF")``, which
+    has no handler, so stdlib's ``lastResort`` sink writes every WARNING+ record
+    straight to stderr. That bypasses ``gateway``'s ``-v`` gate entirely — with
+    verbosity off, all of bubbles' own logs are suppressed and wcferry's are
+    the only thing left on screen.
+
+    Worse, two of those records are now *expected*.
+    ``download_image`` logs ``下载失败`` / ``下载超时`` on every attempt that
+    finds the encrypted ``.dat`` not yet written, and
+    :meth:`WeChatChannel._download_image_with_retry` deliberately provokes
+    exactly that — measured 12 first-attempt failures followed by 12 successes
+    in one burst. Reporting a per-attempt failure as ERROR describes the
+    mechanism, not the outcome; the outcome is logged by the retry helper
+    itself. So records from ``download_image`` are demoted to DEBUG.
+
+    Matching is on ``record.funcName``, not on the message text: it pins the
+    demotion to the one function we wrap, leaving connection, init and video
+    errors at full severity. ``下载超时`` from ``download_video`` really is an
+    outcome — that path has no retry wrapper.
+
+    The wcferry function name is prefixed onto the message rather than recovered
+    by frame-walking (as ``_NioLoguruHandler`` does). Frame-walking would
+    re-attribute each record to ``wcferry.client``, and ``logger.disable
+    ("bubbles")`` — the ``-v`` gate — only silences records attributed to
+    ``bubbles``, so it would reintroduce the leak this class exists to stop.
+    Prefixing also gives the message the only context it has: wcferry's own text
+    is bare enough ("下载失败") to be unattributable on its own.
+    """
+
+    #: wcferry functions whose failures are handled by a retry loop of ours.
+    _RETRIED_FUNCS = frozenset({"download_image"})
+
+    def emit(self, record: logging.LogRecord) -> None:
+        try:
+            if record.funcName in self._RETRIED_FUNCS:
+                level = "DEBUG"
+            else:
+                level = logger.level(record.levelname).name
+        except ValueError:
+            level = record.levelno
+        logger.opt(exception=record.exc_info).log(
+            level, "wcferry.{}: {}", record.funcName, record.getMessage(),
+        )
+
+
+def _configure_wcferry_logging_bridge() -> None:
+    """Bridge wcferry logs to Loguru (idempotent)."""
+    wcf_logger = logging.getLogger("WCF")
+    if any(isinstance(h, _WcferryLoguruHandler) for h in wcf_logger.handlers):
+        return
+    handler = _WcferryLoguruHandler()
+    # wcferry's DEBUG records are a full hex dump of every RPC response
+    # (`_send_request`), so drop them at the handler rather than let bubbles'
+    # verbose mode drown in hex. Filtering here and not via `wcf_logger
+    # .setLevel` covers `Logger.handle()` too, and saves nothing either way —
+    # the dump is built by the caller before any level check runs.
+    handler.setLevel(logging.INFO)
+    wcf_logger.handlers = [handler]
+    wcf_logger.propagate = False
+    wcf_logger.setLevel(logging.DEBUG)
 
 
 @dataclass
@@ -104,6 +170,9 @@ class WeChatChannel(BaseChannel):
 
         self._running = True
         self._loop = asyncio.get_event_loop()
+
+        # Must precede Wcf() — its __init__ already logs through the WCF logger.
+        _configure_wcferry_logging_bridge()
 
         try:
             self.wcf = Wcf()
