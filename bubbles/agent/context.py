@@ -260,6 +260,7 @@ The user can enable a periodic auto-wake with `/heartbeat <interval>` (e.g. `30m
             return text
 
         images = []
+        image_paths: list[str] = []
         for path in media:
             p = Path(path)
             if not p.is_file():
@@ -269,10 +270,22 @@ The user can enable a periodic auto-wake with `/heartbeat <interval>` (e.g. `30m
                 continue
             b64 = base64.b64encode(p.read_bytes()).decode()
             images.append({"type": "image_url", "image_url": {"url": f"data:{mime};base64,{b64}"}})
+            # Inbound media is relocated into the session before context
+            # construction. Derive the real sandbox-relative path rather than
+            # assuming a flat data/ directory, and never expose a host path.
+            try:
+                relative_path = p.resolve().relative_to(self.session_dir.resolve())
+            except ValueError:
+                continue
+            image_paths.append(relative_path.as_posix())
 
         if not images:
             return text
-        return images + [{"type": "text", "text": text}]
+        text_with_paths = text
+        if image_paths:
+            paths = ", ".join(image_paths)
+            text_with_paths = f"{text}\n\n[Attached image paths: {paths}]"
+        return images + [{"type": "text", "text": text_with_paths}]
     
     def add_tool_result(
         self, messages: list[dict[str, Any]],

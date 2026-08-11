@@ -7,6 +7,7 @@ import asyncio
 import typer
 
 from bubbles import __logo__
+from bubbles.cli._image_generation import _make_image_generation_backend
 from bubbles.cli._providers import _make_provider, _make_provider_for_model
 from bubbles.cli.commands import app, console
 
@@ -39,6 +40,7 @@ def gateway(
     provider = _make_provider(config)
     default_provider_name = config.get_provider_name(config.agents.defaults.model)
     provider_factory = lambda m: _make_provider_for_model(config, m)
+    image_generation_backend = _make_image_generation_backend(config)
     session_manager = SessionManager()  # Uses default ~/.bubbles/sessions/
 
     # Create cron service first (callback set after agent creation)
@@ -72,6 +74,7 @@ def gateway(
         channel_manager=channels,
         mcp_servers=config.tools.mcp_servers,
         channels_config=config.channels,
+        image_generation_backend=image_generation_backend,
     )
 
     # Set cron callback (needs agent)

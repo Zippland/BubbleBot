@@ -11,6 +11,7 @@ import typer
 from bubbles import __logo__
 from bubbles.agent.bindings import get_bindings_for_session, save_session_bindings
 from bubbles.agent.turn import do_compact
+from bubbles.cli._image_generation import _make_image_generation_backend
 from bubbles.cli._interactive import (
     _flush_pending_tty_input,
     _init_prompt_session,
@@ -93,6 +94,7 @@ def agent(
     provider = _make_provider(config)
     default_provider_name = config.get_provider_name(config.agents.defaults.model)
     provider_factory = lambda m: _make_provider_for_model(config, m)
+    image_generation_backend = _make_image_generation_backend(config)
 
     # Create cron service for tool usage (no callback needed for CLI unless running)
     cron_store_path = get_data_dir() / "cron" / "jobs.json"
@@ -123,6 +125,7 @@ def agent(
         cron_service=cron,
         mcp_servers=config.tools.mcp_servers,
         channels_config=config.channels,
+        image_generation_backend=image_generation_backend,
     )
 
     # Show spinner when logs are off (no output to miss); skip when logs are on

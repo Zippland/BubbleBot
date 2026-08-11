@@ -53,6 +53,7 @@ from bubbles.agent.subagent import SubagentManager
 from bubbles.agent.tools.cron import CronTool
 from bubbles.agent.tools.filesystem import EditFileTool, ListDirTool, ReadFileTool, WriteFileTool
 from bubbles.agent.tools.find_person import FindPersonTool
+from bubbles.agent.tools.image_generation import GenerateImageTool
 from bubbles.agent.tools.message import MessageTool
 from bubbles.agent.tools.registry import ToolRegistry
 from bubbles.agent.tools.shell import ExecTool
@@ -72,6 +73,7 @@ from bubbles.session.manager import (
 
 if TYPE_CHECKING:
     from bubbles.config.schema import ChannelsConfig, ExecToolConfig, SandboxConfig
+    from bubbles.image_generation import ImageGenerationBackend
     from bubbles.sandbox.base import Sandbox
     from bubbles.cron.service import CronService
 
@@ -114,6 +116,7 @@ class AgentLoop:
         compact_min_messages: int = 5,
         max_api_retries: int = 2,
         max_concurrent_sessions: int = 0,
+        image_generation_backend: "ImageGenerationBackend | None" = None,
     ):
         from bubbles.config.schema import ExecToolConfig, SandboxConfig
         from bubbles.utils.helpers import get_data_path
@@ -135,6 +138,7 @@ class AgentLoop:
         self.channel_manager = channel_manager
         self.provider_factory = provider_factory
         self.default_provider_name = default_provider_name
+        self.image_generation_backend = image_generation_backend
         self._provider_cache: dict[str, LLMProvider] = {}
         if provider is not None and default_provider_name:
             self._provider_cache[default_provider_name] = provider
@@ -197,6 +201,8 @@ class AgentLoop:
         self.tools.register(WebSearchTool(api_key=self.tavily_api_key))
         self.tools.register(WebFetchTool())
         self.tools.register(MessageTool(send_callback=self.bus.publish_outbound))
+        if self.image_generation_backend is not None:
+            self.tools.register(GenerateImageTool(self.image_generation_backend))
         self.tools.register(SpawnTool(manager=self.subagents))
         if self.cron_service:
             self.tools.register(CronTool(self.cron_service))
@@ -248,6 +254,12 @@ class AgentLoop:
         message.start_turn()
         reg.register(message)
 
+        image_generation_backend = getattr(self, "image_generation_backend", None)
+        if image_generation_backend is not None:
+            image_generation = GenerateImageTool(image_generation_backend)
+            image_generation.set_sandbox(sandbox)
+            reg.register(image_generation)
+
         spawn = SpawnTool(manager=self.subagents)
         spawn.set_context(channel, chat_id, session_key)
         spawn.set_session_dir(session_dir)
@@ -290,7 +302,7 @@ class AgentLoop:
             "read_file", "write_file", "edit_file", "list_dir", "exec",
             "web_search", "web_fetch", "message", "spawn", "cron",
             "find_person", "task_list", "task_get", "task_create",
-            "task_update", "stay_silent",
+            "task_update", "stay_silent", "generate_image",
         }
         return {n: t for n, t in self.tools._tools.items() if n not in builtin}
 
