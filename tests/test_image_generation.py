@@ -101,7 +101,6 @@ async def test_openai_generation_sends_json_and_decodes_base64() -> None:
         ImageGenerationRequest(
             prompt="Draw an otter",
             aspect_ratio="3:2",
-            quality="high",
             output_format="webp",
             count=2,
         )
@@ -118,13 +117,22 @@ async def test_openai_generation_sends_json_and_decodes_base64() -> None:
         "prompt": "Draw an otter",
         "n": 2,
         "size": "1536x1024",
-        "quality": "high",
+        "quality": "low",
         "output_format": "webp",
     }
     assert [(image.data, image.output_format) for image in images] == [
         (b"first-image", "webp"),
         (b"second-image", "webp"),
     ]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("quality", ["auto", "high"])
+async def test_openai_backend_rejects_uncapped_quality(quality: str) -> None:
+    backend = OpenAIImageGenerationBackend(api_key="test-secret")
+
+    with pytest.raises(ImageGenerationError, match="Unsupported image quality"):
+        await backend.generate(ImageGenerationRequest(prompt="Draw an otter", quality=quality))
 
 
 @pytest.mark.asyncio
@@ -304,7 +312,6 @@ async def test_tool_uses_replaceable_backend_and_writes_relative_artifacts(
         await tool.execute(
             prompt="  Draw a durable abstraction  ",
             aspect_ratio="9:16",
-            quality="low",
             output_format="webp",
             count=2,
         )
@@ -481,7 +488,8 @@ async def test_tool_rechecks_reference_size_after_read(
         ({"prompt": "x", "count": 5}, "count must be <= 4"),
         ({"prompt": "x", "count": "2"}, "count should be integer"),
         ({"prompt": "x", "aspect_ratio": "4:3"}, "aspect_ratio must be one of"),
-        ({"prompt": "x", "quality": "ultra"}, "quality must be one of"),
+        ({"prompt": "x", "quality": "high"}, "quality must be one of"),
+        ({"prompt": "x", "quality": "auto"}, "quality must be one of"),
         ({"prompt": "x", "output_format": "gif"}, "output_format must be one of"),
     ],
 )
@@ -498,6 +506,8 @@ def test_tool_parameter_schema_exposes_only_provider_neutral_inputs() -> None:
     assert schema["required"] == ["prompt"]
     assert schema["additionalProperties"] is False
     assert schema["properties"]["reference_images"]["maxItems"] == 4
+    assert schema["properties"]["quality"]["enum"] == ["low", "medium"]
+    assert schema["properties"]["quality"]["default"] == "low"
     assert set(schema["properties"]) == {
         "prompt",
         "reference_images",
@@ -511,7 +521,7 @@ def test_tool_parameter_schema_exposes_only_provider_neutral_inputs() -> None:
             "prompt": "x",
             "reference_images": ["refs/a.png"],
             "aspect_ratio": "auto",
-            "quality": "auto",
+            "quality": "medium",
             "output_format": "png",
             "count": 1,
         }

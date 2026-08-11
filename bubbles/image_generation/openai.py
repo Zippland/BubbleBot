@@ -26,7 +26,7 @@ _SIZE_BY_ASPECT_RATIO = {
     "16:9": "1536x864",
     "9:16": "864x1536",
 }
-_QUALITIES = {"auto", "low", "medium", "high"}
+_QUALITIES = {"low", "medium"}
 _OUTPUT_FORMATS = {"png", "jpeg", "webp"}
 
 
