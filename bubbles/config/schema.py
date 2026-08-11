@@ -296,6 +296,15 @@ class ExecToolConfig(Base):
     path_append: str = ""
 
 
+class ImageGenerationConfig(Base):
+    """Image generation tool configuration."""
+
+    enabled: bool = False
+    provider: str = "openai"
+    model: str = "gpt-image-2"
+    timeout: int = 180
+
+
 class SandboxConfig(Base):
     """Sandbox backend selection for exec + file tools.
 
@@ -328,6 +337,7 @@ class ToolsConfig(Base):
 
     web: WebToolsConfig = Field(default_factory=WebToolsConfig)
     exec: ExecToolConfig = Field(default_factory=ExecToolConfig)
+    image_generation: ImageGenerationConfig = Field(default_factory=ImageGenerationConfig)
     sandbox: SandboxConfig = Field(default_factory=SandboxConfig)
     mcp_servers: dict[str, MCPServerConfig] = Field(default_factory=dict)
 

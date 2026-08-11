@@ -202,10 +202,12 @@ def cron_run(
     from bubbles.cron.types import CronJob
     from bubbles.bus.queue import MessageBus
     from bubbles.agent.loop import AgentLoop
+    from bubbles.cli._image_generation import _make_image_generation_backend
     logger.disable("bubbles")
 
     config = load_config()
     provider = _make_provider(config)
+    image_generation_backend = _make_image_generation_backend(config)
     bus = MessageBus()
     agent_loop = AgentLoop(
         bus=bus,
@@ -223,6 +225,7 @@ def cron_run(
         exec_config=config.tools.exec,
         mcp_servers=config.tools.mcp_servers,
         channels_config=config.channels,
+        image_generation_backend=image_generation_backend,
     )
 
     store_path = get_data_dir() / "cron" / "jobs.json"

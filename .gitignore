@@ -20,4 +20,5 @@ poetry.lock
 .pytest_cache/
 botpy.log
 bubbles.log
-tests/
+tests/*
+!tests/test_image_generation.py

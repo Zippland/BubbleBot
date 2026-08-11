@@ -9,20 +9,29 @@ from bubbles.bus.events import OutboundMessage
 
 
 def _resolve_media_path(path: str, session_dir: Path | None) -> str:
-    """Resolve media path: ~ means session_dir, relative paths resolved against it."""
+    """Resolve a media path and keep it inside the current session workspace."""
     raw = (path or "").strip()
     if not raw:
-        return raw
+        raise ValueError("Media path must not be empty")
+    if session_dir is None:
+        raise ValueError("Media attachments require a session workspace")
 
     # Handle ~ as session_dir
-    if raw.startswith("~") and session_dir:
+    if raw.startswith("~"):
         raw = str(session_dir / raw[1:].lstrip("/\\"))
 
     p = Path(raw)
-    if not p.is_absolute() and session_dir:
+    if not p.is_absolute():
         p = session_dir / p
 
-    return str(p.resolve())
+    resolved = p.resolve()
+    workspace = session_dir.resolve()
+    try:
+        resolved.relative_to(workspace)
+    except ValueError as e:
+        raise ValueError(f"Media path is outside the session workspace: {path}") from e
+
+    return str(resolved)
 
 
 class MessageTool(Tool):
@@ -120,13 +129,15 @@ class MessageTool(Tool):
         if msg_key in self._sent_messages:
             self._duplicate_detected = True
             return f"Error: Duplicate message to {current_target} detected. Stop and wait for user response."
-        self._sent_messages.add(msg_key)
 
         # Resolve and validate media files
         resolved_media: list[str] = []
         if media:
             for f in media:
-                resolved = _resolve_media_path(f, self._session_dir)
+                try:
+                    resolved = _resolve_media_path(f, self._session_dir)
+                except ValueError as e:
+                    return f"Error: {e}"
                 if not os.path.isfile(resolved):
                     return f"Error: Media file not found: {f} (resolved to {resolved})"
                 resolved_media.append(resolved)
@@ -142,10 +153,12 @@ class MessageTool(Tool):
         )
 
         try:
+            self._sent_messages.add(msg_key)
             await self._send_callback(msg)
             if channel == self._default_channel and chat_id == self._default_chat_id:
                 self._sent_in_turn = True
             media_info = f" with {len(media)} attachments" if media else ""
             return f"Message sent to {channel}:{chat_id}{media_info}"
         except Exception as e:
+            self._sent_messages.discard(msg_key)
             return f"Error sending message: {str(e)}"

@@ -1,0 +1,1 @@
+Generate or edit one or more images and save them inside the current session workspace. Use reference_images only with session-relative paths. The result contains artifact paths; when the user wants the images delivered to a chat, call the message tool separately and pass those paths in media.
