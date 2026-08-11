@@ -100,7 +100,7 @@ async def test_openai_generation_sends_json_and_decodes_base64() -> None:
     images = await backend.generate(
         ImageGenerationRequest(
             prompt="Draw an otter",
-            aspect_ratio="3:2",
+            aspect_ratio="1:1",
             output_format="webp",
             count=2,
         )
@@ -116,7 +116,7 @@ async def test_openai_generation_sends_json_and_decodes_base64() -> None:
         "model": "gpt-image-2",
         "prompt": "Draw an otter",
         "n": 2,
-        "size": "1536x1024",
+        "size": "816x816",
         "quality": "low",
         "output_format": "webp",
     }
