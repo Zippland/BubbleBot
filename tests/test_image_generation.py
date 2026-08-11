@@ -74,7 +74,19 @@ def _multipart_parts(request: httpx.Request) -> list[dict[str, object]]:
 
 
 @pytest.mark.asyncio
-async def test_openai_generation_sends_json_and_decodes_base64() -> None:
+@pytest.mark.parametrize(
+    ("aspect_ratio", "expected_size"),
+    [
+        ("1:1", "816x816"),
+        ("3:2", "1008x672"),
+        ("2:3", "672x1008"),
+        ("16:9", "1280x720"),
+        ("9:16", "720x1280"),
+    ],
+)
+async def test_openai_generation_sends_json_and_decodes_base64(
+    aspect_ratio: str, expected_size: str
+) -> None:
     expected_images = [b"first-image", b"second-image"]
     captured: dict[str, object] = {}
 
@@ -100,7 +112,7 @@ async def test_openai_generation_sends_json_and_decodes_base64() -> None:
     images = await backend.generate(
         ImageGenerationRequest(
             prompt="Draw an otter",
-            aspect_ratio="1:1",
+            aspect_ratio=aspect_ratio,
             output_format="webp",
             count=2,
         )
@@ -116,7 +128,7 @@ async def test_openai_generation_sends_json_and_decodes_base64() -> None:
         "model": "gpt-image-2",
         "prompt": "Draw an otter",
         "n": 2,
-        "size": "816x816",
+        "size": expected_size,
         "quality": "low",
         "output_format": "webp",
     }
@@ -180,7 +192,7 @@ async def test_openai_reference_images_use_multipart_edits() -> None:
         "model": "gpt-image-2",
         "prompt": "Combine these references",
         "n": "1",
-        "size": "1536x864",
+        "size": "1280x720",
         "quality": "medium",
         "output_format": "jpeg",
     }

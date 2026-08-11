@@ -21,10 +21,10 @@ from bubbles.image_generation.base import (
 _SIZE_BY_ASPECT_RATIO = {
     "auto": "auto",
     "1:1": "816x816",
-    "3:2": "1536x1024",
-    "2:3": "1024x1536",
-    "16:9": "1536x864",
-    "9:16": "864x1536",
+    "3:2": "1008x672",
+    "2:3": "672x1008",
+    "16:9": "1280x720",
+    "9:16": "720x1280",
 }
 _QUALITIES = {"low", "medium"}
 _OUTPUT_FORMATS = {"png", "jpeg", "webp"}
