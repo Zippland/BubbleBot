@@ -18,7 +18,7 @@ from bubbles.image_generation import (
 from bubbles.sandbox.base import Sandbox
 
 _ASPECT_RATIOS = ["auto", "1:1", "3:2", "2:3", "16:9", "9:16"]
-_QUALITIES = ["auto", "low", "medium", "high"]
+_QUALITIES = ["low", "medium"]
 _OUTPUT_FORMATS = ["png", "jpeg", "webp"]
 _MIME_TYPES = {"png": "image/png", "jpeg": "image/jpeg", "webp": "image/webp"}
 _REFERENCE_MIME_TYPES = {
@@ -85,8 +85,10 @@ class GenerateImageTool(Tool):
                 "quality": {
                     "type": "string",
                     "enum": _QUALITIES,
-                    "description": "Rendering quality. Higher quality costs more and takes longer.",
-                    "default": "auto",
+                    "description": (
+                        "Cost-bounded rendering quality; auto and high are not exposed."
+                    ),
+                    "default": "low",
                 },
                 "output_format": {
                     "type": "string",
@@ -111,7 +113,7 @@ class GenerateImageTool(Tool):
         prompt: str,
         reference_images: list[str] | None = None,
         aspect_ratio: str = "auto",
-        quality: str = "auto",
+        quality: str = "low",
         output_format: str = "png",
         count: int = 1,
         **kwargs: Any,

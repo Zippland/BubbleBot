@@ -22,7 +22,7 @@ class ImageGenerationRequest:
     prompt: str
     reference_images: tuple[ReferenceImage, ...] = ()
     aspect_ratio: str = "auto"
-    quality: str = "auto"
+    quality: str = "low"
     output_format: str = "png"
     count: int = 1
 
