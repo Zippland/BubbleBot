@@ -20,7 +20,7 @@ from bubbles.image_generation.base import (
 
 _SIZE_BY_ASPECT_RATIO = {
     "auto": "auto",
-    "1:1": "1024x1024",
+    "1:1": "816x816",
     "3:2": "1536x1024",
     "2:3": "1024x1536",
     "16:9": "1536x864",
