@@ -151,8 +151,10 @@ Bubbles 以**单一二进制 CLI（`bubbles`）**对外暴露能力，没有 GUI
 | QQ         | ✓            | —                              | AppID + Secret          | 基于官方 botpy。                                      |
 | Slack      | DM 策略可控  | 由 `group_policy` 决定          | Bot Token + App Token   | Socket Mode。                                         |
 | Telegram   | ✓            | @ 触发                         | Bot Token              | 可走代理。                                            |
-| WeChat     | ✓            | @ 触发                         | wcferry（仅 Windows）   | 受限于 wcferry 的平台支持。                            |
+| WeChat     | ✓            | @ 触发                         | wcferry（仅 Windows）   | 可压缩的静态大图使用有界 JPEG 副本，原图保持不变。     |
 | WhatsApp   | ✓            | 群聊 @ 触发                    | 扫码（经 Node.js 网桥） | 唯一一个需要外部进程协作的渠道。                       |
+
+微信出站图片默认控制在 `1 MiB`、长边 `1280px` 内；这是 WCFerry 的经验性可靠性预算而非协议上限，可通过 `channels.wechat.outboundImageMaxBytes` 和 `channels.wechat.outboundImageMaxEdge` 调整。超出预算的动画、不可解码或无法压入预算的图片降级为文件发送。
 
 **所有渠道的统一契约**：
 

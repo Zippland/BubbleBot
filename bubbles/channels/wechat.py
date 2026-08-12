@@ -7,9 +7,10 @@ import logging
 import os
 import re
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from queue import Empty
 from threading import Thread
+from uuid import uuid4
 
 from loguru import logger
 
@@ -17,9 +18,16 @@ from bubbles.bus.events import OutboundMessage
 from bubbles.bus.queue import MessageBus
 from bubbles.channels import wechat_app
 from bubbles.channels.base import BaseChannel
-from bubbles.channels.mentions import extract_mentions, replace_mentions
+from bubbles.channels.mentions import replace_mentions
 from bubbles.channels.wechat_app import IMAGE_EXTS
+from bubbles.channels.wechat_media import (
+    WECHAT_IMAGE_CACHE_TTL_SECONDS,
+    prepare_wechat_image,
+    prune_wechat_image_cache,
+    remove_wechat_cached_image,
+)
 from bubbles.config.schema import WeChatConfig
+from bubbles.utils.helpers import get_data_path
 
 try:
     from wcferry import Wcf, WxMsg
@@ -157,6 +165,13 @@ class WeChatChannel(BaseChannel):
         self._loop: asyncio.AbstractEventLoop | None = None
         self._contacts: dict[str, WeChatContact] = {}  # wxid -> WeChatContact
         self._contacts_loaded_at: float = 0.0  # monotonic ts of last roster load
+        self._send_lock = asyncio.Lock()
+        self._outbound_image_cache_root = (
+            get_data_path() / "cache" / "wechat-outbound-images"
+        )
+        self._outbound_image_cache = self._outbound_image_cache_root / uuid4().hex
+        self._outbound_image_cache_ttl_seconds = WECHAT_IMAGE_CACHE_TTL_SECONDS
+        self._outbound_image_cleanup_tasks: set[asyncio.Task[None]] = set()
         # msg.id -> downloaded image path. Quote messages carry the original
         # msg.id as <svrid>; this lets us reuse the local copy instead of
         # re-downloading via wcferry (cdn handles expire fast).
@@ -170,6 +185,11 @@ class WeChatChannel(BaseChannel):
 
         self._running = True
         self._loop = asyncio.get_event_loop()
+        await asyncio.to_thread(
+            prune_wechat_image_cache,
+            self._outbound_image_cache_root,
+            max_age_seconds=self._outbound_image_cache_ttl_seconds,
+        )
 
         # Must precede Wcf() — its __init__ already logs through the WCF logger.
         _configure_wcferry_logging_bridge()
@@ -564,36 +584,137 @@ class WeChatChannel(BaseChannel):
 
         return None
 
+    async def _call_wcf(self, method_name: str, *args) -> int:
+        """Call WCFerry and normalize its process-exit failure mode."""
+        if not self.wcf:
+            raise RuntimeError("WeChat not connected")
+        method = getattr(self.wcf, method_name)
+
+        started = time.monotonic()
+        try:
+            status = method(*args)
+        except SystemExit as exc:
+            raise RuntimeError(f"WCFerry {method_name} aborted") from exc
+        logger.debug(
+            "WCFerry {} completed: status={}, elapsed={:.2f}s",
+            method_name,
+            status,
+            time.monotonic() - started,
+        )
+        return status
+
+    def _schedule_outbound_image_cleanup(self, path: str) -> None:
+        async def expire() -> None:
+            try:
+                await asyncio.sleep(self._outbound_image_cache_ttl_seconds)
+            finally:
+                await asyncio.to_thread(remove_wechat_cached_image, path)
+
+        task = asyncio.create_task(expire())
+        self._outbound_image_cleanup_tasks.add(task)
+        task.add_done_callback(self._outbound_image_cleanup_tasks.discard)
+
+    async def _send_outbound_image(self, file_path: str, chat_id: str) -> None:
+        prepare_task = asyncio.create_task(
+            asyncio.to_thread(
+                prepare_wechat_image,
+                file_path,
+                cache_dir=self._outbound_image_cache,
+                max_bytes=self.config.outbound_image_max_bytes,
+                max_edge=self.config.outbound_image_max_edge,
+            )
+        )
+        try:
+            prepared = await asyncio.shield(prepare_task)
+        except asyncio.CancelledError:
+            try:
+                abandoned = await asyncio.shield(prepare_task)
+            except Exception:
+                pass
+            else:
+                if abandoned.derived:
+                    await asyncio.to_thread(
+                        remove_wechat_cached_image,
+                        abandoned.path,
+                    )
+            raise
+        if prepared.derived:
+            self._schedule_outbound_image_cleanup(prepared.path)
+        if prepared.send_as_file:
+            status = await self._call_wcf("send_file", prepared.original_path, chat_id)
+            if status != 0:
+                raise RuntimeError(f"WCFerry send_file failed with status {status}")
+            logger.debug("Submitted image as file to {}: {}", chat_id, file_path)
+            return
+
+        status = await self._call_wcf("send_image", prepared.path, chat_id)
+        if status == 0:
+            logger.debug(
+                "Submitted image to {}: {} (prepared_bytes={})",
+                chat_id,
+                file_path,
+                prepared.prepared_size_bytes,
+            )
+            return
+
+        logger.warning(
+            "WCFerry send_image failed with status {}; falling back to file: {}",
+            status,
+            file_path,
+        )
+        fallback_status = await self._call_wcf("send_file", prepared.original_path, chat_id)
+        if fallback_status != 0:
+            raise RuntimeError(
+                "WCFerry image and file delivery failed with statuses "
+                f"{status}/{fallback_status}"
+            )
+
     async def send(self, msg: OutboundMessage) -> None:
         """Send a message through WeChat, including media if present."""
         if not self.wcf:
             logger.warning("WeChat not connected")
             return
 
-        try:
+        async with self._send_lock:
             # Send media files first
             for file_path in msg.media:
                 if not os.path.isfile(file_path):
                     logger.warning("Media file not found: {}", file_path)
                     continue
                 ext = os.path.splitext(file_path)[1].lower()
-                if ext in IMAGE_EXTS:
-                    self.wcf.send_image(file_path, msg.chat_id)
-                    logger.debug("Sent image to {}: {}", msg.chat_id, file_path)
-                else:
-                    self.wcf.send_file(file_path, msg.chat_id)
-                    logger.debug("Sent file to {}: {}", msg.chat_id, file_path)
+                try:
+                    if ext in IMAGE_EXTS:
+                        await self._send_outbound_image(file_path, msg.chat_id)
+                    else:
+                        status = await self._call_wcf("send_file", file_path, msg.chat_id)
+                        if status != 0:
+                            raise RuntimeError(
+                                f"WCFerry send_file failed with status {status}"
+                            )
+                        logger.debug("Submitted file to {}: {}", msg.chat_id, file_path)
+                except (Exception, SystemExit) as exc:
+                    logger.error("Failed to send WeChat media {}: {}", file_path, exc)
 
             # Send text content
             if msg.content and msg.content.strip():
-                text, aters = self._translate_outbound_mentions(msg.content, msg.chat_id)
-                self.wcf.send_text(text, msg.chat_id, aters)
-                logger.debug(
-                    "Sent message to {}: {}... (aters={})",
-                    msg.chat_id, text[:50], aters or "-",
-                )
-        except Exception as e:
-            logger.error("Failed to send WeChat message: {}", e)
+                try:
+                    text, aters = self._translate_outbound_mentions(
+                        msg.content,
+                        msg.chat_id,
+                    )
+                    status = await self._call_wcf("send_text", text, msg.chat_id, aters)
+                    if status != 0:
+                        raise RuntimeError(
+                            f"WCFerry send_text failed with status {status}"
+                        )
+                    logger.debug(
+                        "Submitted message to {}: {}... (aters={})",
+                        msg.chat_id,
+                        text[:50],
+                        aters or "-",
+                    )
+                except (Exception, SystemExit) as exc:
+                    logger.error("Failed to send WeChat message: {}", exc)
 
     async def get_group_members(self, chat_id: str) -> list[dict[str, object]]:
         """Return member records for a WeChat group.
@@ -646,8 +767,23 @@ class WeChatChannel(BaseChannel):
             try:
                 self.wcf.disable_recv_msg()
                 logger.info("WeChat message receiver stopped")
-            except Exception as e:
+            except (Exception, SystemExit) as e:
                 logger.error("Error stopping WeChat: {}", e)
             self.wcf = None
+
+        cleanup_tasks = list(self._outbound_image_cleanup_tasks)
+        for task in cleanup_tasks:
+            task.cancel()
+        if cleanup_tasks:
+            await asyncio.gather(*cleanup_tasks, return_exceptions=True)
+        await asyncio.to_thread(
+            prune_wechat_image_cache,
+            self._outbound_image_cache,
+            max_age_seconds=0,
+        )
+        try:
+            self._outbound_image_cache.rmdir()
+        except OSError:
+            pass
 
         self._recv_thread = None

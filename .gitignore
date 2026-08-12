@@ -22,3 +22,4 @@ botpy.log
 bubbles.log
 tests/*
 !tests/test_image_generation.py
+!tests/test_wechat_outbound_images.py
