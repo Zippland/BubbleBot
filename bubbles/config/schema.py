@@ -1,9 +1,8 @@
 """Configuration schema using Pydantic."""
 
-from pathlib import Path
 from typing import Literal
 
-from pydantic import BaseModel, Field, ConfigDict
+from pydantic import BaseModel, ConfigDict, Field
 from pydantic.alias_generators import to_camel
 from pydantic_settings import BaseSettings
 
@@ -190,6 +189,9 @@ class WeChatConfig(Base):
     enabled: bool = False
     groups: list[str] = Field(default_factory=list)  # Allowed group IDs (empty = all groups)
     allow_from: list[str] = Field(default_factory=list)  # Allowed user wxids (empty = all users)
+    # Empirical delivery budget rather than a documented WeChat protocol limit.
+    outbound_image_max_bytes: int = Field(default=1024 * 1024, ge=64 * 1024)
+    outbound_image_max_edge: int = Field(default=1280, ge=256)
 
 
 class ChannelsConfig(Base):
