@@ -54,7 +54,7 @@ class BaseChannel(ABC):
         pass
     
     @abstractmethod
-    async def send(self, msg: OutboundMessage) -> None:
+    async def send(self, msg: OutboundMessage) -> bool | None:
         """
         Send a message through this channel.
         
@@ -162,6 +162,11 @@ class BaseChannel(ABC):
     @property
     def is_running(self) -> bool:
         """Check if the channel is running."""
+        return self._running
+
+    @property
+    def is_ready(self) -> bool:
+        """Whether the channel can currently accept outbound delivery."""
         return self._running
 
     def _get_session_binding(self, chat_id: str) -> str | None:

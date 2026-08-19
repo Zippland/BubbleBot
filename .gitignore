@@ -27,3 +27,5 @@ tests/*
 !tests/test_litellm_provider.py
 !tests/test_wechat_text_trigger.py
 !tests/test_stay_silent.py
+!tests/test_gateway_upgrade.py
+!tests/test_matrix_channel_lifecycle.py

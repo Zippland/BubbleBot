@@ -178,6 +178,7 @@ class MatrixChannel(BaseChannel):
             logger.warning("Matrix device_id empty; restart may replay recent messages.")
 
         self._sync_task = asyncio.create_task(self._sync_loop())
+        await self._sync_task
 
     async def stop(self) -> None:
         """Stop the Matrix channel with graceful sync shutdown."""

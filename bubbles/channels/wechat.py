@@ -3,13 +3,21 @@
 from __future__ import annotations
 
 import asyncio
+import ctypes
+import importlib
+import json
 import logging
 import os
 import re
+import socket
 import time
+from collections.abc import Callable
+from ctypes import wintypes
 from dataclasses import dataclass
+from pathlib import Path
 from queue import Empty
-from threading import Thread
+from threading import Lock, Thread, Timer
+from threading import enumerate as enumerate_threads
 from uuid import uuid4
 
 from loguru import logger
@@ -27,6 +35,7 @@ from bubbles.channels.wechat_media import (
     remove_wechat_cached_image,
 )
 from bubbles.config.schema import WeChatConfig
+from bubbles.gateway_control import NO_RESTART_EXIT_CODE
 from bubbles.utils.helpers import get_data_path
 
 try:
@@ -59,6 +68,469 @@ IMAGE_DOWNLOAD_RETRY_DELAY_SEC = 1.5
 # 微信复制出来的 ``@泡泡`` 只是普通文本，WCFerry 的 ``msg.is_at`` 不会
 # 命中。群聊除了保留原生 @ 兼容性外，也把正文中的名字作为显式唤醒词。
 WECHAT_BOT_TRIGGER_WORD = "泡泡"
+WECHAT_RECEIVER_HEALTH_INTERVAL_SECONDS = 1.0
+WECHAT_LOGIN_POLL_INTERVAL_SECONDS = 1.0
+WECHAT_MESSAGE_TRANSPORT_READY_TIMEOUT_SECONDS = 10.0
+WECHAT_MESSAGE_TRANSPORT_POLL_INTERVAL_SECONDS = 0.05
+WCFERRY_MESSAGE_THREAD_JOIN_TIMEOUT_SECONDS = 5.0
+# WCFerry injects into WeChat and binds machine-wide RPC ports.  The mutex must
+# therefore span console/RDP sessions as well as Python processes.  A Local\
+# mutex would allow the same Windows user to construct a second Wcf() from a
+# different interactive session before the port listener becomes observable.
+WCFERRY_MUTEX_NAME = r"Global\Bubblebot-WCFerry"
+WCFERRY_COMMAND_PORT = 10086
+WCFERRY_MESSAGE_PORT = WCFERRY_COMMAND_PORT + 1
+WCFERRY_LEASE_FILE = "wcferry-lease.json"
+WCFERRY_NATIVE_CLEANUP_TIMEOUT_SECONDS = 30
+
+_WAIT_OBJECT_0 = 0x00000000
+_WAIT_ABANDONED = 0x00000080
+_WAIT_TIMEOUT = 0x00000102
+_ERROR_INSUFFICIENT_BUFFER = 122
+_AF_INET = 2
+_TCP_TABLE_OWNER_PID_LISTENER = 3
+
+
+class WcferryCleanupError(RuntimeError):
+    """The process cannot prove that WCFerry detached from WeChat safely."""
+
+    no_restart = True
+
+
+class _WcferryRequestedExitError(RuntimeError):
+    def __init__(self, exit_code: int) -> None:
+        super().__init__(f"WCFerry requested an immediate process exit ({exit_code})")
+        self.exit_code = exit_code
+
+
+class _WcferryOsProxy:
+    """Override only wcferry.client's os._exit during construction."""
+
+    def __init__(self, wrapped) -> None:
+        self._wrapped = wrapped
+
+    def __getattr__(self, name: str):
+        return getattr(self._wrapped, name)
+
+    @staticmethod
+    def _exit(exit_code: int) -> None:
+        raise _WcferryRequestedExitError(exit_code)
+
+
+class _MibTcpRowOwnerPid(ctypes.Structure):
+    _fields_ = [
+        ("dwState", wintypes.DWORD),
+        ("dwLocalAddr", wintypes.DWORD),
+        ("dwLocalPort", wintypes.DWORD),
+        ("dwRemoteAddr", wintypes.DWORD),
+        ("dwRemotePort", wintypes.DWORD),
+        ("dwOwningPid", wintypes.DWORD),
+    ]
+
+
+def _load_kernel32_mutex_api():
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.CreateMutexW.argtypes = [
+        wintypes.LPVOID,
+        wintypes.BOOL,
+        wintypes.LPCWSTR,
+    ]
+    kernel32.CreateMutexW.restype = wintypes.HANDLE
+    kernel32.WaitForSingleObject.argtypes = [wintypes.HANDLE, wintypes.DWORD]
+    kernel32.WaitForSingleObject.restype = wintypes.DWORD
+    kernel32.ReleaseMutex.argtypes = [wintypes.HANDLE]
+    kernel32.ReleaseMutex.restype = wintypes.BOOL
+    kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+    kernel32.CloseHandle.restype = wintypes.BOOL
+    return kernel32
+
+
+def _windows_mutex_error(operation: str, error_code: int | None = None) -> OSError:
+    if error_code is None:
+        error_code = ctypes.get_last_error()
+    return OSError(error_code, f"{operation} failed: {ctypes.FormatError(error_code)}")
+
+
+class _WcferryInstanceMutex:
+    """Machine-wide WCFerry singleton guard across Windows processes/sessions."""
+
+    def __init__(
+        self,
+        name: str = WCFERRY_MUTEX_NAME,
+        *,
+        enabled: bool | None = None,
+        kernel32=None,
+    ) -> None:
+        self.name = name
+        self.enabled = os.name == "nt" if enabled is None else enabled
+        self._kernel32 = kernel32
+        self._handle = None
+
+    @property
+    def held(self) -> bool:
+        return self._handle is not None
+
+    def acquire(self) -> None:
+        if not self.enabled or self._handle is not None:
+            return
+
+        kernel32 = self._kernel32 or _load_kernel32_mutex_api()
+        handle = kernel32.CreateMutexW(None, False, self.name)
+        if not handle:
+            raise _windows_mutex_error("CreateMutexW")
+
+        try:
+            wait_status = int(kernel32.WaitForSingleObject(handle, 0))
+        except BaseException:
+            kernel32.CloseHandle(handle)
+            raise
+        if wait_status in (_WAIT_OBJECT_0, _WAIT_ABANDONED):
+            self._kernel32 = kernel32
+            self._handle = handle
+            return
+
+        wait_error_code = (
+            ctypes.get_last_error() if wait_status != _WAIT_TIMEOUT else None
+        )
+        close_succeeded = bool(kernel32.CloseHandle(handle))
+        if not close_succeeded:
+            raise _windows_mutex_error("CloseHandle")
+        if wait_status == _WAIT_TIMEOUT:
+            raise WcferryCleanupError(
+                "另一 Bubblebot 进程正在使用 WCFerry；为避免微信连接冲突，本进程拒绝启动。"
+            )
+        raise _windows_mutex_error("WaitForSingleObject", wait_error_code)
+
+    def release(self) -> None:
+        if not self.enabled or self._handle is None:
+            return
+
+        kernel32 = self._kernel32
+        handle = self._handle
+        self._handle = None
+        release_error: BaseException | None = None
+        try:
+            if not kernel32.ReleaseMutex(handle):
+                release_error = _windows_mutex_error("ReleaseMutex")
+        except BaseException as exc:
+            release_error = exc
+        try:
+            if not kernel32.CloseHandle(handle) and release_error is None:
+                release_error = _windows_mutex_error("CloseHandle")
+        except BaseException as exc:
+            if release_error is None:
+                release_error = exc
+        if release_error is not None:
+            raise release_error
+
+
+def _load_iphlpapi():
+    api = ctypes.WinDLL("iphlpapi", use_last_error=True)
+    api.GetExtendedTcpTable.argtypes = [
+        wintypes.LPVOID,
+        ctypes.POINTER(wintypes.ULONG),
+        wintypes.BOOL,
+        wintypes.ULONG,
+        wintypes.ULONG,
+        wintypes.ULONG,
+    ]
+    api.GetExtendedTcpTable.restype = wintypes.ULONG
+    return api
+
+
+def _listening_ipv4_ports(*, iphlpapi=None) -> set[int]:
+    """Read the Windows listener table without connecting to WCFerry's NNG peer."""
+    api = iphlpapi or _load_iphlpapi()
+    size = wintypes.ULONG(0)
+    status = int(
+        api.GetExtendedTcpTable(
+            None,
+            ctypes.byref(size),
+            False,
+            _AF_INET,
+            _TCP_TABLE_OWNER_PID_LISTENER,
+            0,
+        )
+    )
+    if status not in (0, _ERROR_INSUFFICIENT_BUFFER):
+        raise OSError(status, "GetExtendedTcpTable size query failed")
+
+    table = ctypes.create_string_buffer(size.value)
+    status = int(
+        api.GetExtendedTcpTable(
+            table,
+            ctypes.byref(size),
+            False,
+            _AF_INET,
+            _TCP_TABLE_OWNER_PID_LISTENER,
+            0,
+        )
+    )
+    if status != 0:
+        raise OSError(status, "GetExtendedTcpTable failed")
+
+    row_count = ctypes.cast(table, ctypes.POINTER(wintypes.DWORD)).contents.value
+    row_size = ctypes.sizeof(_MibTcpRowOwnerPid)
+    first_row = ctypes.addressof(table) + ctypes.sizeof(wintypes.DWORD)
+    ports: set[int] = set()
+    for index in range(row_count):
+        row = _MibTcpRowOwnerPid.from_address(first_row + index * row_size)
+        ports.add(socket.ntohs(int(row.dwLocalPort) & 0xFFFF))
+    return ports
+
+
+def _assert_wcferry_ports_idle(*, enabled: bool | None = None, iphlpapi=None) -> None:
+    if (os.name == "nt" if enabled is None else enabled) is False:
+        return
+    occupied = {WCFERRY_COMMAND_PORT, WCFERRY_MESSAGE_PORT} & _listening_ipv4_ports(
+        iphlpapi=iphlpapi
+    )
+    if occupied:
+        rendered = ", ".join(str(port) for port in sorted(occupied))
+        raise WcferryCleanupError(
+            f"检测到旧 WCFerry RPC 仍在监听端口 {rendered}；"
+            "为避免重复注入微信，本进程拒绝启动。"
+        )
+
+
+def _wait_for_wcferry_ports_released(
+    *,
+    enabled: bool | None = None,
+    timeout: float = 5.0,
+    poll_interval: float = 0.1,
+) -> None:
+    if (os.name == "nt" if enabled is None else enabled) is False:
+        return
+    deadline = time.monotonic() + timeout
+    occupied: set[int] = set()
+    while True:
+        occupied = {
+            WCFERRY_COMMAND_PORT,
+            WCFERRY_MESSAGE_PORT,
+        } & _listening_ipv4_ports()
+        if not occupied:
+            return
+        if time.monotonic() >= deadline:
+            rendered = ", ".join(str(port) for port in sorted(occupied))
+            raise WcferryCleanupError(
+                f"WxDestroySDK 返回后 WCFerry 端口仍在监听：{rendered}。"
+            )
+        time.sleep(poll_interval)
+
+
+def _wcferry_message_transport_ready(client) -> bool:
+    """Whether pynng has established WCFerry's message-channel pipe."""
+    msg_socket = getattr(client, "msg_socket", None)
+    if msg_socket is None:
+        return False
+    try:
+        return bool(msg_socket.pipes)
+    except Exception:
+        return False
+
+
+def _capture_wcferry_message_threads(
+    previous_threads: frozenset[Thread],
+) -> tuple[Thread, ...]:
+    """Find the internal receiver thread created by WCFerry 39.5.1."""
+    return tuple(
+        thread
+        for thread in enumerate_threads()
+        if thread not in previous_threads and thread.name == "GetMessage"
+    )
+
+
+class _WcferryLease:
+    """Persistent dirty marker; only proven native cleanup may remove it."""
+
+    def __init__(self, path: Path, *, enabled: bool | None = None) -> None:
+        self.path = path
+        self.enabled = os.name == "nt" if enabled is None else enabled
+        self._owned = False
+
+    @property
+    def owned(self) -> bool:
+        return self._owned
+
+    def acquire(self) -> None:
+        if not self.enabled or self._owned:
+            return
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        payload = {
+            "schema_version": 1,
+            "pid": os.getpid(),
+            "command_port": WCFERRY_COMMAND_PORT,
+            "created_at_unix": time.time(),
+        }
+        try:
+            with self.path.open("x", encoding="utf-8") as file:
+                json.dump(payload, file, ensure_ascii=False, indent=2)
+                file.flush()
+                os.fsync(file.fileno())
+        except FileExistsError as exc:
+            raise WcferryCleanupError(
+                f"检测到未清理的 WCFerry 安全标记：{self.path}。"
+                "请先完全退出并重新启动微信，确认没有其他 WCFerry 后再人工移除该文件。"
+            ) from exc
+        self._owned = True
+
+    def release(self) -> None:
+        if not self.enabled or not self._owned:
+            return
+        self.path.unlink()
+        self._owned = False
+
+
+def _wcferry_client_module(factory):
+    module_name = getattr(factory, "__module__", "")
+    if not module_name:
+        return None
+    try:
+        return importlib.import_module(module_name)
+    except ImportError:
+        return None
+
+
+def _construct_wcferry(factory, *, port: int, block: bool = False):
+    """Turn wcferry.client's Python-level os._exit calls into catchable errors."""
+    module = _wcferry_client_module(factory)
+    module_os = getattr(module, "os", None) if module is not None else None
+    if module_os is None:
+        return factory(port=port, block=block)
+
+    module.os = _WcferryOsProxy(module_os)
+    try:
+        return factory(port=port, block=block)
+    finally:
+        module.os = module_os
+
+
+async def _await_blocking_wcf_call(operation: Callable[[], object]):
+    """Let lifecycle control run without abandoning an in-flight socket call."""
+    task = asyncio.create_task(asyncio.to_thread(operation))
+    try:
+        return await asyncio.shield(task)
+    except asyncio.CancelledError:
+        # A WCFerry socket must not be closed while its worker thread is still
+        # using it.  Finish the bounded call, then let cancellation clean up.
+        try:
+            await asyncio.shield(task)
+        except BaseException:
+            pass
+        raise
+
+
+def _load_wcferry_sdk(factory):
+    module = _wcferry_client_module(factory)
+    module_file = getattr(module, "__file__", None) if module is not None else None
+    if not module_file:
+        raise WcferryCleanupError("无法定位 WCFerry sdk.dll，不能证明微信注入已清理。")
+    sdk_path = Path(module_file).resolve().parent / "sdk.dll"
+    if not sdk_path.is_file():
+        raise WcferryCleanupError(f"WCFerry sdk.dll 不存在：{sdk_path}")
+    return ctypes.cdll.LoadLibrary(str(sdk_path))
+
+
+def _destroy_wcferry_sdk(*, client=None, factory=None) -> None:
+    sdk = getattr(client, "sdk", None) if client is not None else None
+    if sdk is None:
+        if factory is None:
+            raise WcferryCleanupError("缺少 WCFerry SDK 句柄，不能证明微信注入已清理。")
+        sdk = _load_wcferry_sdk(factory)
+    destroy = sdk.WxDestroySDK
+    try:
+        destroy.argtypes = []
+        destroy.restype = ctypes.c_int
+    except AttributeError:
+        # Test doubles and alternative wrappers may expose a normal callable.
+        pass
+    status = int(destroy())
+    if status != 0:
+        raise WcferryCleanupError(
+            f"WxDestroySDK 返回 {status}；为避免第二个 WCFerry，本进程禁止自动重启。"
+        )
+
+
+def _cleanup_wcferry_client(
+    client,
+    *,
+    destroy_native: Callable[[], None] | None = None,
+    message_threads: tuple[Thread, ...] = (),
+    message_thread_capture_verified: bool = True,
+    message_thread_join_timeout: float = WCFERRY_MESSAGE_THREAD_JOIN_TIMEOUT_SECONDS,
+) -> None:
+    """Own the detach sequence so native success is observed exactly once."""
+    cleanup_error: BaseException | None = None
+    # Claim cleanup before any fallible operation. WCFerry's atexit and __del__
+    # callbacks both check this flag, while disable_recv_msg does not.
+    if hasattr(client, "_is_running"):
+        client._is_running = False
+
+    disable = getattr(client, "disable_recv_msg", None)
+    if callable(disable):
+        try:
+            disable()
+        except BaseException as exc:
+            cleanup_error = exc
+
+    if hasattr(client, "_is_receiving_msg"):
+        client._is_receiving_msg = False
+
+    # Closing the message socket must unblock WCFerry's hidden GetMessage
+    # thread. Native detach is forbidden until every captured thread is gone.
+    close = getattr(getattr(client, "msg_socket", None), "close", None)
+    if callable(close):
+        try:
+            close()
+        except BaseException as exc:
+            logger.warning("Failed to close WCFerry msg_socket: {}", exc)
+
+    if not message_thread_capture_verified:
+        raise WcferryCleanupError(
+            "无法唯一确认 WCFerry 内部消息线程身份；拒绝执行 native destroy。"
+        )
+    for thread in message_threads:
+        try:
+            thread.join(message_thread_join_timeout)
+        except BaseException as exc:
+            raise WcferryCleanupError(
+                "等待 WCFerry 内部消息线程退出失败；拒绝执行 native destroy。"
+            ) from exc
+        if thread.is_alive():
+            raise WcferryCleanupError(
+                "WCFerry 内部消息线程未退出；拒绝执行 native destroy。"
+            )
+
+    for attribute in ("cmd_socket",):
+        close = getattr(getattr(client, attribute, None), "close", None)
+        if callable(close):
+            try:
+                close()
+            except BaseException as exc:
+                logger.warning("Failed to close WCFerry {}: {}", attribute, exc)
+
+    is_local = getattr(client, "_local_mode", None)
+    if is_local is True:
+        if destroy_native is None:
+            _destroy_wcferry_sdk(client=client)
+        else:
+            destroy_native()
+    elif os.name == "nt" and is_local is not False:
+        raise WcferryCleanupError("无法确认 WCFerry 是否为本地注入模式。")
+
+    if cleanup_error is not None and is_local is not True:
+        raise WcferryCleanupError("WCFerry 客户端清理失败。") from cleanup_error
+
+
+def _arm_native_cleanup_watchdog(
+    *,
+    timeout: float = WCFERRY_NATIVE_CLEANUP_TIMEOUT_SECONDS,
+    timer_factory=Timer,
+):
+    timer = timer_factory(timeout, lambda: os._exit(NO_RESTART_EXIT_CODE))
+    timer.daemon = True
+    timer.start()
+    return timer
 
 
 class _WcferryLoguruHandler(logging.Handler):
@@ -159,11 +631,44 @@ class WeChatChannel(BaseChannel):
         bus: MessageBus,
         session_mode: str = "channel",
         groq_api_key: str | None = None,  # kept for compatibility, not used
+        wcferry_mutex: _WcferryInstanceMutex | None = None,
+        wcferry_lease: _WcferryLease | None = None,
+        wcferry_port_check: Callable[[], None] = _assert_wcferry_ports_idle,
+        wcferry_port_release_check: Callable[[], None] = (
+            _wait_for_wcferry_ports_released
+        ),
+        wcferry_cleanup_watchdog_factory: Callable[[], object] = (
+            _arm_native_cleanup_watchdog
+        ),
+        wcferry_message_transport_check: Callable[[object], bool] = (
+            _wcferry_message_transport_ready
+        ),
+        wcferry_message_thread_capture: Callable[
+            [frozenset[Thread]], tuple[Thread, ...]
+        ] = _capture_wcferry_message_threads,
     ):
         super().__init__(config, bus, session_mode)
         self.config: WeChatConfig = config
         self.wcf: Wcf | None = None
+        self._wcferry_mutex = wcferry_mutex or _WcferryInstanceMutex()
+        self._wcferry_lease = wcferry_lease or _WcferryLease(
+            get_data_path() / "control" / WCFERRY_LEASE_FILE
+        )
+        self._wcferry_port_check = wcferry_port_check
+        self._wcferry_port_release_check = wcferry_port_release_check
+        self._wcferry_cleanup_watchdog_factory = wcferry_cleanup_watchdog_factory
+        self._wcferry_message_transport_check = wcferry_message_transport_check
+        self._wcferry_message_thread_capture = wcferry_message_thread_capture
+        self._wcferry_cleanup_watchdog = None
+        self._wcferry_native_destroy_lock = Lock()
+        self._wcferry_native_destroy_state = "not_attempted"
+        self._wcferry_receiving_enable_attempted = False
+        self._wcferry_message_thread_verified = False
+        self._wcferry_message_threads: tuple[Thread, ...] = ()
+        self._lifecycle_lock = asyncio.Lock()
+        self._stop_requested = False
         self.wxid: str = ""
+        self._ready = False
         self._wechat_home: str = ""  # WeChat file storage base directory
         self._recv_thread: Thread | None = None
         self._loop: asyncio.AbstractEventLoop | None = None
@@ -184,42 +689,186 @@ class WeChatChannel(BaseChannel):
     async def start(self) -> None:
         """Start WeChat client and begin listening for messages."""
         if Wcf is None:
+            self._ready = False
             logger.error("wcferry not installed. Install with: pip install wcferry")
             return
 
-        self._running = True
-        self._loop = asyncio.get_event_loop()
-        await asyncio.to_thread(
-            prune_wechat_image_cache,
-            self._outbound_image_cache_root,
-            max_age_seconds=self._outbound_image_cache_ttl_seconds,
-        )
-
-        # Must precede Wcf() — its __init__ already logs through the WCF logger.
-        _configure_wcferry_logging_bridge()
-
+        construction_incomplete = False
+        startup_claimed = False
         try:
-            self.wcf = Wcf()
-            self.wxid = self.wcf.get_self_wxid()
-            # Get user info including home directory for file downloads
-            user_info = self.wcf.get_user_info()
-            self._wechat_home = user_info.get("home", "")
-            logger.info("WeChat connected as {} (home: {})", self.wxid, self._wechat_home)
-            # Load all contacts
-            self._load_contacts()
-        except Exception as e:
-            logger.error("Failed to connect to WeChat: {}", e)
-            return
+            async with self._lifecycle_lock:
+                if (
+                    self._running
+                    or self.wcf is not None
+                    or self._wcferry_mutex.held
+                    or self._wcferry_lease.owned
+                ):
+                    raise WcferryCleanupError(
+                        "WeChat channel 已经持有 WCFerry；拒绝重复启动第二个实例。"
+                    )
+                if self._stop_requested:
+                    self._running = False
+                    return
 
-        # Start message receiving
-        self.wcf.enable_receiving_msg()
-        self._recv_thread = Thread(target=self._recv_loop, daemon=True)
-        self._recv_thread.start()
-        logger.info("WeChat message receiver started")
+                startup_claimed = True
+                self._ready = False
+                self._running = True
+                self._loop = asyncio.get_running_loop()
+                await asyncio.to_thread(
+                    prune_wechat_image_cache,
+                    self._outbound_image_cache_root,
+                    max_age_seconds=self._outbound_image_cache_ttl_seconds,
+                )
+                if self._stop_requested:
+                    self._running = False
+                    return
 
-        # Keep running until stopped
-        while self._running:
-            await asyncio.sleep(1)
+                # Must precede Wcf() — its __init__ already logs through the WCF logger.
+                _configure_wcferry_logging_bridge()
+                self._wcferry_mutex.acquire()
+                self._wcferry_port_check()
+                try:
+                    self._wcferry_cleanup_watchdog = (
+                        self._wcferry_cleanup_watchdog_factory()
+                    )
+                except BaseException as exc:
+                    raise WcferryCleanupError(
+                        "无法为 WCFerry 构造阶段建立失败关闭 watchdog。"
+                    ) from exc
+
+                try:
+                    self._wcferry_lease.acquire()
+                    construction_task = asyncio.create_task(
+                        asyncio.to_thread(
+                            _construct_wcferry,
+                            Wcf,
+                            port=WCFERRY_COMMAND_PORT,
+                            block=False,
+                        )
+                    )
+                    try:
+                        try:
+                            self.wcf = await asyncio.shield(construction_task)
+                        except asyncio.CancelledError:
+                            try:
+                                self.wcf = await asyncio.shield(construction_task)
+                            except BaseException:
+                                construction_incomplete = True
+                                raise
+                            raise
+                    except BaseException:
+                        construction_incomplete = True
+                        raise
+                finally:
+                    self._wcferry_cleanup_watchdog.cancel()
+                    self._wcferry_cleanup_watchdog = None
+
+                while True:
+                    if self._stop_requested:
+                        self._running = False
+                        return
+                    logged_in = await _await_blocking_wcf_call(self.wcf.is_login)
+                    if self._stop_requested:
+                        self._running = False
+                        return
+                    if logged_in:
+                        break
+                    await asyncio.sleep(WECHAT_LOGIN_POLL_INTERVAL_SECONDS)
+
+                self.wxid = await _await_blocking_wcf_call(self.wcf.get_self_wxid)
+                if self._stop_requested:
+                    self._running = False
+                    return
+                # Get user info including home directory for file downloads
+                user_info = await _await_blocking_wcf_call(self.wcf.get_user_info)
+                if self._stop_requested:
+                    self._running = False
+                    return
+                self._wechat_home = user_info.get("home", "")
+                logger.info(
+                    "WeChat connected as {} (home: {})",
+                    self.wxid,
+                    self._wechat_home,
+                )
+                # Load all contacts
+                await _await_blocking_wcf_call(self._load_contacts)
+                if self._stop_requested:
+                    self._running = False
+                    return
+                # Start message receiving
+                threads_before = frozenset(enumerate_threads())
+                self._wcferry_receiving_enable_attempted = True
+                try:
+                    receiving_enabled = await _await_blocking_wcf_call(
+                        self.wcf.enable_receiving_msg
+                    )
+                finally:
+                    self._wcferry_message_threads = tuple(
+                        self._wcferry_message_thread_capture(threads_before)
+                    )
+                    self._wcferry_message_thread_verified = (
+                        len(self._wcferry_message_threads) == 1
+                    )
+                if self._stop_requested:
+                    self._running = False
+                    return
+                if receiving_enabled is not True:
+                    raise RuntimeError("WCFerry 拒绝启动消息接收；可能存在残留注入。")
+                if len(self._wcferry_message_threads) != 1:
+                    raise RuntimeError(
+                        "无法唯一确认 WCFerry 内部消息线程，拒绝把微信渠道标记为 ready。"
+                    )
+                loop = asyncio.get_running_loop()
+                transport_deadline = (
+                    loop.time() + WECHAT_MESSAGE_TRANSPORT_READY_TIMEOUT_SECONDS
+                )
+                while not (
+                    self._wcferry_message_threads[0].is_alive()
+                    and self._wcferry_message_transport_check(self.wcf)
+                ):
+                    if self._stop_requested:
+                        self._running = False
+                        return
+                    if not self._wcferry_message_threads[0].is_alive():
+                        raise RuntimeError(
+                            "WCFerry 内部消息线程已退出，拒绝把微信渠道标记为 ready。"
+                        )
+                    if loop.time() >= transport_deadline:
+                        raise RuntimeError(
+                            "WCFerry 消息 socket 未建立，拒绝把微信渠道标记为 ready。"
+                        )
+                    await asyncio.sleep(
+                        WECHAT_MESSAGE_TRANSPORT_POLL_INTERVAL_SECONDS
+                    )
+                self._recv_thread = Thread(target=self._recv_loop, daemon=True)
+                self._ready = True
+                self._recv_thread.start()
+                logger.info("WeChat message receiver started")
+
+            # Keep running until stopped
+            while self._running:
+                await asyncio.sleep(WECHAT_RECEIVER_HEALTH_INTERVAL_SECONDS)
+                if self._running and not self.is_ready:
+                    raise RuntimeError("WeChat receiver stopped unexpectedly")
+        except BaseException as exc:
+            if not startup_claimed:
+                raise
+            self._ready = False
+            self._running = False
+            if isinstance(exc, Exception):
+                logger.error("WeChat channel failed: {}", exc)
+            try:
+                await self.stop()
+            except BaseException as stop_exc:
+                logger.opt(exception=stop_exc).error(
+                    "Failed to clean up WeChat after startup error"
+                )
+                raise stop_exc from exc
+            if construction_incomplete:
+                raise WcferryCleanupError(
+                    "WCFerry 构造未完整返回；即使已尝试清理，也禁止自动重启。"
+                ) from exc
+            raise
 
     def _load_contacts(self) -> None:
         """Load full Contact records from WeChat database (nickname + alias + remark)."""
@@ -290,18 +939,21 @@ class WeChatChannel(BaseChannel):
 
     def _recv_loop(self) -> None:
         """Background thread for receiving messages from wcferry."""
-        while self.wcf and self.wcf.is_receiving_msg():
-            try:
-                msg = self.wcf.get_msg()
-                if self._loop:
-                    asyncio.run_coroutine_threadsafe(
-                        self._process_msg(msg),
-                        self._loop
-                    )
-            except Empty:
-                continue
-            except Exception as e:
-                logger.error("Error receiving WeChat message: {}", e)
+        try:
+            while self.wcf and self.wcf.is_receiving_msg():
+                try:
+                    msg = self.wcf.get_msg()
+                    if self._loop:
+                        asyncio.run_coroutine_threadsafe(
+                            self._process_msg(msg),
+                            self._loop
+                        )
+                except Empty:
+                    continue
+                except Exception as e:
+                    logger.error("Error receiving WeChat message: {}", e)
+        finally:
+            self._ready = False
 
     async def _process_msg(self, msg: WxMsg) -> None:
         """Process incoming WeChat message."""
@@ -416,6 +1068,7 @@ class WeChatChannel(BaseChannel):
                 "sender_name": sender_name,
                 "respond": should_respond,
                 "msg_type": msg.type,
+                "message_id": str(msg.id) if getattr(msg, "id", None) is not None else None,
             }
         )
 
@@ -693,17 +1346,19 @@ class WeChatChannel(BaseChannel):
                 f"{status}/{fallback_status}"
             )
 
-    async def send(self, msg: OutboundMessage) -> None:
+    async def send(self, msg: OutboundMessage) -> bool:
         """Send a message through WeChat, including media if present."""
         if not self.wcf:
             logger.warning("WeChat not connected")
-            return
+            return False
 
         async with self._send_lock:
+            delivered = True
             # Send media files first
             for file_path in msg.media:
                 if not os.path.isfile(file_path):
                     logger.warning("Media file not found: {}", file_path)
+                    delivered = False
                     continue
                 ext = os.path.splitext(file_path)[1].lower()
                 try:
@@ -718,6 +1373,7 @@ class WeChatChannel(BaseChannel):
                         logger.debug("Submitted file to {}: {}", msg.chat_id, file_path)
                 except (Exception, SystemExit) as exc:
                     logger.error("Failed to send WeChat media {}: {}", file_path, exc)
+                    delivered = False
 
             # Send text content
             if msg.content and msg.content.strip():
@@ -739,6 +1395,28 @@ class WeChatChannel(BaseChannel):
                     )
                 except (Exception, SystemExit) as exc:
                     logger.error("Failed to send WeChat message: {}", exc)
+                    delivered = False
+            return delivered
+
+    @property
+    def is_ready(self) -> bool:
+        """WCFerry is ready only after its receiver thread has started."""
+        structurally_ready = (
+            self._ready
+            and self._running
+            and self.wcf is not None
+            and self._recv_thread is not None
+            and self._recv_thread.is_alive()
+            and len(self._wcferry_message_threads) == 1
+            and self._wcferry_message_threads[0].is_alive()
+            and self._wcferry_message_transport_check(self.wcf)
+        )
+        if not structurally_ready:
+            return False
+        try:
+            return bool(self.wcf.is_receiving_msg())
+        except Exception:
+            return False
 
     async def get_group_members(self, chat_id: str) -> list[dict[str, object]]:
         """Return member records for a WeChat group.
@@ -785,29 +1463,105 @@ class WeChatChannel(BaseChannel):
 
     async def stop(self) -> None:
         """Stop WeChat client."""
+        self._ready = False
         self._running = False
+        self._stop_requested = True
+        async with self._lifecycle_lock:
+            await self._stop_locked()
 
-        if self.wcf:
+    async def _stop_locked(self) -> None:
+        """Stop WCFerry while holding the lifecycle lock."""
+        cleanup_safe = self.wcf is None and not self._wcferry_lease.owned
+        if (
+            (self.wcf is not None or self._wcferry_lease.owned)
+            and self._wcferry_cleanup_watchdog is None
+        ):
             try:
-                self.wcf.disable_recv_msg()
-                logger.info("WeChat message receiver stopped")
-            except (Exception, SystemExit) as e:
-                logger.error("Error stopping WeChat: {}", e)
-            self.wcf = None
-
-        cleanup_tasks = list(self._outbound_image_cleanup_tasks)
-        for task in cleanup_tasks:
-            task.cancel()
-        if cleanup_tasks:
-            await asyncio.gather(*cleanup_tasks, return_exceptions=True)
-        await asyncio.to_thread(
-            prune_wechat_image_cache,
-            self._outbound_image_cache,
-            max_age_seconds=0,
-        )
+                self._wcferry_cleanup_watchdog = (
+                    self._wcferry_cleanup_watchdog_factory()
+                )
+            except BaseException as exc:
+                logger.opt(exception=exc).error(
+                    "Unable to arm native WCFerry cleanup watchdog"
+                )
         try:
-            self._outbound_image_cache.rmdir()
-        except OSError:
-            pass
+            if self.wcf:
+                client = self.wcf
+                _cleanup_wcferry_client(
+                    client,
+                    destroy_native=lambda: self._destroy_wcferry_once(client=client),
+                    message_threads=self._wcferry_message_threads,
+                    message_thread_capture_verified=(
+                        not self._wcferry_receiving_enable_attempted
+                        or self._wcferry_message_thread_verified
+                    ),
+                )
+                self._wcferry_port_release_check()
+                cleanup_safe = True
+                logger.info("WCFerry detached from WeChat safely")
+                self.wcf = None
+            elif self._wcferry_lease.owned:
+                self._destroy_wcferry_once(factory=Wcf)
+                self._wcferry_port_release_check()
+                cleanup_safe = True
 
-        self._recv_thread = None
+            cleanup_tasks = list(self._outbound_image_cleanup_tasks)
+            for task in cleanup_tasks:
+                task.cancel()
+            if cleanup_tasks:
+                await asyncio.gather(*cleanup_tasks, return_exceptions=True)
+            try:
+                await asyncio.to_thread(
+                    prune_wechat_image_cache,
+                    self._outbound_image_cache,
+                    max_age_seconds=0,
+                )
+                try:
+                    self._outbound_image_cache.rmdir()
+                except OSError:
+                    pass
+            except BaseException as exc:
+                logger.opt(exception=exc).warning(
+                    "Failed to clean WeChat outbound image cache"
+                )
+        finally:
+            self._recv_thread = None
+            if cleanup_safe:
+                try:
+                    if self.wcf is not None:
+                        raise WcferryCleanupError(
+                            "WCFerry cleanup state changed before lease release."
+                        )
+                    self._wcferry_lease.release()
+                    if self.wcf is not None or self._wcferry_lease.owned:
+                        raise WcferryCleanupError(
+                            "WCFerry lease could not be proven clear."
+                        )
+                    self._wcferry_mutex.release()
+                finally:
+                    if self._wcferry_cleanup_watchdog is not None:
+                        self._wcferry_cleanup_watchdog.cancel()
+                        self._wcferry_cleanup_watchdog = None
+
+    def _destroy_wcferry_once(self, *, client=None, factory=None) -> None:
+        """Attempt native detach at most once for this channel instance."""
+        with self._wcferry_native_destroy_lock:
+            if self._wcferry_native_destroy_state == "succeeded":
+                return
+            if self._wcferry_native_destroy_state == "in_progress":
+                raise WcferryCleanupError(
+                    "本进程正在执行 WxDestroySDK；为避免并发重复卸载，拒绝再次调用。"
+                )
+            if self._wcferry_native_destroy_state == "failed":
+                raise WcferryCleanupError(
+                    "本进程此前的 WxDestroySDK 已失败；为避免重复卸载，拒绝再次调用。"
+                )
+            self._wcferry_native_destroy_state = "in_progress"
+        try:
+            _destroy_wcferry_sdk(client=client, factory=factory)
+        except BaseException:
+            with self._wcferry_native_destroy_lock:
+                self._wcferry_native_destroy_state = "failed"
+            raise
+        with self._wcferry_native_destroy_lock:
+            self._wcferry_native_destroy_state = "succeeded"
