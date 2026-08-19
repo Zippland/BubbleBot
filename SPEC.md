@@ -151,7 +151,7 @@ Bubbles 以**单一二进制 CLI（`bubbles`）**对外暴露能力，没有 GUI
 | QQ         | ✓            | —                              | AppID + Secret          | 基于官方 botpy。                                      |
 | Slack      | DM 策略可控  | 由 `group_policy` 决定          | Bot Token + App Token   | Socket Mode。                                         |
 | Telegram   | ✓            | @ 触发                         | Bot Token              | 可走代理。                                            |
-| WeChat     | ✓            | @ 触发                         | wcferry（仅 Windows）   | 可压缩的静态大图使用有界 JPEG 副本，原图保持不变。     |
+| WeChat     | ✓            | 原生 @ 或正文包含“泡泡”触发 | wcferry（仅 Windows）   | 可压缩的静态大图使用有界 JPEG 副本，原图保持不变。     |
 | WhatsApp   | ✓            | 群聊 @ 触发                    | 扫码（经 Node.js 网桥） | 唯一一个需要外部进程协作的渠道。                       |
 
 微信出站图片默认控制在 `1 MiB`、长边 `1280px` 内；这是 WCFerry 的经验性可靠性预算而非协议上限，可通过 `channels.wechat.outboundImageMaxBytes` 和 `channels.wechat.outboundImageMaxEdge` 调整。超出预算的动画、不可解码或无法压入预算的图片降级为文件发送。
@@ -159,7 +159,7 @@ Bubbles 以**单一二进制 CLI（`bubbles`）**对外暴露能力，没有 GUI
 **所有渠道的统一契约**：
 
 1. **白名单**：每个渠道支持 `allow_from`（用户/账号粒度）作为最小权限模型；空列表的语义由各渠道的实现决定，但产品层规则是"默认应保守，公开访问需用户显式同意"。
-2. **群聊触发策略**：群聊默认"被 @ 才回"；私聊默认全回；具体策略字段（如 `group_policy` / `mention.require_in_groups`）属配置层细节，由 `Channels Config` 字段定义。
+2. **群聊触发策略**：群聊默认"被 @ 才回"；微信额外支持正文包含“泡泡”时唤醒；私聊默认全回。具体策略字段（如 `group_policy` / `mention.require_in_groups`）属配置层细节，由 `Channels Config` 字段定义。
 3. **群聊标注**：每条入站消息必须在 metadata 里标注是否来自群聊（标准字段 `is_group: bool`，缺省视为 `false` / 私聊）。这是错误反馈策略与触发策略统一处理的依据，新增渠道必须实现。
 4. **媒体支持**：渠道实现负责把图片 / 文件下载到会话工作目录的 `data/` 下，作为路径传入对话上下文。
 5. **回执**：助手回复可附带"进度文字"与"工具调用提示"，是否启用由 `channels.send_progress` 与 `channels.send_tool_hints` 控制。
@@ -273,7 +273,7 @@ Bubbles 以**单一二进制 CLI（`bubbles`）**对外暴露能力，没有 GUI
 - 任务列表持久化在 `~/.bubbles/cron/jobs.json`，与会话目录平级。
 - **会话隔离（仅 agent 工具）**：模型可调用的 `cron` 工具的 `list` / `remove` 严格限定在当前会话——只看得到、只删得掉本会话创建的 job。其他会话的 job 既不出现在 `list` 返回中，对 `remove` 也一律返回与"不存在"完全相同的错误文案（不通过错误信息泄露其他会话的 job id）。CLI（`bubbles cron …`）保持全局视角不受此限，是跨会话运维入口。
 - **系统触发 turn 不可用 `cron` 工具**：cron job 与心跳触发的 agent turn（即"系统触发 turn"，与 `stay_silent` 同款判断）期间，模型完全看不到 `cron` 工具——无论 add / list / remove 都不可用。防止"一次触发 → 注册更多 job → 雪崩"的嵌套；triggered turn 想表达"完成后自删"等语义请走声明式字段（如 `delete_after_run`），不要走运行时再调度。
-- **沉默信号 `stay_silent`**：cron job 触发的 agent turn（以及任何系统触发的周期/事件 turn，如群聊心跳）可调 `stay_silent` 工具表达"本轮判断无需动作"——调后不向 channel 发出任何 outbound，也不写回会话历史。这是"看一眼条件、不满足就别说话"模式的标准实现方式。该工具仅在系统触发的 turn 里注册，用户直接发问的 turn 看不到。
+- **沉默信号 `stay_silent`**：主 Agent 的所有用户/系统 turn 都可调用无参数工具 `stay_silent()` 表达"本轮无需回复"。调用后立即结束循环，该模型响应携带的文本 progress / 工具提示不会发出，也不生成最终回复或空回复的兜底文案。用户/系统入站消息仍保留在审计日志中；`stay_silent` 的 assistant/tool 控制记录会标记为 context-excluded，不污染后续模型上下文。它无法撤回此前已发送的消息或已执行的副作用，因此应尽早、单独调用。
 - **崩溃安全**：服务按 `next_run_at_ms` 锚点对齐持久化（每个 `every` job 在创建时锁定 anchor，重启后按原节奏继续不漂移）；执行前 pre-advance + 写盘，崩溃也不会重发。
 - **失败退避**：连续失败按 30s / 1m / 5m / 15m / 60m 指数退避，避开 API rate-limit 风暴；成功后自动清零。一次性 `at` 任务失败不进退避（一次性，下次也不会跑）。
 

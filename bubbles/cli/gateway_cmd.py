@@ -82,7 +82,7 @@ def gateway(
         """Execute a cron job through the agent.
 
         Uses the system-triggered tool-set for the duration of the turn:
-        - ``stay_silent`` is added so the model can opt out of delivery.
+        - ``stay_silent`` remains available, as it is in every turn.
         - ``cron`` is removed so a triggered turn cannot schedule more jobs
           (no recursive job creation; see SPEC §5.6).
         """

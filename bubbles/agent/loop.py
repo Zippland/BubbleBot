@@ -43,10 +43,12 @@ from bubbles.agent.commands import (
 )
 from bubbles.agent.context import ContextBuilder
 from bubbles.agent.turn import (
+    TurnState,
+    compact_for_turn,
     do_compact,
-    mid_loop_compact,
+    persist_failed_turn,
+    persist_turn_state,
     process_system_message,
-    save_turn,
     should_compact,
 )
 from bubbles.agent.subagent import SubagentManager
@@ -58,6 +60,7 @@ from bubbles.agent.tools.message import MessageTool
 from bubbles.agent.tools.registry import ToolRegistry
 from bubbles.agent.tools.shell import ExecTool
 from bubbles.agent.tools.spawn import SpawnTool
+from bubbles.agent.tools.stay_silent import STAY_SILENT_SENTINEL, StaySilentTool
 from bubbles.agent.tools.task import TaskListTool, TaskGetTool, TaskCreateTool, TaskUpdateTool
 from bubbles.agent.tools.web import WebFetchTool, WebSearchTool
 from bubbles.sandbox.manager import SandboxManager
@@ -201,6 +204,7 @@ class AgentLoop:
         self.tools.register(WebSearchTool(api_key=self.tavily_api_key))
         self.tools.register(WebFetchTool())
         self.tools.register(MessageTool(send_callback=self.bus.publish_outbound))
+        self.tools.register(StaySilentTool())
         if self.image_generation_backend is not None:
             self.tools.register(GenerateImageTool(self.image_generation_backend))
         self.tools.register(SpawnTool(manager=self.subagents))
@@ -253,6 +257,7 @@ class AgentLoop:
         message.set_session_dir(session_dir)
         message.start_turn()
         reg.register(message)
+        reg.register(StaySilentTool())
 
         image_generation_backend = getattr(self, "image_generation_backend", None)
         if image_generation_backend is not None:
@@ -265,12 +270,9 @@ class AgentLoop:
         spawn.set_session_dir(session_dir)
         reg.register(spawn)
 
-        # System-triggered turns may not schedule further jobs (SPEC §5.6),
-        # and get stay_silent so the model can opt out of delivery.
-        if system_triggered:
-            from bubbles.agent.tools.stay_silent import StaySilentTool
-            reg.register(StaySilentTool())
-        elif self.cron_service:
+        # System-triggered turns may not schedule further jobs (SPEC §5.6).
+        # stay_silent is registered above for every turn.
+        if not system_triggered and self.cron_service:
             cron = CronTool(self.cron_service)
             cron.set_context(channel, chat_id, session_key)
             reg.register(cron)
@@ -382,6 +384,7 @@ class AgentLoop:
         temperature: float,
         max_tokens: int,
         session: Session,
+        turn_state: TurnState | None = None,
         tools: ToolRegistry | None = None,
         on_progress: Callable[..., Awaitable[None]] | None = None,
     ) -> tuple[Any, list[dict]]:
@@ -393,8 +396,15 @@ class AgentLoop:
         重试放在这一层而不是 provider：只有这里能做 context_overflow 的恢复
         动作（压缩历史后重试），provider 看不到 session。
         """
+        if turn_state is None:
+            system_count = 1 if messages and messages[0].get("role") == "system" else 0
+            turn_state = TurnState(
+                system_prefix=list(messages[:system_count]),
+                messages=list(messages[system_count:]),
+            )
+
         attempt = 0
-        compacted_once = False
+        overflow_recovery_attempted = False
 
         while True:
             attempt += 1
@@ -418,16 +428,31 @@ class AgentLoop:
                     raise
 
                 if e.kind is LLMErrorKind.CONTEXT_OVERFLOW:
-                    # 压缩一次就够：压完还超说明不是历史长度的问题，
-                    # 再压只会把上下文越削越少却仍然失败。
-                    if compacted_once:
+                    # Preflight compaction is estimator-driven and may only have
+                    # reduced history.  A real provider overflow still gets one
+                    # stronger recovery attempt that also compacts completed
+                    # active tool groups.  A second real overflow is terminal.
+                    if overflow_recovery_attempted:
                         logger.error(
                             "Context still overflowing after compaction for session {}", session.key,
                         )
                         raise
-                    compacted_once = True
+                    overflow_recovery_attempted = True
                     logger.warning("Context overflow for session {}; compacting and retrying", session.key)
-                    messages = await mid_loop_compact(self, session, messages, on_progress)
+                    messages, result = await compact_for_turn(
+                        self,
+                        session,
+                        turn_state,
+                        on_progress,
+                        force_active=True,
+                    )
+                    if not result.success:
+                        logger.error(
+                            "Context compaction made no progress for session {}: {}",
+                            session.key,
+                            result.error,
+                        )
+                        raise
                     continue
 
                 delay = e.retry_after if e.retry_after is not None else API_RETRY_BASE_DELAY_SEC * (2 ** (attempt - 1))
@@ -446,9 +471,10 @@ class AgentLoop:
         should_stop: Callable[[], bool] | None = None,
         on_tool_call: Callable[[str, dict, str | None], Awaitable[None]] | None = None,
         tools: ToolRegistry | None = None,
+        turn_state: TurnState | None = None,
     ) -> tuple[str | None, list[str], list[dict]]:
         """Run the agent iteration loop. Returns (final_content, tools_used, messages)."""
-        messages = initial_messages
+        messages = list(initial_messages)
         iteration = 0
         final_content = None
         tools_used: list[str] = []
@@ -459,12 +485,35 @@ class AgentLoop:
         if not session:
             raise ValueError("Session is required for agent loop")
         context = self._get_context(session)
+        if turn_state is None:
+            # Backward-compatible default for direct/internal callers. Production
+            # callers pass the exact ContextBuilder boundary explicitly.
+            system_count = 1 if messages and messages[0].get("role") == "system" else 0
+            turn_state = TurnState(
+                system_prefix=list(messages[:system_count]),
+                messages=list(messages[system_count:]),
+            )
 
         # Use session config if available, otherwise use defaults
         cfg = session.config if session else None
         model = (cfg.model if cfg and cfg.model else self.model)
         temperature = (cfg.temperature if cfg and cfg.temperature is not None else self.temperature)
         max_tokens = (cfg.max_tokens if cfg and cfg.max_tokens else self.max_tokens)
+
+        def _drain_injections() -> int:
+            nonlocal messages
+            injected = self._take_injections(session.key)
+            if not injected:
+                return 0
+            appended_from = len(messages)
+            messages = context.add_user_messages(messages, injected)
+            turn_state.capture_appended(messages, appended_from)
+            logger.info(
+                "Injected {} mid-turn message(s) into session {}",
+                len(injected),
+                session.key,
+            )
+            return len(injected)
 
         while iteration < self.max_iterations:
             iteration += 1
@@ -478,15 +527,26 @@ class AgentLoop:
             # assistant(tool_calls) 与它的 tool_result 之间不允许插 user 消息，
             # 所以「下一次工具调用之前」就是循环顶部。放在 compaction 之前，
             # 注入的内容才会被计入 token 估算。
-            if injected := self._take_injections(session.key):
-                messages = context.add_user_messages(messages, injected)
-                logger.info(
-                    "Injected {} mid-turn message(s) into session {}", len(injected), session.key,
-                )
+            _drain_injections()
 
             # Auto-compaction: check if context is overflowing (pre-call estimation)
-            if should_compact(self,messages):
-                messages = await mid_loop_compact(self, session, messages, on_progress)
+            if should_compact(self, messages, session):
+                messages, _ = await compact_for_turn(
+                    self,
+                    session,
+                    turn_state,
+                    on_progress,
+                )
+                # Summarization is an awaited provider call.  Messages that
+                # arrived during it must influence the main request, not wait in
+                # a queue that may outlive this turn.
+                if _drain_injections() and should_compact(self, messages, session):
+                    messages, _ = await compact_for_turn(
+                        self,
+                        session,
+                        turn_state,
+                        on_progress,
+                    )
 
             response, messages = await self._chat_with_retry(
                 model=model,
@@ -494,16 +554,34 @@ class AgentLoop:
                 temperature=temperature,
                 max_tokens=max_tokens,
                 session=session,
+                turn_state=turn_state,
                 tools=tools,
                 on_progress=on_progress,
             )
 
             if response.has_tool_calls:
-                if on_progress:
+                silent_call = next(
+                    (tc for tc in response.tool_calls if tc.name == "stay_silent"),
+                    None,
+                )
+                # A silence decision takes precedence over parallel tool calls.
+                # Executing the other calls could create side effects that silence
+                # cannot undo, and persisting unmatched calls would violate the
+                # assistant(tool_calls) -> tool-result protocol.
+                effective_tool_calls = [silent_call] if silent_call else response.tool_calls
+                if silent_call and len(response.tool_calls) > 1:
+                    logger.warning(
+                        "stay_silent was mixed with {} other tool call(s); ignoring them",
+                        len(response.tool_calls) - 1,
+                    )
+
+                # Do not leak the model's preamble or a tool hint for a turn that
+                # is about to end silently.
+                if on_progress and not silent_call:
                     clean = self._strip_think(response.content)
                     if clean:
                         await on_progress(clean)
-                    await on_progress(self._tool_hint(response.tool_calls), tool_hint=True)
+                    await on_progress(self._tool_hint(effective_tool_calls), tool_hint=True)
 
                 tool_call_dicts = [
                     {
@@ -514,14 +592,17 @@ class AgentLoop:
                             "arguments": json.dumps(tc.arguments, ensure_ascii=False)
                         }
                     }
-                    for tc in response.tool_calls
+                    for tc in effective_tool_calls
                 ]
+                appended_from = len(messages)
                 messages = context.add_assistant_message(
                     messages, response.content, tool_call_dicts,
                     reasoning_content=response.reasoning_content,
                 )
+                turn_state.capture_appended(messages, appended_from)
+                control_messages = list(messages[appended_from:]) if silent_call else []
 
-                for tool_call in response.tool_calls:
+                for tool_call in effective_tool_calls:
                     tools_used.append(tool_call.name)
                     args_str = json.dumps(tool_call.arguments, ensure_ascii=False)
                     logger.info("Tool call: {}({})", tool_call.name, args_str[:200])
@@ -530,9 +611,23 @@ class AgentLoop:
                     result = await tools.execute(tool_call.name, tool_call.arguments)
                     if on_tool_call:
                         await on_tool_call(tool_call.name, tool_call.arguments, result)
+                    appended_from = len(messages)
                     messages = context.add_tool_result(
                         messages, tool_call.id, tool_call.name, result
                     )
+                    turn_state.capture_appended(messages, appended_from)
+                    if tool_call.name == "stay_silent" and result == STAY_SILENT_SENTINEL:
+                        control_messages.extend(messages[appended_from:])
+                        turn_state.context_excluded_message_ids.update(
+                            id(message) for message in control_messages
+                        )
+                        turn_state.suppress_outbound = True
+                        final_content = None
+                        logger.info("stay_silent requested; ending agent loop")
+                        break
+
+                if turn_state.suppress_outbound:
+                    break
 
                 # Check for duplicate message sends (loop detection)
                 if message_tool := tools.get("message"):
@@ -544,15 +639,24 @@ class AgentLoop:
                 final_content = self._strip_think(response.content)
                 # Add final assistant message to history
                 if final_content:
+                    appended_from = len(messages)
                     messages = context.add_assistant_message(messages, final_content, None)
+                    turn_state.capture_appended(messages, appended_from)
                 break
 
-        if final_content is None and iteration >= self.max_iterations:
+        if (
+            final_content is None
+            and iteration >= self.max_iterations
+            and not turn_state.suppress_outbound
+        ):
             logger.warning("Max iterations ({}) reached", self.max_iterations)
             final_content = (
                 f"I reached the maximum number of tool call iterations ({self.max_iterations}) "
                 "without completing the task. You can try breaking the task into smaller steps."
             )
+            appended_from = len(messages)
+            messages = context.add_assistant_message(messages, final_content, None)
+            turn_state.capture_appended(messages, appended_from)
 
         return final_content, tools_used, messages
 
@@ -582,6 +686,9 @@ class AgentLoop:
             # 该 session 正在跑 turn 且这条不是命令 → 插进当前 turn，而不是
             # 排队等它跑完（最多 40 轮迭代，用户可能要等几分钟）。
             if self._has_active_turn(key) and not self._is_command(msg):
+                if msg.media:
+                    session = self.sessions.get_or_create(key)
+                    msg.media = relocate_media_to_session(msg.media, session)
                 self._pending_injections.setdefault(key, []).append(msg)
                 logger.info("Queued mid-turn injection for session {}", key)
                 continue
@@ -596,6 +703,17 @@ class AgentLoop:
             tasks.remove(task)
         if tasks == []:
             self._active_tasks.pop(key, None)
+            # A message can arrive after the loop's last injection drain but
+            # before this task's done callback.  Promote the oldest one to a new
+            # turn and leave the remainder queued so that turn absorbs them.
+            pending = self._pending_injections.get(key) if self._running else None
+            if pending:
+                next_message = pending.pop(0)
+                if not pending:
+                    self._pending_injections.pop(key, None)
+                next_task = asyncio.create_task(self._dispatch(next_message))
+                self._active_tasks.setdefault(key, []).append(next_task)
+                next_task.add_done_callback(lambda t, k=key: self._forget_task(k, t))
 
     def _has_active_turn(self, key: str) -> bool:
         return any(not t.done() for t in self._active_tasks.get(key, []))
@@ -946,28 +1064,10 @@ class AgentLoop:
             sender_name=msg.metadata.get("sender_name"),
             system_prompt_extra=session.config.system_prompt,
             session_bindings=get_bindings_for_session(self._session_bindings, session.key),
+            heartbeat_info=build_heartbeat_info(self.cron_service, session.key),
             work_dir=sandbox.root,
         )
-
-        # Entry compaction: check if context is overflowing before entering loop
-        if should_compact(self,initial_messages):
-            logger.info("Entry compaction triggered for session {}", session.key)
-            await do_compact(self,session)
-            self.sessions.save(session)
-            # Rebuild messages with compacted history
-            history = session.get_history(max_messages=self.memory_window)
-            initial_messages = context.build_messages(
-                history=history,
-                current_message=msg.content,
-                media=media,
-                channel=msg.channel, chat_id=msg.chat_id,
-                sender_id=msg.sender_id,
-                sender_name=msg.metadata.get("sender_name"),
-                system_prompt_extra=session.config.system_prompt,
-                session_bindings=get_bindings_for_session(self._session_bindings, session.key),
-                heartbeat_info=build_heartbeat_info(self.cron_service, session.key),
-                work_dir=sandbox.root,
-            )
+        turn_state = TurnState.from_context_messages(initial_messages, len(history))
 
         # Track progress messages to detect loops
         _sent_progress: set[str] = set()
@@ -991,20 +1091,33 @@ class AgentLoop:
                 channel=msg.channel, chat_id=msg.chat_id, content=content, metadata=meta,
             ))
 
-        final_content, _, all_msgs = await self._run_agent_loop(
-            initial_messages,
-            on_progress=on_progress or _bus_progress,
-            session=session,
-            should_stop=lambda: _progress_loop_detected,
-            on_tool_call=on_tool_call,
-            tools=turn_tools,
-        )
+        try:
+            final_content, _, _ = await self._run_agent_loop(
+                initial_messages,
+                on_progress=on_progress or _bus_progress,
+                session=session,
+                should_stop=lambda: _progress_loop_detected,
+                on_tool_call=on_tool_call,
+                tools=turn_tools,
+                turn_state=turn_state,
+            )
+        except BaseException:
+            try:
+                persist_failed_turn(session, turn_state)
+                self.sessions.save(session)
+            except Exception as persist_error:
+                logger.exception("Failed to persist interrupted turn: {}", persist_error)
+            raise
+
+        persist_turn_state(session, turn_state)
+        self.sessions.save(session)
+
+        if turn_state.suppress_outbound:
+            logger.info("Turn ended silently for session {}", session.key)
+            return None
 
         if final_content is None:
             final_content = "I've completed processing but have no response to give."
-
-        save_turn(session, all_msgs, 1 + len(history))
-        self.sessions.save(session)
 
         if (mt := turn_tools.get("message")) and isinstance(mt, MessageTool) and mt._sent_in_turn:
             return None
@@ -1032,8 +1145,8 @@ class AgentLoop:
         2. Default: f"{channel}:{chat_id}"
 
         ``system_triggered=True`` marks a turn the user didn't ask for (cron /
-        heartbeat): the model gains ``stay_silent`` and loses ``cron`` (no
-        recursive job creation, SPEC §5.6), and failures stay silent.
+        heartbeat): the model keeps globally available ``stay_silent`` but loses
+        ``cron`` (no recursive job creation, SPEC §5.6), and failures stay silent.
 
         Returns ``(response_text, tools_used)``. ``tools_used`` lists tool names
         invoked during the turn — callers can check for sentinel tools like
