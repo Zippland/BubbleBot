@@ -1,5 +1,5 @@
-Call this ONLY during a system-triggered turn (heartbeat scan, scheduled cron tick, or any other periodic / autonomous wake-up) when you decide NOT to act this cycle.
+End the current turn without sending any reply to the user or channel.
 
-The runner periodically wakes you to inspect some context (recent group messages, a workspace file, a scheduled check, etc.). If after looking you judge nothing is worth sending or doing right now (off-topic, already handled, casual chatter you can't add to, condition not met), call this tool. The agent loop ends and nothing is sent to the outbound channel.
+Call this with no arguments when silence is genuinely the best response: for example, a group message matched your name incidentally ("泡泡玛特" / "泡泡浴"), casual chatter is not addressed to you, a periodic condition was not met, or the user explicitly asked for no reply.
 
-If you DO think you should act, just reply normally or call other tools — do NOT call this. This tool is only available during system-triggered turns; if the user message directly asks you something, this tool will not be available.
+Call it immediately once you decide to stay silent, preferably as the first and only tool call. It cannot undo messages, progress updates, or side effects that were already produced. Do not use it merely to avoid answering a clear request that is addressed to you.

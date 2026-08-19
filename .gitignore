@@ -23,3 +23,7 @@ bubbles.log
 tests/*
 !tests/test_image_generation.py
 !tests/test_wechat_outbound_images.py
+!tests/test_turn_compaction.py
+!tests/test_litellm_provider.py
+!tests/test_wechat_text_trigger.py
+!tests/test_stay_silent.py

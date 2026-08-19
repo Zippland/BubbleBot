@@ -56,6 +56,10 @@ CONTACTS_MIN_REFRESH_INTERVAL_SEC = 60.0
 IMAGE_DOWNLOAD_ATTEMPTS = 4
 IMAGE_DOWNLOAD_RETRY_DELAY_SEC = 1.5
 
+# 微信复制出来的 ``@泡泡`` 只是普通文本，WCFerry 的 ``msg.is_at`` 不会
+# 命中。群聊除了保留原生 @ 兼容性外，也把正文中的名字作为显式唤醒词。
+WECHAT_BOT_TRIGGER_WORD = "泡泡"
+
 
 class _WcferryLoguruHandler(logging.Handler):
     """Route wcferry's stdlib logs into Loguru, demoting expected retry noise.
@@ -143,7 +147,7 @@ class WeChatChannel(BaseChannel):
     WeChat channel using wcferry.
 
     - Private chats: Direct reply
-    - Group chats: Only reply when @mentioned
+    - Group chats: Reply when natively @mentioned or when text contains ``泡泡``
     - Supports: text, image, voice, video, file, and quoted messages
     """
 
@@ -314,13 +318,15 @@ class WeChatChannel(BaseChannel):
             chat_id = msg.roomid
             sender_id = msg.sender
             room_id = msg.roomid
-            is_at_me = msg.is_at(self.wxid)
+            native_at_me = msg.is_at(self.wxid)
+            should_respond = native_at_me
         else:
             # Private chat: direct reply
             chat_id = msg.sender
             sender_id = msg.sender
             room_id = None
-            is_at_me = True  # Always respond to private chat
+            native_at_me = True
+            should_respond = True  # Always respond to private chat
 
         # Get sender name (group alias or contact nickname)
         sender_name = self._get_sender_name(sender_id, room_id)
@@ -331,6 +337,8 @@ class WeChatChannel(BaseChannel):
 
         if msg.type == MSG_TYPE_TEXT:
             text = msg.content
+            name_triggered = is_group and self._contains_bot_trigger(text)
+            should_respond = should_respond or name_triggered
             # In groups, convert WeChat-native "@nickname " mentions to `<@wxid>`
             # markers so the model sees a uniform format. Falls back to stripping
             # @me when no aters info is available.
@@ -338,8 +346,13 @@ class WeChatChannel(BaseChannel):
                 aters = self._parse_atuserlist(msg.xml)
                 if aters:
                     text = self._convert_inbound_mentions(text, aters)
-                elif is_at_me:
+                elif native_at_me:
                     text = self._strip_at_mention(text)
+                elif name_triggered:
+                    # A copied ``@泡泡`` has no atuserlist. Remove only this
+                    # literal prefix; do not delete unrelated mentions such as
+                    # ``@张三 帮我问泡泡``.
+                    text = self._strip_copied_bot_mention(text)
 
         elif msg.type == MSG_TYPE_IMAGE:
             file_path, content_text = await self._download_and_save_media(
@@ -375,9 +388,10 @@ class WeChatChannel(BaseChannel):
             # For quoted messages in groups, check if replying to bot or @mentioned
             if is_group:
                 if is_reply_to_me:
-                    is_at_me = True
-                elif text and self._is_at_in_text(text):
-                    is_at_me = True
+                    should_respond = True
+                elif text and self._contains_bot_trigger(text):
+                    should_respond = True
+                if native_at_me:
                     text = self._strip_at_mention(text)
 
         else:
@@ -390,7 +404,7 @@ class WeChatChannel(BaseChannel):
         logger.debug("WeChat message from {} ({}) in {}: {}{}",
                      sender_name or sender_id, sender_id, chat_id,
                      (text[:50] if text else "[media]"),
-                     " [@me]" if is_at_me else "")
+                     " [triggered]" if should_respond else "")
 
         await self._handle_message(
             sender_id=sender_id,
@@ -400,10 +414,28 @@ class WeChatChannel(BaseChannel):
             metadata={
                 "is_group": is_group,
                 "sender_name": sender_name,
-                "respond": is_at_me,  # Only respond when @mentioned or private chat
+                "respond": should_respond,
                 "msg_type": msg.type,
             }
         )
+
+    @staticmethod
+    def _contains_bot_trigger(content: str | None) -> bool:
+        """Whether visible message text explicitly names the bot."""
+        return bool(content and WECHAT_BOT_TRIGGER_WORD in content)
+
+    @staticmethod
+    def _strip_copied_bot_mention(content: str) -> str:
+        """Remove copied ``@泡泡`` text without touching other @mentions."""
+        stripped = re.sub(
+            rf"@{re.escape(WECHAT_BOT_TRIGGER_WORD)}"
+            rf"(?=$|[\s\u2005，。！？、,:：;；])[\s\u2005]*",
+            "",
+            content,
+        ).strip()
+        # A message containing only the copied mention is still a real wake-up;
+        # keeping it prevents the empty-message guard from dropping the turn.
+        return stripped or content.strip()
 
     def _strip_at_mention(self, content: str) -> str:
         """Remove @mention from message content."""
@@ -457,14 +489,6 @@ class WeChatChannel(BaseChannel):
             return f"@{nickname} "
 
         return replace_mentions(text, repl), ",".join(aters)
-
-    def _is_at_in_text(self, text: str) -> bool:
-        """True if text contains `@<bot-name>` under any of the bot's known names."""
-        if not self.wcf:
-            return False
-        contact = self._contacts.get(self.wxid)
-        names = contact.all_names() if contact else []
-        return any(name and f"@{name}" in text for name in names)
 
     async def _download_and_save_media(
         self,

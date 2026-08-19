@@ -16,6 +16,11 @@ from bubbles.providers.registry import find_by_model, find_gateway
 # thinking-enabled models (Kimi k2.5, DeepSeek-R1, etc.).
 _ALLOWED_MSG_KEYS = frozenset({"role", "content", "tool_calls", "tool_call_id", "name", "reasoning_content"})
 
+# Anthropic accepts at most four explicit prompt-cache breakpoints per request.
+# OpenRouter forwards the same cache_control shape to Anthropic models, so keep
+# the limit here rather than relying on a downstream 400 response.
+_MAX_CACHE_BREAKPOINTS = 4
+
 
 class LiteLLMProvider(LLMProvider):
     """
@@ -125,10 +130,29 @@ class LiteLLMProvider(LLMProvider):
         messages: list[dict[str, Any]],
         tools: list[dict[str, Any]] | None,
     ) -> tuple[list[dict[str, Any]], list[dict[str, Any]] | None]:
-        """Return copies of messages and tools with cache_control injected."""
+        """Return copies with a bounded set of prompt-cache breakpoints.
+
+        Tool definitions are large and stable, so they get one breakpoint when
+        present.  The remaining budget goes to system messages: always keep the
+        first (the stable base prompt), then prefer the latest messages so a
+        repeated tool-loop request can reuse the longest possible prefix.
+        """
+        system_indices = [
+            index
+            for index, message in enumerate(messages)
+            if message.get("role") == "system"
+        ]
+        system_budget = _MAX_CACHE_BREAKPOINTS - (1 if tools else 0)
+        if len(system_indices) > system_budget:
+            system_indices = [
+                system_indices[0],
+                *system_indices[-(system_budget - 1):],
+            ]
+        cached_system_indices = set(system_indices)
+
         new_messages = []
-        for msg in messages:
-            if msg.get("role") == "system":
+        for index, msg in enumerate(messages):
+            if index in cached_system_indices:
                 content = msg["content"]
                 if isinstance(content, str):
                     new_content = [{"type": "text", "text": content, "cache_control": {"type": "ephemeral"}}]

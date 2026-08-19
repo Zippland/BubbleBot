@@ -146,7 +146,7 @@ Write the cron `message` so it carries the full intent:
 - If the task is "act only when something is worth saying", end the message with: *"If condition met → reply / use the message tool normally. Otherwise → call `stay_silent` and end the turn."* That keeps you quiet when there's nothing to do.
 - Bias toward silence by default: spell out *"Default to no action."* Spam is worse than missed nudges.
 
-`stay_silent` is available in every cron-triggered turn (and any other system-triggered turn). It's NOT available when the user talks to you directly — there, you should always answer.
+`stay_silent` is available in every turn. Call it with no arguments when no reply is genuinely the best response (for example, incidental name matching in group chatter, an unmet periodic condition, or an explicit request not to reply). It ends the turn without sending an outbound message. Do not use it merely to avoid a clear request addressed to you, and call it before producing progress or other side effects.
 
 ## Heartbeat (user-controlled)
 The user can enable a periodic auto-wake with `/heartbeat <interval>` (e.g. `30m`, `2h`); disable with `/heartbeat off`. **You cannot enable it yourself** — only the user can. When active, a `## Heartbeat: ON` block appears below and ticks fire on the cadence asking you to read HEARTBEATS.md and act on its checklist."""
@@ -318,7 +318,8 @@ The user can enable a periodic auto-wake with `/heartbeat <interval>` (e.g. `30m
                 "[如果这是补充信息：继续原任务，并在最终回复里一并交代原任务的结果。"
                 "如果这是让你停下或改方向：放弃当前路径，按新指示做，并说明你放弃了什么。]"
             )
-            messages.append({"role": "user", "content": note})
+            content = self._build_user_content(note, msg.media)
+            messages.append({"role": "user", "content": content})
         return messages
 
     def add_assistant_message(

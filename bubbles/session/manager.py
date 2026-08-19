@@ -17,6 +17,11 @@ from bubbles.utils.helpers import ensure_dir, safe_filename
 # Files in <session>/data/ older than this are auto-cleaned (SPEC §5.4).
 DATA_DIR_TTL_SECONDS = 3 * 86400
 
+# Raw messages removed from the provider projection by active-turn compaction
+# stay in session.jsonl for audit/debugging.  History builders and later
+# compactions must ignore them so the large tool payload is not sent again.
+CONTEXT_EXCLUDED_KEY = "_context_excluded"
+
 
 def cleanup_data_dir(session_dir: Path, max_age_seconds: float = DATA_DIR_TTL_SECONDS) -> int:
     """Delete files under <session_dir>/data/ whose mtime is older than the TTL.
@@ -262,16 +267,24 @@ class Session:
         start_idx = last_compaction_idx + 1 if last_compaction_idx >= 0 else 0
         active = self.messages[start_idx:]
 
-        # Filter out any compaction markers and limit
-        active = [m for m in active if not _is_compaction_marker(m)]
+        # Filter provider-invisible audit records before applying the message
+        # window; otherwise many compacted tool records could evict useful
+        # projected history from a small window.
+        active = [
+            m
+            for m in active
+            if not _is_compaction_marker(m) and not m.get(CONTEXT_EXCLUDED_KEY)
+        ]
         sliced = active[-max_messages:]
 
         # Sanitize：兜底剔除任何残留的不配对 tool_calls/tool_result。
         sliced = _sanitize_for_api(sliced)
 
-        # Drop leading non-user messages to avoid orphaned tool_result blocks
+        # Start at a real turn boundary.  System-triggered turns (cron/subagent)
+        # are legitimate history and may not contain any user role at all;
+        # orphan tool blocks have already been removed by _sanitize_for_api.
         for i, m in enumerate(sliced):
-            if m.get("role") == "user":
+            if m.get("role") in ("user", "system"):
                 sliced = sliced[i:]
                 break
         else:
