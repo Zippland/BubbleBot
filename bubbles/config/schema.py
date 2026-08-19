@@ -271,11 +271,26 @@ class ProvidersConfig(Base):
     github_copilot: ProviderConfig = Field(default_factory=ProviderConfig)  # Github Copilot (OAuth)
 
 
+class GatewayUpdateConfig(Base):
+    """Privileged repository update settings.
+
+    ``admins`` maps channel names to stable sender IDs. It is intentionally
+    separate from normal chat allow-lists: permission to use the bot must not
+    imply permission to update and restart its host process.
+    """
+
+    enabled: bool = False
+    remote: str = "bubblebot"
+    branch: str = "main"
+    admins: dict[str, list[str]] = Field(default_factory=dict)
+
+
 class GatewayConfig(Base):
     """Gateway/server configuration."""
 
     host: str = "0.0.0.0"
     port: int = 18790
+    update: GatewayUpdateConfig = Field(default_factory=GatewayUpdateConfig)
 
 
 class WebSearchConfig(Base):

@@ -91,6 +91,7 @@ Bubbles 以**单一二进制 CLI（`bubbles`）**对外暴露能力，没有 GUI
 - **本地直跑**：`pip install -e .` + `bubbles onboard` + `bubbles gateway`。
 - **Docker**：基于 `Dockerfile` / `docker-compose.yml` 构建镜像，挂载 `~/.bubbles` 作为持久卷。
 - **网桥进程**：WhatsApp 渠道依赖一个独立的 Node.js 网桥（项目内 `bridge/` 目录），由 `bubbles channels login` 引导构建与登录。其他渠道全部在 Python 主进程内。
+- **Windows 微信常驻与受控升级**：WCFerry 必须运行在已登录微信的同一用户会话中。由仓库外层 supervisor 常驻启动 `bubbles gateway`；每个 Windows 用户通过跨会话的 `Global` 命名锁只允许一个 supervisor 操作共享控制平面，安装和运行必须使用 64 位 Windows PowerShell 5.1。持久升级事务绑定发起它的 clone 绝对路径，其他 clone 不得接管恢复。微信管理员私聊发送精确命令 `/upgrade` 后，gateway 先确认回复已送达，再优雅退出。supervisor 随后对固定 remote/branch 执行 `git pull --ff-only`、同步锁定依赖并用不带 `-v` 的命令启动候选进程；只有新 Agent 与微信接收线程都 ready 且通过短稳定窗口才提交事务，否则在候选完成 native 卸载并提供匹配证明后回滚。整台机器的控制台、RDP 会话和所有 clone 共用跨会话 WCFerry 命名锁；同一用户还共用持久 lease。旧实例必须依次停止接收、关闭 socket、确认一次 `WxDestroySDK()==0` 且 10086/10087 已释放，才可删除 lease 并允许新实例启动。任何退出缺少 native-cleanup 证明时 supervisor 必须失败关闭，不得强杀后拉起第二个 WCFerry。候选在收到匹配的提交结果前拒绝第二次升级；运行中的 Python 进程不直接更新自身。
 
 ---
 
@@ -344,7 +345,7 @@ Bubbles 以**单一二进制 CLI（`bubbles`）**对外暴露能力，没有 GUI
 | `agents`     | 默认模型 / 温度 / 上下文 / 迭代上限 / 记忆窗口 / 压缩保留预算 / API 重试与超时 / 会话并发上限。 |
 | `channels`   | 启用哪些渠道、每个渠道的鉴权与白名单、会话归属模式、是否流式回显进度。 |
 | `providers`  | 每个 provider 的 API key、自定义 base URL、自定义 header。 |
-| `gateway`    | 网关进程绑定的 host 与 port。                     |
+| `gateway`    | 网关进程绑定的 host / port，以及默认关闭的受控升级目标和独立管理员名单。 |
 | `tools`      | Web 搜索 key、Shell 工具超时与 PATH、图像生成开关 / provider / model / 超时、执行沙箱后端（`sandbox`，含每会话独立 HOME 开关）、MCP servers 列表。 |
 
 **契约**：
@@ -353,6 +354,7 @@ Bubbles 以**单一二进制 CLI（`bubbles`）**对外暴露能力，没有 GUI
 - 图像生成默认关闭；启用后复用对应 `providers` 项的 API key、base URL 与额外 headers。首个支持的后端是 OpenAI `gpt-image-2`；未知 provider 或缺少 API key 时进程启动即失败。
 - 环境变量以 `BUBBLES_` 前缀，嵌套字段以 `__` 分隔（如 `BUBBLES_AGENTS__DEFAULTS__MODEL`），可覆盖配置文件。
 - `bubbles onboard` 在已有配置文件时支持"覆盖默认"或"刷新（保留旧值，补全新字段）"两个分支，绝不静默丢用户配置。
+- 受控升级默认关闭；管理员名单独立于渠道 `allow_from`。普通聊天权限不自动获得宿主机更新/重启权限。remote 与 branch 只读本机配置，微信命令不接受任意仓库、分支或 shell 参数。
 
 > **SPEC 与 Schema 的分工**：本文档只承诺顶级字段的产品语义、可配置的能力面、以及关键开关的产品行为。**具体字段名、类型、嵌套结构、默认值、校验规则由配置 schema（项目里的 pydantic 模型）定义**，schema 是配置层的事实源。两者保持一致：本文档新增产品决定 → schema 实现；schema 改了字段名/默认值 → 检查本文档的产品语义是否仍然成立。
 
@@ -374,6 +376,7 @@ Bubbles 以**单一二进制 CLI（`bubbles`）**对外暴露能力，没有 GUI
 6. **凭证隔离（可选，每会话）**：默认所有会话共享宿主环境（含 `$HOME`、已登录的 CLI 凭证）。开启 `local_isolated` 沙箱后端后，每个会话获得独立的 `$HOME`，会话内 CLI 工具的凭证按会话隔离、彼此不可见，且存放在会话工作目录之外（模型的文件工具读不到）。**边界**：这只隔离环境变量导向的凭证查找，不隔离整个文件系统；硬隔离仍需容器 / OS 级手段（见 `SECURITY.md` §4.1）。
 7. **密钥**：API key 以明文存储在 `~/.bubbles/config.json`；配置文件权限收紧到用户私有。生产场景推荐用环境变量或 OS keyring 替代明文（详见 `SECURITY.md`）。
 8. **审计**：助手的每一步工具调用在日志中可见；用户可以用 `--logs` / `--debug` 追到模型实际收到的系统提示词与每一次工具调用的入参与结果。
+9. **进程控制隔离**：`/upgrade` 是确定性的 gateway 控制命令，不注册为模型工具；只允许配置中的稳定渠道 ID 在私聊触发。回复真正送达前不得退出，更新与重新拉起必须由外部 supervisor 完成。
 
 **当前明确不做的**（与未来不做承诺，但当前如此）：
 

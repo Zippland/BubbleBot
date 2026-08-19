@@ -76,6 +76,7 @@ from bubbles.session.manager import (
 
 if TYPE_CHECKING:
     from bubbles.config.schema import ChannelsConfig, ExecToolConfig, SandboxConfig
+    from bubbles.gateway_control import GatewayControl
     from bubbles.image_generation import ImageGenerationBackend
     from bubbles.sandbox.base import Sandbox
     from bubbles.cron.service import CronService
@@ -120,6 +121,7 @@ class AgentLoop:
         max_api_retries: int = 2,
         max_concurrent_sessions: int = 0,
         image_generation_backend: "ImageGenerationBackend | None" = None,
+        gateway_control: "GatewayControl | None" = None,
     ):
         from bubbles.config.schema import ExecToolConfig, SandboxConfig
         from bubbles.utils.helpers import get_data_path
@@ -142,6 +144,7 @@ class AgentLoop:
         self.provider_factory = provider_factory
         self.default_provider_name = default_provider_name
         self.image_generation_backend = image_generation_backend
+        self.gateway_control = gateway_control
         self._provider_cache: dict[str, LLMProvider] = {}
         if provider is not None and default_provider_name:
             self._provider_cache[default_provider_name] = provider
@@ -670,12 +673,16 @@ class AgentLoop:
         except Exception as e:
             logger.warning("Startup data/ cleanup failed: {}", e)
         logger.info("Agent loop started")
+        if self.gateway_control is not None:
+            self.gateway_control.mark_agent_ready()
 
         while self._running:
             try:
                 msg = await asyncio.wait_for(self.bus.consume_inbound(), timeout=1.0)
             except asyncio.TimeoutError:
                 continue
+            if not self._running:
+                break
 
             if msg.content.strip().lower() == "/stop":
                 await self._handle_stop(msg)
@@ -865,6 +872,22 @@ class AgentLoop:
         self._running = False
         logger.info("Agent loop stopping")
 
+    async def cancel_active_tasks(self) -> None:
+        """Cancel and await every active turn and background subagent."""
+        self._pending_injections.clear()
+        tasks = {
+            task
+            for session_tasks in self._active_tasks.values()
+            for task in session_tasks
+            if not task.done()
+        }
+        for task in tasks:
+            task.cancel()
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
+        self._active_tasks.clear()
+        await self.subagents.cancel_all()
+
     async def _process_message(
         self,
         msg: InboundMessage,
@@ -949,6 +972,32 @@ class AgentLoop:
                     content=f"Bound to session: `{new_session_key}`"
                 )
 
+        # A privileged lifecycle command must be deterministic and must not be
+        # exposed as an LLM tool. It is handled before session binding because
+        # recovering the gateway is independent from conversation state.
+        if cmd_name == "/upgrade":
+            if cmd != "/upgrade":
+                return OutboundMessage(
+                    channel=msg.channel,
+                    chat_id=msg.chat_id,
+                    content="热升级命令不接受参数，请单独发送 `/upgrade`。",
+                )
+            if self.gateway_control is None:
+                return OutboundMessage(
+                    channel=msg.channel,
+                    chat_id=msg.chat_id,
+                    content="当前进程不支持热升级。",
+                )
+            decision = self.gateway_control.prepare_upgrade(msg)
+            metadata = dict(msg.metadata or {})
+            metadata.update(decision.metadata)
+            return OutboundMessage(
+                channel=msg.channel,
+                chat_id=msg.chat_id,
+                content=decision.content,
+                metadata=metadata,
+            )
+
         # Require session binding before chatting (except CLI)
         if msg.channel != "cli" and not bound_key:
             if not should_respond:
@@ -1014,7 +1063,9 @@ class AgentLoop:
 /config [<key> <value>|reset]
   key: model | system_prompt | sandbox；reset 还原默认
 /heartbeat [<间隔>|off]
-  开启（30m / 2h…）/ 关闭定时唤醒"""
+  开启（30m / 2h…）/ 关闭定时唤醒
+/upgrade
+  由管理员在微信私聊中触发受控升级并重启"""
             return OutboundMessage(channel=msg.channel, chat_id=msg.chat_id, content=help_text)
 
         # should_respond was computed at the top of this method (around the command-gate).
