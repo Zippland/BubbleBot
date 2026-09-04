@@ -200,6 +200,7 @@ Bubbles 以**单一二进制 CLI（`bubbles`）**对外暴露能力，没有 GUI
 3. OAuth provider 不会被当作 fallback 使用，必须用户显式选择。
 4. Custom（任意 OpenAI 兼容端点）走独立 client，不经过 LiteLLM，以保证用户对请求格式的完全控制。
 5. 所有非 OAuth provider 都通过 LiteLLM 统一适配，新增 provider 的成本应仅是登记一行注册条目 + 改本文档。
+6. Zhipu 默认连接中国区 BigModel API；`glm-5.3-flash` 支持渠道传入的图片附件、Function Calling 与连续工具调用中的思考上下文。国际区 Z.ai 或代理地址通过 `providers.zhipu.apiBase` 显式覆盖。
 
 **失败与重试契约**（对所有 provider 一致，不因换 provider 而变）：
 

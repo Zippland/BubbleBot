@@ -370,7 +370,7 @@ class Config(BaseSettings):
 
     def _match_provider(self, model: str | None = None) -> tuple["ProviderConfig | None", str | None]:
         """Match provider config and its registry name. Returns (config, spec_name)."""
-        from bubbles.providers.registry import PROVIDERS
+        from bubbles.providers.registry import PROVIDERS, find_by_name
 
         forced = self.agents.defaults.provider
         if forced != "auto":
@@ -386,12 +386,17 @@ class Config(BaseSettings):
             kw = kw.lower()
             return kw in model_lower or kw.replace("-", "_") in model_normalized
 
-        # Explicit provider prefix wins — prevents `github-copilot/...codex` matching openai_codex.
-        for spec in PROVIDERS:
+        # Explicit provider/LiteLLM prefix wins — prevents
+        # `github-copilot/...codex` matching openai_codex and lets canonical
+        # aliases such as `zai/...` select the configured `zhipu` provider.
+        if model_prefix:
+            spec = find_by_name(normalized_prefix)
+        else:
+            spec = None
+        if spec:
             p = getattr(self.providers, spec.name, None)
-            if p and model_prefix and normalized_prefix == spec.name:
-                if spec.is_oauth or p.api_key:
-                    return p, spec.name
+            if p and (spec.is_oauth or p.api_key):
+                return p, spec.name
 
         # Match by keyword (order follows PROVIDERS registry)
         for spec in PROVIDERS:
@@ -432,9 +437,9 @@ class Config(BaseSettings):
         p, name = self._match_provider(model)
         if p and p.api_base:
             return p.api_base
-        # Only gateways get a default api_base here. Standard providers
-        # (like Moonshot) set their base URL via env vars in _setup_env
-        # to avoid polluting the global litellm.api_base.
+        # Only gateways expose a default here. LiteLLMProvider resolves standard
+        # provider defaults on its own instance so one provider cannot redirect
+        # another provider through LiteLLM's process-global api_base.
         if name:
             spec = find_by_name(name)
             if spec and spec.is_gateway and spec.default_api_base:

@@ -56,6 +56,34 @@ bubbles cron --help
 bubbles provider --help
 ```
 
+### GLM-5.3-Flash（多模态）
+
+现有 `zhipu` provider 可直接使用智谱中国区的 OpenAI 兼容 API。把
+`~/.bubbles/config.json` 中对应部分改为：
+
+```json
+{
+  "agents": {
+    "defaults": {
+      "model": "glm-5.3-flash",
+      "provider": "zhipu",
+      "temperature": 1.0,
+      "contextLimit": 1000000
+    }
+  },
+  "providers": {
+    "zhipu": {
+      "apiKey": "YOUR_ZHIPU_API_KEY"
+    }
+  }
+}
+```
+
+默认请求地址是 `https://open.bigmodel.cn/api/paas/v4`。若使用国际区 Z.ai
+或自建代理，在 `providers.zhipu.apiBase` 显式填写对应地址。当前 Bubbles
+会把渠道收到的图片编码为 `image_url` Data URL；视频和通用文件尚未进入
+模型上下文。
+
 Docker：
 
 ```bash
