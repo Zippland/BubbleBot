@@ -1,16 +1,15 @@
 """LiteLLM provider implementation for multi-provider support."""
 
-import json_repair
 import os
+from copy import deepcopy
 from typing import Any
 
+import json_repair
 import litellm
 from litellm import acompletion
-from loguru import logger
 
 from bubbles.providers.base import LLMProvider, LLMResponse, ToolCallRequest, to_llm_call_error
-from bubbles.providers.registry import find_by_model, find_gateway
-
+from bubbles.providers.registry import find_by_model, find_by_name, find_gateway
 
 # Standard OpenAI chat-completion message keys plus reasoning_content for
 # thinking-enabled models (Kimi k2.5, DeepSeek-R1, etc.).
@@ -40,7 +39,6 @@ class LiteLLMProvider(LLMProvider):
         provider_name: str | None = None,
         timeout: float = 180.0,
     ):
-        super().__init__(api_key, api_base)
         self.default_model = default_model
         self.extra_headers = extra_headers or {}
         self.timeout = timeout
@@ -49,13 +47,20 @@ class LiteLLMProvider(LLMProvider):
         # provider_name (from config key) is the primary signal;
         # api_key / api_base are fallback for auto-detection.
         self._gateway = find_gateway(provider_name, api_key, api_base)
+        configured_spec = find_by_name(provider_name) if provider_name else None
+        self._provider_spec = self._gateway or configured_spec or find_by_model(default_model)
+
+        # Keep endpoint selection on the provider instance. Writing
+        # ``litellm.api_base`` globally lets one session/provider redirect
+        # another one in the same gateway process.
+        effective_api_base = api_base
+        if not effective_api_base and self._provider_spec:
+            effective_api_base = self._provider_spec.default_api_base or None
+        super().__init__(api_key, effective_api_base)
 
         # Configure environment variables
         if api_key:
-            self._setup_env(api_key, api_base, default_model)
-
-        if api_base:
-            litellm.api_base = api_base
+            self._setup_env(api_key, effective_api_base, default_model)
 
         # Disable LiteLLM logging noise
         litellm.suppress_debug_info = True
@@ -100,7 +105,7 @@ class LiteLLMProvider(LLMProvider):
             return model
 
         # Standard mode: auto-prefix for known providers
-        spec = find_by_model(model)
+        spec = self._gateway or find_by_model(model) or self._provider_spec
         if spec and spec.litellm_prefix:
             model = self._canonicalize_explicit_prefix(model, spec.name, spec.litellm_prefix)
             if not any(model.startswith(s) for s in spec.skip_prefixes):
@@ -171,17 +176,29 @@ class LiteLLMProvider(LLMProvider):
         return new_messages, new_tools
 
     def _apply_param_policy(self, model: str, kwargs: dict[str, Any]) -> None:
-        """Drop request params the provider fixes server-side.
+        """Apply provider/model request policy from the registry.
 
         Some vendors (Moonshot's Kimi K series) pin sampling params and reject
         requests that set them explicitly. The registry declares them per
-        provider, so a new model from the same vendor needs no code change.
+        provider. Model policies also carry vendor extension fields that must
+        bypass LiteLLM's OpenAI-parameter filtering.
         """
         spec = find_by_model(model)
         if not spec:
             return
         for name in spec.omit_params:
             kwargs.pop(name, None)
+
+        bare_model = model.rsplit("/", 1)[-1].lower()
+        for policy in spec.model_request_policies:
+            if bare_model != policy.model.lower():
+                continue
+            extra_body = deepcopy(policy.extra_body)
+            existing = kwargs.get("extra_body")
+            if isinstance(existing, dict):
+                extra_body.update(existing)
+            kwargs["extra_body"] = extra_body
+            break
 
     @staticmethod
     def _sanitize_messages(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:

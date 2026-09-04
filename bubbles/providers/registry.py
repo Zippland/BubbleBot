@@ -13,6 +13,15 @@ Every entry writes out all fields so you can copy-paste as a template.
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import Any
+
+
+@dataclass(frozen=True)
+class ModelRequestPolicy:
+    """Provider-specific request defaults for one exact model ID."""
+
+    model: str
+    extra_body: dict[str, Any]
 
 
 @dataclass(frozen=True)
@@ -59,6 +68,9 @@ class ProviderSpec:
 
     # Provider supports cache_control on content blocks (e.g. Anthropic prompt caching)
     supports_prompt_caching: bool = False
+
+    # Vendor extensions that LiteLLM should forward for exact model IDs.
+    model_request_policies: tuple[ModelRequestPolicy, ...] = ()
 
     @property
     def label(self) -> str:
@@ -272,7 +284,10 @@ PROVIDERS: tuple[ProviderSpec, ...] = (
         omit_params=(),
     ),
 
-    # Zhipu: LiteLLM uses "zai/" prefix.
+    # Zhipu BigModel (China): LiteLLM uses the "zai/" adapter, whose own
+    # default endpoint is the international Z.ai service. Pin the provider-
+    # specific base URL so a `providers.zhipu` key reaches the matching China
+    # platform unless the user explicitly overrides api_base.
     # Also mirrors key to ZHIPUAI_API_KEY (some LiteLLM paths check that).
     # skip_prefixes: don't add "zai/" when already routed via gateway.
     ProviderSpec(
@@ -284,14 +299,27 @@ PROVIDERS: tuple[ProviderSpec, ...] = (
         skip_prefixes=("zhipu/", "zai/", "openrouter/", "hosted_vllm/"),
         env_extras=(
             ("ZHIPUAI_API_KEY", "{api_key}"),
+            ("ZAI_API_BASE", "{api_base}"),
         ),
         is_gateway=False,
         is_local=False,
         detect_by_key_prefix="",
         detect_by_base_keyword="",
-        default_api_base="",
+        default_api_base="https://open.bigmodel.cn/api/paas/v4",
         strip_model_prefix=False,
         omit_params=(),
+        model_request_policies=(
+            ModelRequestPolicy(
+                model="glm-5.3-flash",
+                extra_body={
+                    # GLM-5.3-Flash only supports enabled thinking. Keeping the
+                    # reasoning trace across tool calls is the vendor-recommended
+                    # setting for agent loops.
+                    "thinking": {"type": "enabled", "clear_thinking": False},
+                    "reasoning_effort": "max",
+                },
+            ),
+        ),
     ),
 
     # DashScope: Qwen models, needs "dashscope/" prefix.
@@ -459,8 +487,17 @@ def find_gateway(
 
 
 def find_by_name(name: str) -> ProviderSpec | None:
-    """Find a provider spec by config field name, e.g. "dashscope"."""
+    """Find a provider by config name or an unambiguous LiteLLM prefix."""
+    normalized = name.lower().replace("-", "_")
     for spec in PROVIDERS:
-        if spec.name == name:
+        if spec.name == normalized:
             return spec
+    prefix_matches = [
+        spec
+        for spec in PROVIDERS
+        if spec.litellm_prefix
+        and spec.litellm_prefix.lower().replace("-", "_") == normalized
+    ]
+    if len(prefix_matches) == 1:
+        return prefix_matches[0]
     return None
