@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import Any
+from typing import Any, Callable
 
 from bubbles.agent.tools.base import Tool
 
@@ -16,6 +16,11 @@ class FindPersonTool(Tool):
         self._channel: str = ""
         self._chat_id: str = ""
         self._channel_manager: Any = None
+        self._target_provider: Callable[[], tuple[str, str]] | None = None
+
+    def set_target_provider(self, provider: Callable[[], tuple[str, str]]) -> None:
+        """Look up members in the selected output window, not the input source."""
+        self._target_provider = provider
 
     def set_context(self, channel: str, chat_id: str) -> None:
         self._channel = channel
@@ -47,14 +52,15 @@ class FindPersonTool(Tool):
             return "Error: `query` is required."
         if not self._channel_manager:
             return "Error: channel manager not configured."
-        if not self._channel or not self._chat_id:
+        target_channel, chat_id = self._target_provider() if self._target_provider else (self._channel, self._chat_id)
+        if not target_channel or not chat_id:
             return "Error: no chat context — only callable inside a chat session."
 
-        channel = self._channel_manager.get_channel(self._channel)
+        channel = self._channel_manager.get_channel(target_channel)
         if channel is None:
-            return f"Error: channel '{self._channel}' is not running."
+            return f"Error: channel '{target_channel}' is not running."
 
-        members = await channel.get_group_members(self._chat_id)
+        members = await channel.get_group_members(chat_id)
         if not members:
             return "No group members available (this isn't a group, or the roster is empty)."
 

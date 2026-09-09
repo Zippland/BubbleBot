@@ -36,13 +36,10 @@ from bubbles.agent.bindings import (
     relocate_media_to_session,
     save_session_bindings,
 )
-from bubbles.agent.commands import (
-    build_heartbeat_info,
-    handle_config_command,
-    handle_heartbeat_command,
-)
+from bubbles.agent.commands import handle_config_command
 from bubbles.agent.context import ContextBuilder
 from bubbles.agent.turn import (
+    ASSISTANT_TEXT_RECEIPT_PREFIX,
     TurnState,
     compact_for_turn,
     do_compact,
@@ -56,7 +53,7 @@ from bubbles.agent.tools.cron import CronTool
 from bubbles.agent.tools.filesystem import EditFileTool, ListDirTool, ReadFileTool, WriteFileTool
 from bubbles.agent.tools.find_person import FindPersonTool
 from bubbles.agent.tools.image_generation import GenerateImageTool
-from bubbles.agent.tools.message import MessageTool
+from bubbles.agent.tools.message import MessageTool, SwitchMessageTargetTool
 from bubbles.agent.tools.registry import ToolRegistry
 from bubbles.agent.tools.shell import ExecTool
 from bubbles.agent.tools.spawn import SpawnTool
@@ -191,11 +188,10 @@ class AgentLoop:
         self._register_default_tools()
 
     def _register_default_tools(self) -> None:
-        """Register the stateless, session-independent tools.
+        """Register all built-in schemas, regardless of backend availability.
 
-        These carry no per-turn state, so a single shared instance is safe even
-        with several sessions running concurrently. Session-scoped tools are
-        built per turn by :meth:`build_turn_tools`.
+        Session-scoped tool instances are built separately by
+        :meth:`build_turn_tools`; only stateless tools are shared across turns.
 
         ``self.tools`` remains the template registry: it backs
         ``get_definitions()`` (the schema list is identical for every session)
@@ -206,17 +202,17 @@ class AgentLoop:
         self.tools.register(ExecTool(timeout=self.exec_config.timeout))
         self.tools.register(WebSearchTool(api_key=self.tavily_api_key))
         self.tools.register(WebFetchTool())
-        self.tools.register(MessageTool(send_callback=self.bus.publish_outbound))
+        message = MessageTool(send_callback=self.bus.publish_outbound)
+        self.tools.register(message)
+        self.tools.register(SwitchMessageTargetTool(message, self.channel_manager))
         self.tools.register(StaySilentTool())
-        if self.image_generation_backend is not None:
-            self.tools.register(GenerateImageTool(self.image_generation_backend))
+        self.tools.register(GenerateImageTool(self.image_generation_backend))
         self.tools.register(SpawnTool(manager=self.subagents))
-        if self.cron_service:
-            self.tools.register(CronTool(self.cron_service))
-        if self.channel_manager is not None:
-            find_person = FindPersonTool()
-            find_person.set_channel_manager(self.channel_manager)
-            self.tools.register(find_person)
+        self.tools.register(CronTool(self.cron_service))
+        find_person = FindPersonTool()
+        find_person.set_channel_manager(self.channel_manager)
+        find_person.set_target_provider(lambda: message.target)
+        self.tools.register(find_person)
         for cls in (TaskListTool, TaskGetTool, TaskCreateTool, TaskUpdateTool):
             self.tools.register(cls())
 
@@ -257,34 +253,34 @@ class AgentLoop:
 
         message = MessageTool(send_callback=self.bus.publish_outbound)
         message.set_context(channel, chat_id, message_id)
+        if session is not None:
+            message.bind_session(session, lambda: self.sessions.save(session))
         message.set_session_dir(session_dir)
         message.start_turn()
         reg.register(message)
+        reg.register(SwitchMessageTargetTool(message, self.channel_manager))
         reg.register(StaySilentTool())
 
         image_generation_backend = getattr(self, "image_generation_backend", None)
-        if image_generation_backend is not None:
-            image_generation = GenerateImageTool(image_generation_backend)
-            image_generation.set_sandbox(sandbox)
-            reg.register(image_generation)
+        image_generation = GenerateImageTool(image_generation_backend)
+        image_generation.set_sandbox(sandbox)
+        reg.register(image_generation)
 
         spawn = SpawnTool(manager=self.subagents)
         spawn.set_context(channel, chat_id, session_key)
         spawn.set_session_dir(session_dir)
         reg.register(spawn)
 
-        # System-triggered turns may not schedule further jobs (SPEC §5.6).
-        # stay_silent is registered above for every turn.
-        if not system_triggered and self.cron_service:
-            cron = CronTool(self.cron_service)
-            cron.set_context(channel, chat_id, session_key)
-            reg.register(cron)
+        # Keep schemas stable; enforce availability in execute(), not registration.
+        cron = CronTool(self.cron_service, system_triggered=system_triggered)
+        cron.set_context(channel, chat_id, session_key)
+        reg.register(cron)
 
-        if self.channel_manager is not None:
-            find_person = FindPersonTool()
-            find_person.set_channel_manager(self.channel_manager)
-            find_person.set_context(channel, chat_id)
-            reg.register(find_person)
+        find_person = FindPersonTool()
+        find_person.set_channel_manager(self.channel_manager)
+        find_person.set_context(channel, chat_id)
+        find_person.set_target_provider(lambda: message.target)
+        reg.register(find_person)
 
         for cls in (TaskListTool, TaskGetTool, TaskCreateTool, TaskUpdateTool):
             tool = cls()
@@ -305,7 +301,7 @@ class AgentLoop:
         """MCP-provided tools from the template registry (stateless, shared)."""
         builtin = {
             "read_file", "write_file", "edit_file", "list_dir", "exec",
-            "web_search", "web_fetch", "message", "spawn", "cron",
+            "web_search", "web_fetch", "message", "switch_message_target", "spawn", "cron",
             "find_person", "task_list", "task_get", "task_create",
             "task_update", "stay_silent", "generate_image",
         }
@@ -368,7 +364,7 @@ class AgentLoop:
         """Remove <think>…</think> blocks that some models embed in content."""
         if not text:
             return None
-        return re.sub(r"<think>[\s\S]*?</think>", "", text).strip() or None
+        return re.sub(r"<think>[\s\S]*?(?:</think>|$)", "", text, flags=re.IGNORECASE).strip() or None
 
     @staticmethod
     def _tool_hint(tool_calls: list) -> str:
@@ -475,12 +471,14 @@ class AgentLoop:
         on_tool_call: Callable[[str, dict, str | None], Awaitable[None]] | None = None,
         tools: ToolRegistry | None = None,
         turn_state: TurnState | None = None,
+        require_explicit_end: bool = False,
     ) -> tuple[str | None, list[str], list[dict]]:
         """Run the agent iteration loop. Returns (final_content, tools_used, messages)."""
         messages = list(initial_messages)
         iteration = 0
         final_content = None
         tools_used: list[str] = []
+        text_only_retries = 0
         # 每轮自己的工具集；缺省回落到模板 registry（测试与旧调用方）。
         tools = tools if tools is not None else self.tools
 
@@ -502,6 +500,38 @@ class AgentLoop:
         model = (cfg.model if cfg and cfg.model else self.model)
         temperature = (cfg.temperature if cfg and cfg.temperature is not None else self.temperature)
         max_tokens = (cfg.max_tokens if cfg and cfg.max_tokens else self.max_tokens)
+
+        message_tool = tools.get("message")
+        if not isinstance(message_tool, MessageTool):
+            message_tool = None
+
+        def _record_notice(content: str) -> None:
+            messages.append({"role": "system", "content": content})
+            turn_state.capture_appended(messages, len(messages) - 1)
+
+        def _record_target() -> None:
+            if message_tool is not None:
+                channel, chat_id = message_tool.target
+                _record_notice("[Current message target] " + json.dumps({
+                    "channel": channel, "chat_id": chat_id,
+                    "note": "Persists until switch_message_target succeeds. Incoming message sources do not change it.",
+                }, ensure_ascii=False))
+
+        async def _send_assistant_text(text: str | None) -> str | None:
+            content = self._strip_think(text)
+            if content and message_tool is not None:
+                return await message_tool.execute(content=content)
+            return None
+
+        def _record_text_receipt(receipt: str | None) -> None:
+            if receipt is not None:
+                _record_notice(
+                    ASSISTANT_TEXT_RECEIPT_PREFIX
+                    + ToolRegistry._cap_result("message", receipt)
+                )
+
+        # Dynamic destination belongs at the tail, never in the stable prompt.
+        _record_target()
 
         def _drain_injections() -> int:
             nonlocal messages
@@ -563,28 +593,9 @@ class AgentLoop:
             )
 
             if response.has_tool_calls:
-                silent_call = next(
-                    (tc for tc in response.tool_calls if tc.name == "stay_silent"),
-                    None,
-                )
-                # A silence decision takes precedence over parallel tool calls.
-                # Executing the other calls could create side effects that silence
-                # cannot undo, and persisting unmatched calls would violate the
-                # assistant(tool_calls) -> tool-result protocol.
-                effective_tool_calls = [silent_call] if silent_call else response.tool_calls
-                if silent_call and len(response.tool_calls) > 1:
-                    logger.warning(
-                        "stay_silent was mixed with {} other tool call(s); ignoring them",
-                        len(response.tool_calls) - 1,
-                    )
-
-                # Do not leak the model's preamble or a tool hint for a turn that
-                # is about to end silently.
-                if on_progress and not silent_call:
-                    clean = self._strip_think(response.content)
-                    if clean:
-                        await on_progress(clean)
-                    await on_progress(self._tool_hint(effective_tool_calls), tool_hint=True)
+                text_only_retries = 0
+                # Ending is a batch barrier, never a reason to discard other calls.
+                effective_tool_calls = response.tool_calls
 
                 tool_call_dicts = [
                     {
@@ -603,48 +614,74 @@ class AgentLoop:
                     reasoning_content=response.reasoning_content,
                 )
                 turn_state.capture_appended(messages, appended_from)
-                control_messages = list(messages[appended_from:]) if silent_call else []
-
-                for tool_call in effective_tool_calls:
-                    tools_used.append(tool_call.name)
-                    args_str = json.dumps(tool_call.arguments, ensure_ascii=False)
-                    logger.info("Tool call: {}({})", tool_call.name, args_str[:200])
-                    if on_tool_call:
-                        await on_tool_call(tool_call.name, tool_call.arguments, None)
-                    result = await tools.execute(tool_call.name, tool_call.arguments)
-                    if on_tool_call:
-                        await on_tool_call(tool_call.name, tool_call.arguments, result)
-                    appended_from = len(messages)
-                    messages = context.add_tool_result(
-                        messages, tool_call.id, tool_call.name, result
-                    )
-                    turn_state.capture_appended(messages, appended_from)
-                    if tool_call.name == "stay_silent" and result == STAY_SILENT_SENTINEL:
-                        control_messages.extend(messages[appended_from:])
-                        turn_state.context_excluded_message_ids.update(
-                            id(message) for message in control_messages
+                end_requested = False
+                # Provider text precedes its tool calls, including any switch.
+                receipt = await _send_assistant_text(response.content)
+                previous_target = message_tool.target if message_tool is not None else None
+                try:
+                    for tool_call in effective_tool_calls:
+                        tools_used.append(tool_call.name)
+                        args_str = json.dumps(tool_call.arguments, ensure_ascii=False)
+                        logger.info("Tool call: {}({})", tool_call.name, args_str[:200])
+                        if on_tool_call:
+                            await on_tool_call(tool_call.name, tool_call.arguments, None)
+                        result = await tools.execute(tool_call.name, tool_call.arguments)
+                        if on_tool_call:
+                            await on_tool_call(tool_call.name, tool_call.arguments, result)
+                        appended_from = len(messages)
+                        messages = context.add_tool_result(
+                            messages, tool_call.id, tool_call.name, result
                         )
-                        turn_state.suppress_outbound = True
-                        final_content = None
-                        logger.info("stay_silent requested; ending agent loop")
-                        break
+                        turn_state.capture_appended(messages, appended_from)
+                        if tool_call.name == "stay_silent" and result == STAY_SILENT_SENTINEL:
+                            end_requested = True
+                finally:
+                    # Never interrupt assistant/tool-result pairing. Preserve
+                    # the text submission audit even if later work is cancelled.
+                    _record_text_receipt(receipt)
+                    if message_tool is not None and message_tool.target != previous_target:
+                        _record_target()
 
-                if turn_state.suppress_outbound:
+                if end_requested:
+                    turn_state.suppress_outbound = True
+                    final_content = None
+                    logger.info("stay_silent/end_turn completed after all tool results")
                     break
-
-                # Check for duplicate message sends (loop detection)
-                if message_tool := tools.get("message"):
-                    if isinstance(message_tool, MessageTool) and message_tool._duplicate_detected:
-                        logger.warning("Duplicate message detected, stopping agent loop")
-                        final_content = None  # Already sent via message tool
-                        break
             else:
                 final_content = self._strip_think(response.content)
-                # Add final assistant message to history
-                if final_content:
+                # Keep the actual provider message (including reasoning) for
+                # round-trip fidelity; only stripped content is sent outward.
+                if response.content or response.reasoning_content is not None:
                     appended_from = len(messages)
-                    messages = context.add_assistant_message(messages, final_content, None)
+                    messages = context.add_assistant_message(
+                        messages, response.content, None,
+                        reasoning_content=response.reasoning_content,
+                    )
                     turn_state.capture_appended(messages, appended_from)
+                receipt = await _send_assistant_text(response.content)
+                _record_text_receipt(receipt)
+                if receipt is not None:
+                    final_content = None  # Already submitted; never send twice.
+                if require_explicit_end:
+                    final_content = None
+                    if text_only_retries >= 1:
+                        logger.warning("Model omitted end_turn twice; stopping without additional output")
+                        break
+                    text_only_retries += 1
+                    reminder = {
+                        "role": "system",
+                        "content": (
+                            "[Harness protocol] Any assistant text was handled according to its receipt; "
+                            "do not repeat successfully submitted text. "
+                            "If your work is finished, call stay_silent (end_turn) without additional text. "
+                            "Otherwise continue with the needed tools."
+                        ),
+                    }
+                    messages.append(reminder)
+                    turn_state.capture_appended(messages, len(messages) - 1)
+                    continue
+                if receipt is not None:
+                    turn_state.suppress_outbound = True
                 break
 
         if (
@@ -653,6 +690,8 @@ class AgentLoop:
             and not turn_state.suppress_outbound
         ):
             logger.warning("Max iterations ({}) reached", self.max_iterations)
+            if require_explicit_end:
+                return None, tools_used, messages
             final_content = (
                 f"I reached the maximum number of tool call iterations ({self.max_iterations}) "
                 "without completing the task. You can try breaking the task into smaller steps."
@@ -825,7 +864,7 @@ class AgentLoop:
 
         判据是"这一轮是不是用户主动触发的"，不是群聊/私聊：
         - 用户触发（私聊、群里 @ 机器人、CLI）→ 回一条，用户在等回应，静默才是坏体验；
-        - 非用户触发（cron、心跳、subagent 汇报等 system turn，或群里没 @ 的旁听
+        - 非用户触发（cron、subagent 汇报等 system turn，或群里没 @ 的旁听
           消息）→ 完全静默，只进日志。没人在等的消息不该让机器人在群里叫。
 
         ``exc`` 是 LLMCallError 时给出错误类别与重试次数（不含异常类型、堆栈、
@@ -895,6 +934,7 @@ class AgentLoop:
         on_progress: Callable[[str], Awaitable[None]] | None = None,
         on_tool_call: Callable[[str, dict, str | None], Awaitable[None]] | None = None,
         system_triggered: bool = False,
+        on_message: Callable[[OutboundMessage], Awaitable[None]] | None = None,
     ) -> OutboundMessage | None:
         """Process a single inbound message and return the response."""
         if msg.channel == "system":
@@ -1026,9 +1066,12 @@ class AgentLoop:
         if cmd_name == "/config":
             return await handle_config_command(self, msg, session, cmd_arg)
 
-        # /heartbeat - user-controlled periodic auto-wake (AI cannot enable)
+        # Retired command: do not send it to the model and recreate the feature.
         if cmd_name == "/heartbeat":
-            return handle_heartbeat_command(self, msg, session, key, cmd_arg)
+            return OutboundMessage(
+                channel=msg.channel, chat_id=msg.chat_id,
+                content="心跳功能已移除。需要定时执行时，请使用 cron 定时任务。",
+            )
 
         if cmd == "/new":
             session.clear()
@@ -1062,8 +1105,6 @@ class AgentLoop:
   绑定 / 解绑会话
 /config [<key> <value>|reset]
   key: model | system_prompt | sandbox；reset 还原默认
-/heartbeat [<间隔>|off]
-  开启（30m / 2h…）/ 关闭定时唤醒
 /upgrade
   由管理员在微信私聊中触发受控升级并重启"""
             return OutboundMessage(channel=msg.channel, chat_id=msg.chat_id, content=help_text)
@@ -1103,6 +1144,10 @@ class AgentLoop:
             session=session, sandbox=sandbox,
             system_triggered=system_triggered,
         )
+        if on_message is not None:
+            message_tool = turn_tools.get("message")
+            if isinstance(message_tool, MessageTool):
+                message_tool.set_send_callback(on_message)
 
         context = self._get_context(session)
         history = session.get_history(max_messages=self.memory_window)
@@ -1115,42 +1160,19 @@ class AgentLoop:
             sender_name=msg.metadata.get("sender_name"),
             system_prompt_extra=session.config.system_prompt,
             session_bindings=get_bindings_for_session(self._session_bindings, session.key),
-            heartbeat_info=build_heartbeat_info(self.cron_service, session.key),
             work_dir=sandbox.root,
         )
         turn_state = TurnState.from_context_messages(initial_messages, len(history))
 
-        # Track progress messages to detect loops
-        _sent_progress: set[str] = set()
-        _progress_loop_detected = False
-
-        async def _bus_progress(content: str, *, tool_hint: bool = False) -> None:
-            nonlocal _progress_loop_detected
-            # Skip duplicate progress messages (loop detection)
-            content_key = content[:100]
-            if not tool_hint and content_key in _sent_progress:
-                _progress_loop_detected = True
-                logger.warning("Duplicate progress message detected, will stop loop")
-                return
-            if not tool_hint:
-                _sent_progress.add(content_key)
-
-            meta = dict(msg.metadata or {})
-            meta["_progress"] = True
-            meta["_tool_hint"] = tool_hint
-            await self.bus.publish_outbound(OutboundMessage(
-                channel=msg.channel, chat_id=msg.chat_id, content=content, metadata=meta,
-            ))
-
         try:
-            final_content, _, _ = await self._run_agent_loop(
+            await self._run_agent_loop(
                 initial_messages,
-                on_progress=on_progress or _bus_progress,
+                on_progress=on_progress,
                 session=session,
-                should_stop=lambda: _progress_loop_detected,
                 on_tool_call=on_tool_call,
                 tools=turn_tools,
                 turn_state=turn_state,
+                require_explicit_end=True,
             )
         except BaseException:
             try:
@@ -1163,22 +1185,10 @@ class AgentLoop:
         persist_turn_state(session, turn_state)
         self.sessions.save(session)
 
-        if turn_state.suppress_outbound:
-            logger.info("Turn ended silently for session {}", session.key)
-            return None
+        # Conversational output has already gone through the shared sender. Never append a
+        # final answer or a fallback merely because the model stopped generating.
+        return None
 
-        if final_content is None:
-            final_content = "I've completed processing but have no response to give."
-
-        if (mt := turn_tools.get("message")) and isinstance(mt, MessageTool) and mt._sent_in_turn:
-            return None
-
-        preview = final_content[:120] + "..." if len(final_content) > 120 else final_content
-        logger.info("Response to {}:{}: {}", msg.channel, msg.sender_id, preview)
-        return OutboundMessage(
-            channel=msg.channel, chat_id=msg.chat_id, content=final_content,
-            metadata=msg.metadata or {},
-        )
     async def process_direct(
         self,
         content: str,
@@ -1195,19 +1205,30 @@ class AgentLoop:
         1. User's session binding (if exists)
         2. Default: f"{channel}:{chat_id}"
 
-        ``system_triggered=True`` marks a turn the user didn't ask for (cron /
-        heartbeat): the model keeps globally available ``stay_silent`` but loses
-        ``cron`` (no recursive job creation, SPEC §5.6), and failures stay silent.
+        ``system_triggered=True`` keeps the same schemas but makes cron return
+        an explanatory error (no recursive scheduling, SPEC §5.6).
 
         Returns ``(response_text, tools_used)``. ``tools_used`` lists tool names
-        invoked during the turn — callers can check for sentinel tools like
-        ``stay_silent`` to suppress outbound delivery.
+        invoked during the turn. response_text contains submissions to the input
+        destination (or a command response), including ordinary assistant text.
+        Non-CLI submissions are already published; callers must not resend them.
         """
         await self._connect_mcp()
         msg = InboundMessage(channel=channel, sender_id="user", chat_id=chat_id, content=content)
 
         # Capture which tools ran, while still forwarding to any user-provided on_tool_call.
         tools_used: list[str] = []
+        sent_content: list[str] = []
+
+        async def _send(message: OutboundMessage) -> None:
+            current_target = message.channel == channel and message.chat_id == chat_id
+            if current_target:
+                if message.content:
+                    sent_content.append(message.content)
+                sent_content.extend(f"[附件: {path}]" for path in message.media)
+            # Direct CLI has no bus consumer; return its messages below.
+            if not (current_target and channel == "cli"):
+                await self.bus.publish_outbound(message)
 
         async def _capture(name: str, args: dict, result: str | None) -> None:
             if on_tool_call is not None:
@@ -1215,8 +1236,12 @@ class AgentLoop:
             if result is not None:
                 tools_used.append(name)
 
-        response = await self._process_message(
-            msg, session_key=session_key, on_progress=on_progress, on_tool_call=_capture,
-            system_triggered=system_triggered,
-        )
-        return (response.content if response else ""), tools_used
+        # Cron/direct entry points share history and destination with chat turns.
+        # Use the same lock before constructing tools or loading routing state.
+        async with self._session_lock(self._resolve_session_key(msg, session_key)):
+            response = await self._process_message(
+                msg, session_key=session_key, on_progress=on_progress, on_tool_call=_capture,
+                system_triggered=system_triggered,
+                on_message=_send,
+            )
+        return (response.content if response else "\n\n".join(sent_content)), tools_used

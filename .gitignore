@@ -20,12 +20,17 @@ poetry.lock
 .pytest_cache/
 botpy.log
 bubbles.log
+/injector.log
+/logs/
 tests/*
 !tests/test_image_generation.py
 !tests/test_wechat_outbound_images.py
 !tests/test_turn_compaction.py
 !tests/test_litellm_provider.py
 !tests/test_wechat_text_trigger.py
+!tests/test_wechat_group_join.py
 !tests/test_stay_silent.py
 !tests/test_gateway_upgrade.py
 !tests/test_matrix_channel_lifecycle.py
+!tests/test_agent_protocol.py
+!tests/test_prompt_cache.py

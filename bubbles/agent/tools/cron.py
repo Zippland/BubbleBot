@@ -11,8 +11,9 @@ from bubbles.cron.types import CronSchedule
 class CronTool(Tool):
     """Tool to schedule reminders and recurring tasks."""
 
-    def __init__(self, cron_service: CronService):
+    def __init__(self, cron_service: CronService | None, *, system_triggered: bool = False):
         self._cron = cron_service
+        self._system_triggered = system_triggered
         self._channel = ""
         self._chat_id = ""
         self._session_key = ""
@@ -81,6 +82,14 @@ class CronTool(Tool):
         include_disabled: bool = False,
         **kwargs: Any
     ) -> str:
+        if self._system_triggered:
+            return (
+                "Error: 当前是系统触发的执行，不能调用 cron 工具。"
+                "定时任务不能递归创建或管理定时任务，以免产生无限调度。"
+                "如需调整计划，请等待用户主动发起请求。"
+            )
+        if self._cron is None:
+            return "Error: cron 调度服务未配置，当前无法创建、查询或删除定时任务。"
         if action == "add":
             return self._add_job(message, every_seconds, cron_expr, tz, at)
         elif action == "list":

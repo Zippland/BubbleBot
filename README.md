@@ -56,6 +56,21 @@ bubbles cron --help
 bubbles provider --help
 ```
 
+### 发言与工具协议
+
+`switch_message_target(channel, chat_id)` 切换当前发送窗口，按工作区保存，跨任务和重启保留，直到再次切换。
+`message` 只传正文/附件；普通 assistant 文本（含工具前说明）也发往当前窗口。
+中途想说就说，不要求每次调用工具前说明。切换应先单独调用并查看结果，再向新窗口说话。
+每次发言只向模型返回目标和提交状态，失败时附错误原因，不重复正文和附件；回执不发到群里，提交不等于渠道确认送达。
+`message` 只发送消息，不结束本轮；
+发完消息或决定不回复时，调用 `stay_silent()`。这个名称沿用旧版，实际含义是
+“结束本轮”（end_turn），不表示这轮一定没有说过话，也不会取消同批其他工具。
+
+内置工具清单始终一致：没有生图后端、没有渠道管理器或没有 cron 服务时，
+工具返回说明性错误；系统触发时调用 cron 也返回错误，防止递归调度。
+心跳功能已移除；旧专用任务在网关启动时停用并保留记录，已有 `HEARTBEATS.md`
+不删除、不再加载。普通 cron、`/upgrade` 及自定义 `system_prompt` 继续保留。
+
 ### GLM-5.3-Flash（多模态）
 
 现有 `zhipu` provider 可直接使用智谱中国区的 OpenAI 兼容 API。把
@@ -117,13 +132,18 @@ supervisor，并用当前用户的“登录时”计划任务启动它；任务�
 
 ```powershell
 Set-Location C:\path\to\Bubblebot
-.\scripts\install-bubbles-gateway-task.ps1 `
+powershell.exe -NoProfile -ExecutionPolicy Bypass `
+  -File .\scripts\install-bubbles-gateway-task.ps1 `
   -RepoPath (Get-Location).Path `
   -Remote bubblebot `
   -Branch main `
   -Port 18790 `
   -StartNow
 ```
+
+首次安装请显式传入 `-RepoPath`。旧版脚本在参数默认值中读取 `$PSScriptRoot`，
+部分启动环境下可能得到空值并在 `Split-Path` 处失败；显式路径可绕过该问题。
+新版仅在进入脚本正文后推导默认路径，并在无法确定路径时提示手动指定。
 
 安装脚本会先执行一次 `uv sync --locked`，再把 supervisor 原子复制到
 `%USERPROFILE%\.bubbles\control\bubbles-supervisor.ps1`。计划任务始终运行这份仓库外的稳定

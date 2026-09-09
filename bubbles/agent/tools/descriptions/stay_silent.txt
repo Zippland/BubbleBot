@@ -1,5 +1,5 @@
-End the current turn without sending any reply to the user or channel.
+End the current turn (end_turn). The legacy name stay_silent means this tool sends no additional message; it does NOT mean you must have stayed silent throughout the turn.
 
-Call this with no arguments when silence is genuinely the best response: for example, a group message matched your name incidentally ("泡泡玛特" / "泡泡浴"), casual chatter is not addressed to you, a periodic condition was not met, or the user explicitly asked for no reply.
+Call with no arguments when this turn is finished, whether you have already sent replies or have decided no reply is appropriate. A silent turn has neither assistant text nor message calls. Ending does not reset the selected message destination.
 
-Call it immediately once you decide to stay silent, preferably as the first and only tool call. It cannot undo messages, progress updates, or side effects that were already produced. Do not use it merely to avoid answering a clear request that is addressed to you.
+Both message and ordinary assistant text are delivered to the selected destination. Text accompanying this tool is still sent; omit text to end without speaking. Prefer calling this after you have inspected the results of your other tools. If included in a batch, all other calls in that batch finish before this ends the turn. It does not undo earlier messages or side effects, and it does not claim that the user's whole task succeeded.

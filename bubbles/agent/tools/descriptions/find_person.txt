@@ -1,4 +1,4 @@
-Search for a person in the current group chat by name to get an @-mention marker.
+Search for a person in the currently selected outbound group chat by name to get an @-mention marker. This follows switch_message_target, not the source of the latest input.
 
 Use this when you want to @-mention someone in your reply but don't yet know their channel-native ID. Returns matching members along with their `<@id>` markers. Embed the marker directly into your reply text — the channel layer will translate it into a real @-mention on send.
 

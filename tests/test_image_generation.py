@@ -564,7 +564,7 @@ class _Provider:
         return "test-model"
 
 
-def test_agent_registers_image_tool_only_when_backend_is_enabled(tmp_path: Path) -> None:
+def test_agent_registers_same_image_schema_with_or_without_backend(tmp_path: Path) -> None:
     common = {
         "bus": MessageBus(),
         "provider": _Provider(),
@@ -575,7 +575,7 @@ def test_agent_registers_image_tool_only_when_backend_is_enabled(tmp_path: Path)
     }
 
     disabled = AgentLoop(**common)
-    assert not disabled.tools.has("generate_image")
+    assert disabled.tools.has("generate_image")
 
     enabled = AgentLoop(
         **common,
@@ -584,6 +584,7 @@ def test_agent_registers_image_tool_only_when_backend_is_enabled(tmp_path: Path)
         ),
     )
     assert enabled.tools.has("generate_image")
+    assert disabled.tools.get_definitions() == enabled.tools.get_definitions()
     turn_tools = enabled.build_turn_tools(
         channel="test",
         chat_id="chat",

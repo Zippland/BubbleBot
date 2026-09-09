@@ -256,15 +256,16 @@ def test_system_triggered_history_survives_reload_projection() -> None:
     assert history[0]["content"] == "SUBAGENT-RESULT"
 
 
-def test_codex_combines_all_system_messages() -> None:
+def test_codex_keeps_appended_system_messages_out_of_prefix() -> None:
     instructions, items = _convert_messages([
         {"role": "system", "content": "BASE-SYSTEM"},
         {"role": "system", "content": "COMPACTED-HISTORY"},
         {"role": "user", "content": "current"},
     ])
 
-    assert instructions == "BASE-SYSTEM\n\nCOMPACTED-HISTORY"
-    assert len(items) == 1
+    assert instructions == "BASE-SYSTEM"
+    assert len(items) == 2
+    assert items[0] == {"role": "developer", "content": [{"type": "input_text", "text": "COMPACTED-HISTORY"}]}
 
 
 @pytest.mark.asyncio
@@ -411,7 +412,8 @@ async def test_active_turn_accumulates_and_persists_each_message_once(tmp_path) 
     assert repr(session.messages).count("CURRENT-REQUEST") == 1
     assert repr(session.messages).count("TOOL-RESULT") == 1
     assert repr(session.messages).count("FINAL-ANSWER") == 1
-    assert "reasoning_content" not in session.messages[1]
+    assert session.messages[1]["reasoning_content"] == "provider-only reasoning"
+    assert session.get_history()[1]["reasoning_content"] == "provider-only reasoning"
     assert "reasoning_content" in turn_state.messages[1]
 
 
@@ -746,9 +748,26 @@ async def test_process_message_persists_active_compaction_projection_across_relo
     tmp_path,
 ) -> None:
     provider = _CompactingScriptedProvider()
+    original_chat = provider.chat
+
+    async def chat(**kwargs):
+        response = await original_chat(**kwargs)
+        if response.content == "FINAL-AFTER-COMPACT":
+            response.tool_calls = [ToolCallRequest(id="end", name="stay_silent", arguments={})]
+        return response
+
+    provider.chat = chat
+
+    class EndingTools(_Tools):
+        async def execute(self, name, arguments):
+            if name == "stay_silent":
+                from bubbles.agent.tools.stay_silent import STAY_SILENT_SENTINEL
+                return STAY_SILENT_SENTINEL
+            return await super().execute(name, arguments)
+
     loop = _agent_loop(tmp_path, provider, context_limit=10_000)
     loop._get_context = lambda session: ContextBuilder(session_dir=session.directory)
-    loop.build_turn_tools = lambda **kwargs: _Tools(result="R" * 40_000)
+    loop.build_turn_tools = lambda **kwargs: EndingTools(result="R" * 40_000)
     message = InboundMessage(
         channel="cli",
         chat_id="active-persistence",
@@ -761,8 +780,7 @@ async def test_process_message_persists_active_compaction_projection_across_relo
         session_key="cli:active-persistence",
     )
 
-    assert response is not None
-    assert response.content == "FINAL-AFTER-COMPACT"
+    assert response is None  # Plain assistant text is internal, never auto-delivered.
     assert len(provider.summary_calls) == 1
     loop.sessions.invalidate("cli:active-persistence")
     reloaded = loop.sessions.get_or_create("cli:active-persistence")
@@ -771,8 +789,8 @@ async def test_process_message_persists_active_compaction_projection_across_relo
     assert rendered.count("DURABLE-CURRENT-GOAL") == 1
     assert rendered.count("COMPACTED-HISTORY") == 1
     assert rendered.count("FINAL-AFTER-COMPACT") == 1
-    assert not [message for message in history if message.get("role") == "tool"]
-    assert not [message for message in history if message.get("tool_calls")]
+    assert [m["name"] for m in history if m.get("role") == "tool"] == ["stay_silent"]
+    assert len([m for m in history if m.get("tool_calls")]) == 1
     raw_tools = [
         message
         for message in reloaded.messages
@@ -848,7 +866,8 @@ async def test_process_message_persists_current_user_when_overflow_cannot_recove
 
     loop.sessions.invalidate("cli:failure")
     reloaded = loop.sessions.get_or_create("cli:failure")
-    assert len(reloaded.messages) == 1
+    assert len(reloaded.messages) == 2
+    assert reloaded.messages[1]["content"].startswith("[Current message target]")
     assert reloaded.messages[0]["role"] == "user"
     assert "DURABLE-CURRENT-REQUEST" in str(reloaded.messages[0]["content"])
     await loop.close_sandboxes()

@@ -134,9 +134,18 @@ def _convert_messages(messages: list[dict[str, Any]]) -> tuple[str, list[dict[st
         role = msg.get("role")
         content = msg.get("content")
 
-        if role == "system":
+        if idx == 0 and role == "system":
             if isinstance(content, str) and content:
                 system_parts.append(content)
+            continue
+
+        if role in ("system", "developer"):
+            # Runtime notices/summaries belong where they were appended, not in
+            # the reusable instructions prefix. Codex accepts developer input.
+            input_items.append({
+                "role": "developer",
+                "content": [{"type": "input_text", "text": content or ""}],
+            })
             continue
 
         if role == "user":
@@ -216,7 +225,10 @@ def _split_tool_call_id(tool_call_id: Any) -> tuple[str, str | None]:
 
 
 def _prompt_cache_key(messages: list[dict[str, Any]]) -> str:
-    raw = json.dumps(messages, ensure_ascii=True, sort_keys=True)
+    # Route related turns together; hashing the full history changes the key
+    # on every tool result/user message and defeats this routing hint.
+    prefix = messages[0].get("content", "") if messages and messages[0].get("role") == "system" else ""
+    raw = json.dumps(prefix, ensure_ascii=True, sort_keys=True)
     return hashlib.sha256(raw.encode("utf-8")).hexdigest()
 
 

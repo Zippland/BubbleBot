@@ -11,6 +11,7 @@ import os
 import re
 import socket
 import time
+from collections import OrderedDict
 from collections.abc import Callable
 from ctypes import wintypes
 from dataclasses import dataclass
@@ -28,6 +29,7 @@ from bubbles.channels import wechat_app
 from bubbles.channels.base import BaseChannel
 from bubbles.channels.mentions import replace_mentions
 from bubbles.channels.wechat_app import IMAGE_EXTS
+from bubbles.channels.wechat_group_events import parse_group_join_members
 from bubbles.channels.wechat_media import (
     WECHAT_IMAGE_CACHE_TTL_SECONDS,
     prepare_wechat_image,
@@ -619,7 +621,7 @@ class WeChatChannel(BaseChannel):
     WeChat channel using wcferry.
 
     - Private chats: Direct reply
-    - Group chats: Reply when natively @mentioned or when text contains ``泡泡``
+    - Group chats: Native @mentions, ``泡泡``, and newcomer notices trigger the agent
     - Supports: text, image, voice, video, file, and quoted messages
     """
 
@@ -685,6 +687,7 @@ class WeChatChannel(BaseChannel):
         # msg.id as <svrid>; this lets us reuse the local copy instead of
         # re-downloading via wcferry (cdn handles expire fast).
         self._image_path_by_msg_id: dict[int, str] = {}
+        self._processed_join_ids: OrderedDict[tuple[str, str], None] = OrderedDict()
 
     async def start(self) -> None:
         """Start WeChat client and begin listening for messages."""
@@ -957,8 +960,9 @@ class WeChatChannel(BaseChannel):
 
     async def _process_msg(self, msg: WxMsg) -> None:
         """Process incoming WeChat message."""
-        # Skip self messages
-        if msg.from_self():
+        # Native notices can describe the bot inviting somebody else. They
+        # still need processing even when WCFerry marks them as from_self.
+        if msg.from_self() and msg.type != MSG_TYPE_SYSTEM:
             return
 
         is_group = msg.from_group()
@@ -970,6 +974,9 @@ class WeChatChannel(BaseChannel):
             chat_id = msg.roomid
             sender_id = msg.sender
             room_id = msg.roomid
+            if msg.type == MSG_TYPE_SYSTEM:
+                await self._handle_group_join(msg)
+                return
             native_at_me = msg.is_at(self.wxid)
             should_respond = native_at_me
         else:
@@ -1071,6 +1078,81 @@ class WeChatChannel(BaseChannel):
                 "message_id": str(msg.id) if getattr(msg, "id", None) is not None else None,
             }
         )
+
+    async def _handle_group_join(self, msg: WxMsg) -> None:
+        """Turn a native membership event into an ordinary user prompt."""
+        members = parse_group_join_members(msg.content)
+        if not members or not self.is_allowed(msg.sender):
+            return
+
+        message_id = str(msg.id) if getattr(msg, "id", None) else None
+        if message_id:
+            key = (msg.roomid, message_id)
+            if key in self._processed_join_ids:
+                return
+            self._processed_join_ids[key] = None
+            while len(self._processed_join_ids) > 1000:
+                self._processed_join_ids.popitem(last=False)
+
+        # A native text notice contains display names, not necessarily wxids.
+        # Read one fresh roster/contact snapshot off the event loop, avoiding
+        # one get_alias_in_chatroom RPC per member of a potentially large group.
+        joined_members = await asyncio.to_thread(
+            self._resolve_join_members, msg.roomid, members
+        )
+        labels = [
+            f"{member['name']} <@{member['wxid']}>"
+            if member["wxid"] else f"{member['name']}（wxid 暂未确认）"
+            for member in joined_members
+        ]
+        content = (
+            f"【系统通知】{'、'.join(labels)} 入群了。"
+            "可以 @ 新人欢迎一下。"
+        )
+        if any(not member["wxid"] for member in joined_members):
+            content += "未提供提及标记的成员不要猜测 wxid。"
+
+        await self._handle_message(
+            sender_id=msg.sender,
+            chat_id=msg.roomid,
+            content=content,
+            metadata={
+                "is_group": True,
+                "sender_name": "微信系统",
+                "respond": True,
+                "msg_type": MSG_TYPE_SYSTEM,
+                "message_id": message_id,
+                "event_type": "group_member_joined",
+                "joined_members": joined_members,
+            },
+        )
+
+    def _resolve_join_members(
+        self, chat_id: str, names: list[str]
+    ) -> list[dict[str, str | None]]:
+        """Resolve exact, unique names in this group; never infer an identity."""
+        roster = {}
+        if self.wcf:
+            try:
+                roster = self.wcf.get_chatroom_members(chat_id) or {}
+                self._load_contacts()
+            except Exception as exc:
+                logger.warning("Failed to resolve newcomers in {}: {}", chat_id, exc)
+
+        by_name: dict[str, set[str]] = {}
+        for wxid, room_name in roster.items():
+            contact = self._contacts.get(wxid) or WeChatContact()
+            for name in (room_name, contact.nickname, contact.remark, contact.alias):
+                if name:
+                    by_name.setdefault(name, set()).add(wxid)
+        resolved = []
+        for name in names:
+            matches = by_name.get(name, set())
+            resolved.append({
+                "name": name,
+                "wxid": next(iter(matches)) if len(matches) == 1 else None,
+            })
+        return resolved
 
     @staticmethod
     def _contains_bot_trigger(content: str | None) -> bool:

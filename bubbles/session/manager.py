@@ -306,7 +306,7 @@ class Session:
 
         for m in sliced:
             entry: dict[str, Any] = {"role": m["role"], "content": m.get("content", "")}
-            for k in ("tool_calls", "tool_call_id", "name"):
+            for k in ("tool_calls", "tool_call_id", "name", "reasoning_content"):
                 if k in m:
                     entry[k] = m[k]
             out.append(entry)

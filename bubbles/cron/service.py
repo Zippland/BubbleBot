@@ -10,7 +10,7 @@ from typing import Any, Callable, Coroutine
 
 from loguru import logger
 
-from bubbles.cron.types import CronJob, CronJobState, CronPayload, CronSchedule, CronStore
+from bubbles.cron.types import CronJob, CronJobState, CronPayload, CronSchedule, CronStore, is_retired_heartbeat
 
 
 MAX_TIMER_DELAY_MS = 60_000
@@ -224,6 +224,13 @@ class CronService:
             return
         now = _now_ms()
         for job in self._store.jobs:
+            if is_retired_heartbeat(job.name, job.payload.session_key):
+                # Preserve old records, but never reactivate the removed feature.
+                job.enabled = False
+                job.state.next_run_at_ms = None
+                job.state.running_at_ms = None
+                job.state.backoff_until_ms = None
+                continue
             if job.state.running_at_ms is not None:
                 # Process crashed mid-run. next_run_at_ms was pre-advanced before
                 # the run started, so just clear the flag and treat as completed
@@ -312,6 +319,13 @@ class CronService:
         the on_job callback runs. If the process dies mid-call, the next slot
         is already advanced past the current one, so we don't double-fire.
         """
+        if is_retired_heartbeat(job.name, job.payload.session_key):
+            # Also retire unexpected in-memory legacy jobs, so an overdue
+            # record cannot keep rearming a zero-delay timer without advancing.
+            job.enabled = False
+            job.state.next_run_at_ms = None
+            job.state.running_at_ms = None
+            return
         start_ms = _now_ms()
         job.state.running_at_ms = start_ms
         # Pre-advance next_run so a crash mid-run doesn't re-fire this slot.
@@ -437,6 +451,8 @@ class CronService:
         store = self._load_store()
         for job in store.jobs:
             if job.id == job_id:
+                if enabled and is_retired_heartbeat(job.name, job.payload.session_key):
+                    return None
                 job.enabled = enabled
                 job.updated_at_ms = _now_ms()
                 if enabled:
@@ -453,6 +469,8 @@ class CronService:
         store = self._load_store()
         for job in store.jobs:
             if job.id == job_id:
+                if is_retired_heartbeat(job.name, job.payload.session_key):
+                    return False
                 if not force and not job.enabled:
                     return False
                 if job.state.running_at_ms is not None:

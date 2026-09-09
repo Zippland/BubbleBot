@@ -1,6 +1,7 @@
-Send a message to a specific channel and chat. Defaults to replying to the current channel/chat from the runtime context. Can specify a different channel (telegram, feishu, wechat, discord, slack, etc.) and chat_id to send cross-channel messages.
+Send content and optional attachments to the currently selected destination. To change destination, first call switch_message_target and inspect its result. This tool takes no channel/chat_id. Its result contains only the destination and submission status, plus an error reason on failure. Content and attachments are already in the history and are not repeated. Submission is not confirmation of channel delivery.
 
 Usage:
-- Use this tool when you need to send a message to a specific destination
-- For simple replies, just respond normally without using this tool
+- Ordinary assistant text is also delivered to the same selected destination. Do not repeat the same text both as assistant text and through this tool.
+- Sending a message does not end the turn. Continue using tools as needed, then call stay_silent (end_turn) when finished.
+- Decide for yourself whether any message is useful. Tool calls do not require a progress message.
 - Supports media attachments via the media parameter
