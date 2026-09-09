@@ -504,17 +504,13 @@ def gateway(
     async def on_cron_job(job: CronJob) -> str | None:
         """Execute a cron job through the agent.
 
-        Uses the system-triggered tool-set for the duration of the turn:
-        - ``stay_silent`` remains available, as it is in every turn.
-        - ``cron`` is removed so a triggered turn cannot schedule more jobs
-          (no recursive job creation; see SPEC §5.6).
+        Uses the same tool schemas. cron rejects execution in system turns.
+        The shared sender publishes assistant text and message calls; do not deliver them twice.
         """
-        from bubbles.bus.events import OutboundMessage
-
         # Use the saved session_key to inject history, fallback to cron:{job.id}
         session_key = job.payload.session_key or f"cron:{job.id}"
 
-        response, tools_used = await agent.process_direct(
+        response, _tools_used = await agent.process_direct(
             job.payload.message,
             session_key=session_key,
             channel=job.payload.channel or "cli",
@@ -522,17 +518,7 @@ def gateway(
             system_triggered=True,
         )
 
-        if "stay_silent" in tools_used:
-            logger.info("cron: stay_silent for job {} ({})", job.id, job.name)
-            return None
-
-        if job.payload.deliver and job.payload.to and response:
-            await bus.publish_outbound(OutboundMessage(
-                channel=job.payload.channel or "cli",
-                chat_id=job.payload.to,
-                content=response,
-            ))
-        return response
+        return response or None
     cron.on_job = on_cron_job
 
     if channels.enabled_channels:

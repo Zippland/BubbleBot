@@ -1,270 +1,52 @@
-"""Tests for /heartbeat command + helpers."""
+"""Compatibility tests for removal of the former heartbeat feature."""
 
-from __future__ import annotations
-
-from unittest.mock import MagicMock
+from unittest.mock import AsyncMock
 
 import pytest
 
-from bubbles.agent.loop import AgentLoop, HEARTBEAT_TICK_MESSAGE
-from bubbles.bus.events import InboundMessage
+from bubbles.cli.status_cmd import _collect_session_overrides
 from bubbles.cron.service import CronService
+from bubbles.cron.types import CronSchedule, is_retired_heartbeat
 from bubbles.session.manager import SessionManager
 
 
-# ---------- Static helpers (pure functions) ----------
-
-@pytest.mark.parametrize("s,expected", [
-    ("30", 30),
-    ("30m", 30),
-    ("2h", 120),
-    ("1h", 60),
-    ("90s", 2),       # 90 / 60 with rounding → 2
-    ("30s", 1),       # subminute floors to 1
-    ("1", 1),
-    ("  45m  ", 45),  # surrounding whitespace
-    ("30 m", 30),     # inner space between number and unit is allowed
-    ("60M", 60),      # case-insensitive
+@pytest.mark.parametrize("name,key,retired", [
+    ("heartbeat:shared", "shared", True),
+    ("heartbeat:cli:direct", "cli:direct", True),
+    ("heartbeat:shared", "other", False),
+    ("heartbeat:shared", None, False),
+    ("regular", "shared", False),
 ])
-def test_parse_heartbeat_interval_valid(s: str, expected: int) -> None:
-    assert AgentLoop._parse_heartbeat_interval(s) == expected
+def test_retirement_only_matches_reserved_job_identity(name, key, retired):
+    assert is_retired_heartbeat(name, key) is retired
 
 
-@pytest.mark.parametrize("s", [
-    "", "abc", "30x", "1.5h", "-5", "h", "30min",
-])
-def test_parse_heartbeat_interval_invalid(s: str) -> None:
-    assert AgentLoop._parse_heartbeat_interval(s) is None
+@pytest.mark.asyncio
+async def test_legacy_heartbeat_cannot_be_forced_even_before_service_start(tmp_path):
+    path = tmp_path / "jobs.json"
+    old = CronService(path)
+    job = old.add_job("heartbeat:shared", CronSchedule(kind="every", every_ms=60_000),
+        "old heartbeat", session_key="shared")
+    callback = AsyncMock()
+    service = CronService(path, on_job=callback)
+    assert not await service.run_job(job.id, force=True)
+    assert service.enable_job(job.id) is None
+    callback.assert_not_awaited()
 
 
-def test_humanize_minutes_cn() -> None:
-    assert AgentLoop._humanize_minutes_cn(30) == "30 分钟"
-    assert AgentLoop._humanize_minutes_cn(60) == "1 小时"
-    assert AgentLoop._humanize_minutes_cn(120) == "2 小时"
-    assert AgentLoop._humanize_minutes_cn(90) == "90 分钟"  # not a whole hour
-
-
-def test_humanize_minutes_en() -> None:
-    assert AgentLoop._humanize_minutes_en(30) == "30 minutes"
-    assert AgentLoop._humanize_minutes_en(1) == "1 minute"
-    assert AgentLoop._humanize_minutes_en(60) == "1 hour"
-    assert AgentLoop._humanize_minutes_en(120) == "2 hours"
-
-
-def test_heartbeat_job_name() -> None:
-    assert AgentLoop._heartbeat_job_name("cli:direct") == "heartbeat:cli:direct"
-    assert AgentLoop._heartbeat_job_name("foo") == "heartbeat:foo"
-
-
-# ---------- Command integration ----------
-
-@pytest.fixture
-def loop(tmp_path):
-    """Build an AgentLoop with real cron+sessions, mocked bus+provider."""
-    bus = MagicMock()
-    provider = MagicMock()
-    provider.get_default_model.return_value = "test-model"
-
-    cron = CronService(tmp_path / "cron" / "jobs.json")
-
-    sessions = SessionManager(sessions_dir=tmp_path / "sessions")
-
-    return AgentLoop(
-        bus=bus,
-        provider=provider,
-        max_tokens=4096,
-        memory_window=20,
-        context_limit=128_000,
-        cron_service=cron,
-        session_manager=sessions,
-    )
-
-
-def _make_msg(content: str) -> InboundMessage:
-    return InboundMessage(channel="cli", sender_id="user", chat_id="direct", content=content)
-
-
-def test_heartbeat_status_when_off(loop) -> None:
-    session = loop.sessions.get_or_create("cli:direct")
-    msg = _make_msg("/heartbeat")
-    out = loop._handle_heartbeat_command(msg, session, "cli:direct", "")
-    assert "心跳未开启" in out.content
-    assert loop._build_heartbeat_info("cli:direct") is None
-
-
-def test_heartbeat_enable_creates_job_and_template(loop) -> None:
-    session = loop.sessions.get_or_create("cli:direct")
-    assert session.directory is not None
-    hb_path = session.directory / "HEARTBEATS.md"
-    assert not hb_path.exists()
-
-    msg = _make_msg("/heartbeat 30m")
-    out = loop._handle_heartbeat_command(msg, session, "cli:direct", "30m")
-
-    assert "心跳已开启" in out.content
-    assert "30 分钟" in out.content
-    assert hb_path.exists(), "HEARTBEATS.md template should be auto-written"
-    assert "Heartbeats" in hb_path.read_text(encoding="utf-8")
-
-    # Cron job registered with correct name + interval + tick message
-    job = loop._get_heartbeat_job("cli:direct")
-    assert job is not None
-    assert job.schedule.kind == "every"
-    assert job.schedule.every_ms == 30 * 60 * 1000
-    assert job.payload.message == HEARTBEAT_TICK_MESSAGE
-    assert job.payload.deliver is True
-
-
-def test_heartbeat_info_block_present_when_on(loop) -> None:
-    session = loop.sessions.get_or_create("cli:direct")
-    msg = _make_msg("/heartbeat 30m")
-    loop._handle_heartbeat_command(msg, session, "cli:direct", "30m")
-
-    info = loop._build_heartbeat_info("cli:direct")
-    assert info is not None
-    assert "## Heartbeat: ON" in info
-    assert "30 minutes" in info
-    assert "stay_silent" in info
-
-
-def test_heartbeat_replace_keeps_existing_template(loop) -> None:
-    """Re-enabling should not overwrite a user-edited HEARTBEATS.md."""
-    session = loop.sessions.get_or_create("cli:direct")
-    msg = _make_msg("/heartbeat 30m")
-    loop._handle_heartbeat_command(msg, session, "cli:direct", "30m")
-
-    hb_path = session.directory / "HEARTBEATS.md"
-    hb_path.write_text("# my own checklist\n- item A", encoding="utf-8")
-
-    # Change interval — should replace cron job but keep file
-    out = loop._handle_heartbeat_command(msg, session, "cli:direct", "1h")
-    assert "已开启" in out.content
-    assert "1 小时" in out.content
-    assert hb_path.read_text(encoding="utf-8") == "# my own checklist\n- item A"
-    # Re-enabling on an existing file must not boast about writing a template
-    assert "模板" not in out.content
-
-    # Only one heartbeat job exists (old was replaced, not duplicated)
-    matches = [
-        j for j in loop.cron_service.list_jobs(include_disabled=True)
-        if j.name == "heartbeat:cli:direct"
-    ]
-    assert len(matches) == 1
-    assert matches[0].schedule.every_ms == 60 * 60 * 1000
-
-
-def test_heartbeat_off(loop) -> None:
-    session = loop.sessions.get_or_create("cli:direct")
-    msg = _make_msg("/heartbeat 30m")
-    loop._handle_heartbeat_command(msg, session, "cli:direct", "30m")
-    assert loop._get_heartbeat_job("cli:direct") is not None
-
-    out = loop._handle_heartbeat_command(_make_msg("/heartbeat off"), session, "cli:direct", "off")
-    assert "已关闭" in out.content
-    assert loop._get_heartbeat_job("cli:direct") is None
-    assert loop._build_heartbeat_info("cli:direct") is None
-
-
-def test_heartbeat_off_when_not_on(loop) -> None:
-    session = loop.sessions.get_or_create("cli:direct")
-    out = loop._handle_heartbeat_command(_make_msg("/heartbeat off"), session, "cli:direct", "off")
-    assert "本来就没开" in out.content
-
-
-def test_heartbeat_invalid_format(loop) -> None:
-    session = loop.sessions.get_or_create("cli:direct")
-    out = loop._handle_heartbeat_command(_make_msg("/heartbeat junk"), session, "cli:direct", "junk")
-    assert "格式不对" in out.content
-    assert loop._get_heartbeat_job("cli:direct") is None
-
-
-def test_heartbeat_out_of_range(loop) -> None:
-    session = loop.sessions.get_or_create("cli:direct")
-    out = loop._handle_heartbeat_command(_make_msg("/heartbeat 0m"), session, "cli:direct", "0m")
-    assert "间隔需在" in out.content
-    out = loop._handle_heartbeat_command(_make_msg("/heartbeat 25h"), session, "cli:direct", "25h")
-    assert "间隔需在" in out.content
-
-
-def test_heartbeat_isolated_per_session(loop) -> None:
-    """Two sessions should have independent heartbeat state."""
-    s1 = loop.sessions.get_or_create("cli:alice")
-    s2 = loop.sessions.get_or_create("cli:bob")
-    loop._handle_heartbeat_command(_make_msg("/heartbeat 30m"), s1, "cli:alice", "30m")
-
-    assert loop._get_heartbeat_job("cli:alice") is not None
-    assert loop._get_heartbeat_job("cli:bob") is None
-    assert loop._build_heartbeat_info("cli:alice") is not None
-    assert loop._build_heartbeat_info("cli:bob") is None
-
-
-# ---------- bubbles status integration ----------
-
-def test_scan_cron_jobs_separates_heartbeats(tmp_path) -> None:
-    """`_scan_cron_jobs` must split regular cron jobs from heartbeats."""
-    from bubbles.cli.commands import _scan_cron_jobs, _format_interval
-    from bubbles.cron.service import CronService
-    from bubbles.cron.types import CronSchedule
-
-    svc = CronService(tmp_path / "cron" / "jobs.json")
-    # 1 plain cron + 2 heartbeats
-    svc.add_job(
-        name="daily standup",
-        schedule=CronSchedule(kind="cron", expr="0 9 * * *", tz="UTC"),
-        message="ping",
-    )
-    svc.add_job(
-        name="heartbeat:cli:alice",
-        schedule=CronSchedule(kind="every", every_ms=30 * 60_000),
-        message="tick",
-    )
-    svc.add_job(
-        name="heartbeat:telegram:work",
-        schedule=CronSchedule(kind="every", every_ms=60 * 60_000),
-        message="tick",
-    )
-
-    cron_count, heartbeats = _scan_cron_jobs(tmp_path)
-    assert cron_count == 1, "regular cron job should not be counted as heartbeat"
-    sessions = sorted(h["session"] for h in heartbeats)
-    assert sessions == ["cli:alice", "telegram:work"]
-
-    intervals = {h["session"]: _format_interval(h["every_ms"]) for h in heartbeats}
-    assert intervals["cli:alice"] == "30m"
-    assert intervals["telegram:work"] == "1h"
-
-
-def test_scan_cron_jobs_skips_disabled_heartbeats(tmp_path) -> None:
-    """Disabled heartbeat rows shouldn't show up in status."""
-    from bubbles.cli.commands import _scan_cron_jobs
-    from bubbles.cron.service import CronService
-    from bubbles.cron.types import CronSchedule
-
-    svc = CronService(tmp_path / "cron" / "jobs.json")
-    job = svc.add_job(
-        name="heartbeat:cli:test",
-        schedule=CronSchedule(kind="every", every_ms=30 * 60_000),
-        message="tick",
-    )
-    svc.enable_job(job.id, enabled=False)
-
-    cron_count, heartbeats = _scan_cron_jobs(tmp_path)
-    assert cron_count == 0
-    assert heartbeats == []
-
-
-def test_scan_cron_jobs_handles_missing_store(tmp_path) -> None:
-    from bubbles.cli.commands import _scan_cron_jobs
-    cron_count, heartbeats = _scan_cron_jobs(tmp_path)
-    assert cron_count == 0
-    assert heartbeats == []
-
-
-def test_format_interval() -> None:
-    from bubbles.cli.commands import _format_interval
-    assert _format_interval(30 * 60_000) == "30m"
-    assert _format_interval(60 * 60_000) == "1h"
-    assert _format_interval(2 * 60 * 60_000) == "2h"
-    assert _format_interval(90 * 60_000) == "90m"  # not a whole hour
-    assert _format_interval(None) == "?"
-    assert _format_interval(0) == "?"
+def test_status_omits_legacy_heartbeat_but_keeps_regular_jobs(tmp_path):
+    sessions = tmp_path / "sessions"
+    manager = SessionManager(sessions_dir=sessions)
+    session = manager.get_or_create("shared")
+    manager.save(session)
+    service = CronService(tmp_path / "cron" / "jobs.json")
+    service.add_job("heartbeat:shared", CronSchedule(kind="every", every_ms=60_000),
+        "tick", session_key="shared")
+    assert _collect_session_overrides(sessions, tmp_path, "test-model") == ([], 0)
+    service.add_job("regular", CronSchedule(kind="every", every_ms=60_000),
+        "run", session_key="shared")
+    overrides, unassigned = _collect_session_overrides(sessions, tmp_path, "test-model")
+    assert unassigned == 0
+    assert len(overrides) == 1
+    assert overrides[0]["cron"] == 1
+    assert "heartbeat_ms" not in overrides[0]

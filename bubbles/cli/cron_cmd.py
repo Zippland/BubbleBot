@@ -239,6 +239,7 @@ def cron_run(
             session_key=f"cron:{job.id}",
             channel=job.payload.channel or "cli",
             chat_id=job.payload.to or "direct",
+            system_triggered=True,
         )
         result_holder.append(response)
         return response

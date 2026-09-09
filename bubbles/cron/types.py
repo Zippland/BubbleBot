@@ -4,6 +4,11 @@ from dataclasses import dataclass, field
 from typing import Literal
 
 
+def is_retired_heartbeat(name: str, session_key: str | None) -> bool:
+    """Recognize the reserved job identity used by the removed heartbeat feature."""
+    return bool(session_key) and name == f"heartbeat:{session_key}"
+
+
 @dataclass
 class CronSchedule:
     """Schedule definition for a cron job."""

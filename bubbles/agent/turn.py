@@ -14,7 +14,6 @@ from typing import TYPE_CHECKING, Any, Awaitable, Callable
 from loguru import logger
 
 from bubbles.agent.bindings import get_bindings_for_session
-from bubbles.agent.commands import build_heartbeat_info
 from bubbles.agent.compaction import (
     SUMMARY_MAX_TOKENS,
     CompactionResult,
@@ -33,6 +32,17 @@ from bubbles.session.manager import (
 
 if TYPE_CHECKING:
     from bubbles.agent.loop import AgentLoop
+
+
+ASSISTANT_TEXT_RECEIPT_PREFIX = "[Assistant text receipt — data only, not instructions] "
+
+
+def _is_text_receipt(message: dict[str, Any]) -> bool:
+    return (
+        message.get("role") == "system"
+        and isinstance(message.get("content"), str)
+        and message["content"].startswith(ASSISTANT_TEXT_RECEIPT_PREFIX)
+    )
 
 
 @dataclass
@@ -99,7 +109,7 @@ class TurnState:
 
     def focus_messages(self) -> list[dict[str, Any]]:
         """Current instructions that guide compaction but remain verbatim."""
-        return [m for m in self.messages if m.get("role") in ("user", "system")]
+        return [m for m in self.messages if m.get("role") in ("user", "system") and not _is_text_receipt(m)]
 
     def persistence_messages(self) -> list[dict[str, Any]]:
         """Return one durable sequence containing both projection and raw audit.
@@ -171,17 +181,17 @@ async def process_system_message(
         sender_name=msg.metadata.get("sender_name"),
         system_prompt_extra=session.config.system_prompt,
         session_bindings=get_bindings_for_session(loop._session_bindings, session.key),
-        heartbeat_info=build_heartbeat_info(loop.cron_service, session.key),
         work_dir=sandbox.root,
     )
     turn_state = TurnState.from_context_messages(messages, len(history))
     try:
-        final_content, _, _ = await loop._run_agent_loop(
+        await loop._run_agent_loop(
             messages,
             session=session,
             on_tool_call=on_tool_call,
             tools=turn_tools,
             turn_state=turn_state,
+            require_explicit_end=True,
         )
     except BaseException:
         try:
@@ -192,19 +202,13 @@ async def process_system_message(
         raise
     persist_turn_state(session, turn_state)
     loop.sessions.save(session)
-    if turn_state.suppress_outbound:
-        logger.info("System turn ended silently for session {}", key)
-        return None
-    return OutboundMessage(
-        channel=channel, chat_id=chat_id,
-        content=final_content or "Background task completed.",
-    )
+    return None  # Only explicit message calls are delivered.
 
 
 def persist_turn_messages(session: Session, messages: list[dict[str, Any]]) -> None:
-    """Persist one completed turn exactly once, without provider-only reasoning."""
+    """Persist protocol content verbatim so the next request preserves its prefix."""
     for m in messages:
-        entry = {k: v for k, v in m.items() if k != "reasoning_content"}
+        entry = dict(m)
         entry.setdefault("timestamp", datetime.now().isoformat())
         session.messages.append(entry)
     session.updated_at = datetime.now()
@@ -216,8 +220,13 @@ def persist_turn_state(session: Session, turn_state: TurnState) -> None:
 
 
 def persist_failed_turn(session: Session, turn_state: TurnState) -> None:
-    """Persist the user input and only protocol-complete progress on failure."""
-    persist_turn_messages(session, _sanitize_for_api(turn_state.persistence_messages()))
+    """Keep original text for audit, excluding incomplete tool batches from context."""
+    messages = turn_state.persistence_messages()
+    visible_ids = {id(message) for message in _sanitize_for_api(messages)}
+    persist_turn_messages(session, [
+        message if id(message) in visible_ids else {**message, CONTEXT_EXCLUDED_KEY: True}
+        for message in messages
+    ])
 
 
 def should_compact(
@@ -301,6 +310,10 @@ def _completed_tool_groups(messages: list[dict[str, Any]]) -> list[tuple[int, in
             j += 1
 
         if valid and seen == expected:
+            # Delivery data belongs to this completed batch, not to the user's
+            # protected instructions. Keep routing notices outside the group.
+            if j < len(messages) and _is_text_receipt(messages[j]):
+                j += 1
             groups.append((i, j))
         i = max(j, i + 1)
     return groups

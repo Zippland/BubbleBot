@@ -11,6 +11,7 @@ from loguru import logger
 from bubbles.bus.events import InboundMessage
 from bubbles.bus.queue import MessageBus
 from bubbles.providers.base import LLMProvider
+from bubbles.agent.context import ContextBuilder
 from bubbles.agent.tools.registry import ToolRegistry
 from bubbles.agent.tools.filesystem import ReadFileTool, WriteFileTool, EditFileTool, ListDirTool
 from bubbles.agent.tools.shell import ExecTool
@@ -119,7 +120,7 @@ class SubagentManager:
             system_prompt = self._build_subagent_prompt(task, session_dir)
             messages: list[dict[str, Any]] = [
                 {"role": "system", "content": system_prompt},
-                {"role": "user", "content": task},
+                {"role": "user", "content": ContextBuilder._inject_runtime_context(task, None, None)},
             ]
             
             # Run agent loop (limited iterations)
@@ -227,16 +228,9 @@ class SubagentManager:
     
     def _build_subagent_prompt(self, task: str, session_dir: Path | None = None) -> str:
         """Build a focused system prompt for the subagent."""
-        from datetime import datetime
-        import time as _time
-        now = datetime.now().strftime("%Y-%m-%d %H:%M (%A)")
-        tz = _time.strftime("%Z") or "UTC"
         workspace = str(session_dir) if session_dir else "current directory"
 
         return f"""# Subagent
-
-## Current Time
-{now} ({tz})
 
 You are a subagent spawned by the main agent to complete a specific task.
 

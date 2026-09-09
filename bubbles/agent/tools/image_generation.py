@@ -45,7 +45,7 @@ def _content_matches_image_format(data: bytes, suffix: str) -> bool:
 class GenerateImageTool(Tool):
     """Generate images through a configurable provider backend."""
 
-    def __init__(self, backend: ImageGenerationBackend) -> None:
+    def __init__(self, backend: ImageGenerationBackend | None) -> None:
         self._backend = backend
         self._sandbox: Sandbox | None = None
 
@@ -118,6 +118,8 @@ class GenerateImageTool(Tool):
         count: int = 1,
         **kwargs: Any,
     ) -> str:
+        if self._backend is None:
+            return "Error: 生图后端未配置，当前无法生成或编辑图片。请先配置生图服务。"
         if self._sandbox is None:
             return "Error: no sandbox bound"
         if not prompt.strip():

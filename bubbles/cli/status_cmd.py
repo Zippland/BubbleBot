@@ -12,6 +12,7 @@ from datetime import datetime, timedelta
 
 from bubbles import __logo__
 from bubbles.cli.commands import app, console
+from bubbles.cron.types import is_retired_heartbeat
 
 
 # Cap on Session-overrides rows. status is supposed to be at-a-glance, not a
@@ -67,7 +68,7 @@ def status():
     else:
         console.print("\nChannels:  [dim]none enabled[/dim]")
 
-    # Session overrides: only sessions whose model / cron / heartbeat differs.
+    # Session overrides: only sessions whose model / cron differs.
     default_model = config.agents.defaults.model
     overrides, unassigned_cron = _collect_session_overrides(sessions_dir, get_data_path(), default_model)
     _render_overrides_section(overrides, total_sessions=session_stats["count"])
@@ -214,12 +215,11 @@ def _collect_session_overrides(
         {
             "session": str,                # session key
             "model": str | None,           # set if model differs from default
-            "cron": int,                   # non-heartbeat job count for this session
-            "heartbeat_ms": int | None,    # set if heartbeat enabled
+            "cron": int,                   # active-feature job count for this session
             "last_activity": datetime | None,
         }
 
-    A session appears in the list iff at least one of (model, cron, heartbeat)
+    A session appears in the list iff at least one of (model, cron)
     is a true override.
     """
     # Pass 1: read each session's config.json + jsonl mtime
@@ -235,7 +235,6 @@ def _collect_session_overrides(
                 "session": child.name,
                 "model": None,
                 "cron": 0,
-                "heartbeat_ms": None,
                 "last_activity": None,
             }
             try:
@@ -253,28 +252,20 @@ def _collect_session_overrides(
     for j in _iter_cron_jobs(data_path):
         name = j.get("name", "")
         session_key = j.get("payload", {}).get("sessionKey")
-        if name.startswith("heartbeat:"):
-            if not j.get("enabled", True):
-                continue
-            hb_key = name[len("heartbeat:"):]
-            entry = sessions.get(hb_key)
-            if entry is not None:
-                entry["heartbeat_ms"] = j.get("schedule", {}).get("everyMs")
-            # If the heartbeat names a session that no longer exists on disk,
-            # we silently drop it — status is a snapshot, not an integrity tool.
+        if is_retired_heartbeat(name, session_key):
+            continue
+        if session_key and session_key in sessions:
+            sessions[session_key]["cron"] += 1
         else:
-            if session_key and session_key in sessions:
-                sessions[session_key]["cron"] += 1
-            else:
-                unassigned += 1
+            unassigned += 1
 
     overrides = [
         e for e in sessions.values()
-        if e["model"] is not None or e["cron"] > 0 or e["heartbeat_ms"] is not None
+        if e["model"] is not None or e["cron"] > 0
     ]
     # Sort: most-customized first (number of override dimensions), then most-recent.
     def _rank(e: dict) -> tuple[int, float]:
-        dims = (1 if e["model"] else 0) + (1 if e["cron"] else 0) + (1 if e["heartbeat_ms"] else 0)
+        dims = (1 if e["model"] else 0) + (1 if e["cron"] else 0)
         ts = e["last_activity"].timestamp() if e["last_activity"] else 0.0
         return (-dims, -ts)
     overrides.sort(key=_rank)
@@ -323,19 +314,7 @@ def _render_overrides_section(overrides: list[dict], total_sessions: int) -> Non
             parts.append(f"model: {entry['model']}")
         if entry["cron"]:
             parts.append(f"cron: {entry['cron']}")
-        if entry["heartbeat_ms"]:
-            parts.append(f"heartbeat: {_format_interval(entry['heartbeat_ms'])}")
         console.print(f"  {entry['session'].ljust(name_width)}  {'  ·  '.join(parts)}")
 
     if n > SESSION_OVERRIDES_LIMIT:
         console.print(f"  [dim]({n - SESSION_OVERRIDES_LIMIT} more session(s) with overrides)[/dim]")
-
-
-def _format_interval(every_ms: int | None) -> str:
-    """Compact interval format matching the /heartbeat input syntax (30m / 1h)."""
-    if not every_ms:
-        return "?"
-    minutes = every_ms // 60_000
-    if minutes >= 60 and minutes % 60 == 0:
-        return f"{minutes // 60}h"
-    return f"{minutes}m"

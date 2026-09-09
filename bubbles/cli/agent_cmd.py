@@ -236,7 +236,12 @@ def agent(
                 while True:
                     try:
                         msg = await asyncio.wait_for(bus.consume_outbound(), timeout=1.0)
-                        if msg.metadata.get("_progress"):
+                        if msg.metadata.get("_agent_message"):
+                            # A message is not a turn-completion event. The loop
+                            # publishes a separate empty completion after end_turn.
+                            from prompt_toolkit import print_formatted_text
+                            print_formatted_text(f"\n{__logo__} bubbles\n{msg.content}\n")
+                        elif msg.metadata.get("_progress"):
                             is_tool_hint = msg.metadata.get("_tool_hint", False)
                             ch = agent_loop.channels_config
                             if ch and is_tool_hint and not ch.send_tool_hints:

@@ -2,7 +2,7 @@
 
 [CmdletBinding()]
 param(
-    [string]$RepoPath = (Split-Path -Parent $PSScriptRoot),
+    [string]$RepoPath,
     [string]$GitPath = "git",
     [string]$UvPath = "uv",
     [ValidatePattern("^[A-Za-z0-9][A-Za-z0-9._-]*$")]
@@ -1629,6 +1629,20 @@ if ([Environment]::Is64BitOperatingSystem -and -not [Environment]::Is64BitProces
 }
 if (-not [Environment]::UserInteractive) {
     throw "The supervisor must run in the current user's interactive session."
+}
+
+# Installed tasks supply RepoPath explicitly. Resolve a manual invocation's
+# default only after parameter binding has finished and script variables exist.
+if ([string]::IsNullOrWhiteSpace($RepoPath)) {
+    $scriptDirectory = $PSScriptRoot
+    if ([string]::IsNullOrWhiteSpace($scriptDirectory) -and
+        -not [string]::IsNullOrWhiteSpace($PSCommandPath)) {
+        $scriptDirectory = Split-Path -Parent $PSCommandPath
+    }
+    if ([string]::IsNullOrWhiteSpace($scriptDirectory)) {
+        throw "Cannot determine the script directory. Supply -RepoPath with the repository's absolute path."
+    }
+    $RepoPath = Split-Path -Parent $scriptDirectory
 }
 
 $identity = [System.Security.Principal.WindowsIdentity]::GetCurrent()

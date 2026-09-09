@@ -3,7 +3,7 @@
 
 [CmdletBinding()]
 param(
-    [string]$RepoPath = (Split-Path -Parent $PSScriptRoot),
+    [string]$RepoPath,
     [ValidatePattern("^[A-Za-z0-9][A-Za-z0-9._-]*$")]
     [string]$Remote = "bubblebot",
     [ValidatePattern("^[A-Za-z0-9][A-Za-z0-9._/-]*$")]
@@ -169,6 +169,20 @@ if ([Environment]::Is64BitOperatingSystem -and -not [Environment]::Is64BitProces
 }
 if (-not [Environment]::UserInteractive) {
     throw "Run this installer from the current user's interactive session."
+}
+
+# Resolve the default during script execution, not parameter binding: script
+# automatic variables may still be empty when a default expression is evaluated.
+if ([string]::IsNullOrWhiteSpace($RepoPath)) {
+    $scriptDirectory = $PSScriptRoot
+    if ([string]::IsNullOrWhiteSpace($scriptDirectory) -and
+        -not [string]::IsNullOrWhiteSpace($PSCommandPath)) {
+        $scriptDirectory = Split-Path -Parent $PSCommandPath
+    }
+    if ([string]::IsNullOrWhiteSpace($scriptDirectory)) {
+        throw "Cannot determine the script directory. Supply -RepoPath with the repository's absolute path."
+    }
+    $RepoPath = Split-Path -Parent $scriptDirectory
 }
 
 $identity = [System.Security.Principal.WindowsIdentity]::GetCurrent()

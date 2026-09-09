@@ -8,7 +8,7 @@ import json_repair
 import litellm
 from litellm import acompletion
 
-from bubbles.providers.base import LLMProvider, LLMResponse, ToolCallRequest, to_llm_call_error
+from bubbles.providers.base import LLMProvider, LLMResponse, ToolCallRequest, normalize_usage, to_llm_call_error
 from bubbles.providers.registry import find_by_model, find_by_name, find_gateway
 
 # Standard OpenAI chat-completion message keys plus reasoning_content for
@@ -307,13 +307,7 @@ class LiteLLMProvider(LLMProvider):
                     arguments=args,
                 ))
 
-        usage = {}
-        if hasattr(response, "usage") and response.usage:
-            usage = {
-                "prompt_tokens": response.usage.prompt_tokens,
-                "completion_tokens": response.usage.completion_tokens,
-                "total_tokens": response.usage.total_tokens,
-            }
+        usage = normalize_usage(getattr(response, "usage", None))
 
         reasoning_content = getattr(message, "reasoning_content", None) or None
 

@@ -2,10 +2,12 @@
 
 from __future__ import annotations
 
+import json
 from types import SimpleNamespace
 
 import pytest
 
+from bubbles.agent.context import ContextBuilder
 from bubbles.agent.loop import AgentLoop
 from bubbles.agent.tools.message import MessageTool
 from bubbles.agent.tools.registry import ToolRegistry
@@ -84,9 +86,18 @@ def _silent_response(*, mixed: bool = False) -> LLMResponse:
         calls.insert(0, ToolCallRequest(
             id="message-1",
             name="message",
-            arguments={"content": "must not be sent"},
+            arguments={"content": "explicit message"},
         ))
-    return LLMResponse(content="这条也不能作为 progress 发出去", tool_calls=calls)
+    return LLMResponse(content="可选的说明" if mixed else None, tool_calls=calls)
+
+
+def test_tool_call_preamble_is_optional(tmp_path) -> None:
+    prompt = ContextBuilder(session_dir=tmp_path).build_system_prompt()
+
+    assert "Tool calls do not require a preamble." in prompt
+    assert "only when you independently judge" in prompt
+    assert "otherwise call the tool directly" in prompt
+    assert "Before calling tools, you may briefly state your intent" not in prompt
 
 
 def test_stay_silent_is_registered_for_every_turn(tmp_path) -> None:
@@ -112,7 +123,7 @@ def test_stay_silent_is_registered_for_every_turn(tmp_path) -> None:
 
 
 @pytest.mark.asyncio
-async def test_stay_silent_stops_without_progress_or_parallel_side_effects(tmp_path) -> None:
+async def test_stay_silent_finishes_batch_without_implicit_progress(tmp_path) -> None:
     provider = _ScriptedProvider(_silent_response(mixed=True))
     loop = _make_loop(tmp_path, provider)
     loop.max_iterations = 1
@@ -126,7 +137,10 @@ async def test_stay_silent_stops_without_progress_or_parallel_side_effects(tmp_p
     sent = []
     progress = []
     tools = ToolRegistry()
-    message = MessageTool(send_callback=sent.append)
+    async def send(outbound):
+        sent.append(outbound)
+
+    message = MessageTool(send_callback=send)
     message.set_context("wechat", "room@chatroom")
     tools.register(message)
     tools.register(StaySilentTool())
@@ -144,18 +158,17 @@ async def test_stay_silent_stops_without_progress_or_parallel_side_effects(tmp_p
 
     assert provider.calls == 1
     assert final is None
-    assert tools_used == ["stay_silent"]
+    assert tools_used == ["message", "stay_silent"]
     assert turn_state.suppress_outbound is True
     assert progress == []
-    assert sent == []
+    assert [m.content for m in sent] == ["可选的说明", "explicit message"]
 
     persist_turn_state(session, turn_state)
     assert session.messages[0]["role"] == "user"
-    assert all(
-        message.get(CONTEXT_EXCLUDED_KEY) is True
-        for message in session.messages[1:]
-    )
-    assert "stay-silent" not in repr(session.get_history())
+    assert not any(m.get(CONTEXT_EXCLUDED_KEY) for m in session.messages)
+    assert [m["tool_call_id"] for m in session.get_history() if m["role"] == "tool"] == [
+        "message-1", "silent-1",
+    ]
 
 
 @pytest.mark.asyncio
@@ -180,7 +193,7 @@ async def test_user_turn_stay_silent_has_no_outbound_or_fallback(tmp_path) -> No
     session = loop.sessions.get_or_create("shared-session")
     assert "I've completed processing" not in repr(session.messages)
     assert any("大家在聊泡泡浴" in str(message.get("content")) for message in session.messages)
-    assert "stay-silent" not in repr(session.get_history())
+    assert session.get_history()[-1]["name"] == "stay_silent"
 
 
 @pytest.mark.asyncio
@@ -191,7 +204,7 @@ async def test_system_turn_stay_silent_has_no_background_fallback(tmp_path) -> N
     loop._session_bindings["wechat:room@chatroom"] = "shared-session"
     msg = InboundMessage(
         channel="system",
-        sender_id="heartbeat",
+        sender_id="cron",
         chat_id="shared-session",
         content="check whether anything needs attention",
     )
@@ -201,7 +214,7 @@ async def test_system_turn_stay_silent_has_no_background_fallback(tmp_path) -> N
     assert response is None
     session = loop.sessions.get_or_create("shared-session")
     assert "Background task completed" not in repr(session.messages)
-    assert "stay-silent" not in repr(session.get_history())
+    assert session.get_history()[-1]["name"] == "stay_silent"
 
 
 @pytest.mark.asyncio
@@ -215,6 +228,7 @@ async def test_message_tool_still_sends_normally() -> None:
 
     result = await tool.execute(content="hello")
 
-    assert result == "Message sent to wechat:room"
-    assert tool._sent_in_turn is True
+    receipt = json.loads(result)
+    assert receipt == {"status": "submitted", "channel": "wechat", "chat_id": "room"}
+    assert sent[0].metadata["_agent_message"] is True
     assert [message.content for message in sent] == ["hello"]

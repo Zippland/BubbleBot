@@ -130,6 +130,24 @@ def to_llm_call_error(exc: BaseException) -> LLMCallError:
     return LLMCallError(classify_exception(exc), str(exc), _retry_after_of(exc))
 
 
+def normalize_usage(usage: Any) -> dict[str, int]:
+    """Keep reported token/cache counters without treating missing data as zero."""
+    def value(obj: Any, key: str) -> Any:
+        return obj.get(key) if isinstance(obj, dict) else getattr(obj, key, None)
+
+    result = {}
+    for key in ("prompt_tokens", "completion_tokens", "total_tokens",
+                "cache_read_input_tokens", "cache_creation_input_tokens"):
+        count = value(usage, key)
+        if isinstance(count, int):
+            result[key] = count
+    details = value(usage, "prompt_tokens_details")
+    cached = value(details, "cached_tokens")
+    if isinstance(cached, int):
+        result["cached_tokens"] = cached
+    return result
+
+
 @dataclass
 class ToolCallRequest:
     """A tool call request from the LLM."""

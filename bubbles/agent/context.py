@@ -20,7 +20,7 @@ class ContextBuilder:
     """
 
     # Bootstrap files loaded from session directory
-    BOOTSTRAP_FILES = ["SOUL.md", "MEMORY.md", "HEARTBEATS.md"]
+    BOOTSTRAP_FILES = ["SOUL.md", "MEMORY.md"]
 
     def __init__(self, session_dir: Path):
         """Initialize context builder.
@@ -99,34 +99,38 @@ class ContextBuilder:
 - Files in <work_dir>/data are auto-deleted after 3 days of inactivity. Persist long-term facts in MEMORY.md, not in files.
 
 ## Message Context
-Reply directly with text for conversations. Only use the 'message' tool to send to a specific channel.
+Both 'message' and ordinary assistant text are delivered to the current selected message target, including text before tool calls. Reasoning is not delivered. Do not repeat a sentence through both paths.
+Use 'switch_message_target' to select a different channel/chat, then inspect the result before speaking there. 'message' takes only content/media, never destination arguments.
+The destination is saved per workspace across turns and restarts until explicitly switched. Incoming messages do not reset it. The latest [Current message target] notice identifies it; the input source below may differ. 'find_person' also searches this selected target.
+Assistant text in a response is sent BEFORE that response's tool calls. To switch windows, call switch_message_target without accompanying text, then speak after its result. Each submission returns only the selected destination and status, plus an error reason on failure; content and attachments are already in the history and are not repeated. Receipts are internal data, not additional messages to the channel; submitted does not mean confirmed delivered.
+After completing this turn, call 'stay_silent' (end_turn). It sends nothing itself and works both after replying and when no reply is needed.
 MUST be plain text only - no Markdown formatting (**, #, -, ```, etc.) as chat apps don't render it.
 
 PS. Each user message includes a [Runtime Context] block at the end with:
 - Current time and timezone
-- Channel and chat ID
+- Input source channel and chat ID (not necessarily the selected outbound target)
 - Sender information (name and ID when available)
 
 ## Tool Call Guidelines
-- Before calling tools, you may briefly state your intent, but NEVER predict the result.
+- Tool calls do not require a preamble. Speak only when you independently judge
+  that a user-visible update adds concrete value; otherwise call the tool directly. NEVER
+  predict the result.
 - Before modifying a file, read it first.
 - Do not assume a file exists — use list_dir or read_file to verify.
 - If a tool call fails, analyze the error before retrying.
 
-## Soul, Memory & Heartbeats
-Three persistent workspace files. Each owns a distinct slice — keep them sharp, don't blur them.
+## Soul & Memory
+Two persistent workspace files. Each owns a distinct slice — keep them sharp, don't blur them.
 
 - **SOUL.md = how I am.** Identity, defaults, behavioral rules. Voice: *"I do / I don't / I default to X."* Update with `edit_file` when your sense of self genuinely evolves; tell the user when you do.
 - **MEMORY.md = what I know.** Facts about the outside world — user, project, environment, relationships. Voice: *"User's name is David. The repo is at X. API uses OAuth2."* Write facts immediately with `edit_file` or `write_file`.
-- **HEARTBEATS.md = what to check each tick.** Action triggers fired on every heartbeat. Voice: *"Scan inbox. Check unread > 5. Light check-in if quiet 8h+ during daytime."* Only created once the user enables heartbeats; persists when off (ticks just don't fire).
 
 **Anti-overlap rules** (the boundaries blur if you let them):
 - *A fact about the user* ("user prefers casual tone") → MEMORY, **not** SOUL.
 - *A rule for yourself* ("I default to casual tone") → SOUL, **not** MEMORY.
-- *A recurring action* ("each tick scan calendar") → HEARTBEATS, **not** MEMORY or SOUL (those aren't action lists).
-- *A one-shot or precise-time task* ("remind me at 9am Friday") → cron tool, **not** HEARTBEATS.
+- *A scheduled action* ("check every hour" / "remind me at 9am Friday") → cron tool, not MEMORY or SOUL.
 
-**Prune ruthlessly.** These are working notes, not append-only logs. When a SOUL entry no longer reflects you, a MEMORY fact became untrue (preference changed, project shifted, relationship ended), or a HEARTBEATS check went obsolete (the inbox you scanned is gone, the deadline passed) — **delete it with `edit_file`**. Stale entries dilute signal and waste tokens every turn. A short, sharp file beats a long, cluttered one.
+**Prune ruthlessly.** These are working notes, not append-only logs. When a SOUL entry no longer reflects you or a MEMORY fact became untrue (preference changed, project shifted, relationship ended), delete it with `edit_file`. Stale entries dilute signal and waste tokens every turn. A short, sharp file beats a long, cluttered one.
 
 ## Recalling past conversations
 What you see above is a **window**, not the whole history. Long sessions get compacted: older turns are replaced by a summary, so details that were once said may no longer be in front of you. **Nothing is lost** — every message ever exchanged in this session stays in `<work_dir>/session.jsonl`.
@@ -143,13 +147,11 @@ When the user asks you to do something on a schedule — "remind me at 9am tomor
 
 Write the cron `message` so it carries the full intent:
 - State the condition explicitly (look at recent group history? check a URL? read a file? scan MEMORY?).
-- If the task is "act only when something is worth saying", end the message with: *"If condition met → reply / use the message tool normally. Otherwise → call `stay_silent` and end the turn."* That keeps you quiet when there's nothing to do.
+- If the task is "act only when something is worth saying", end the message with: *"If condition met → use message. Otherwise → send nothing. In either case call stay_silent to end the turn."*
 - Bias toward silence by default: spell out *"Default to no action."* Spam is worse than missed nudges.
 
-`stay_silent` is available in every turn. Call it with no arguments when no reply is genuinely the best response (for example, incidental name matching in group chatter, an unmet periodic condition, or an explicit request not to reply). It ends the turn without sending an outbound message. Do not use it merely to avoid a clear request addressed to you, and call it before producing progress or other side effects.
-
-## Heartbeat (user-controlled)
-The user can enable a periodic auto-wake with `/heartbeat <interval>` (e.g. `30m`, `2h`); disable with `/heartbeat off`. **You cannot enable it yourself** — only the user can. When active, a `## Heartbeat: ON` block appears below and ticks fire on the cadence asking you to read HEARTBEATS.md and act on its checklist."""
+`stay_silent` is always available and means end_turn: call it with no arguments after your work or replies are complete, or immediately when no action is appropriate. It does not retract messages already sent or mean that the whole task succeeded. Inspect other tool results before ending whenever further action might be needed.
+Tool definitions remain available even when their backend is unavailable or this turn cannot use them. In that case the tool returns an explanatory error. System-triggered turns cannot use cron, to prevent recursive scheduling."""
 
     @staticmethod
     def _inject_runtime_context(
@@ -199,7 +201,6 @@ The user can enable a periodic auto-wake with `/heartbeat <interval>` (e.g. `30m
         sender_name: str | None = None,
         system_prompt_extra: str | None = None,
         session_bindings: list[str] | None = None,
-        heartbeat_info: str | None = None,
         work_dir: str | None = None,
     ) -> list[dict[str, Any]]:
         """
@@ -225,14 +226,10 @@ The user can enable a periodic auto-wake with `/heartbeat <interval>` (e.g. `30m
         # System prompt
         system_prompt = self.build_system_prompt(skill_names, work_dir=work_dir)
 
-        # Heartbeat ON block (only present when enabled for this session)
-        if heartbeat_info:
-            system_prompt += f"\n\n{heartbeat_info}"
-
         # Add session bindings info
         if session_bindings:
             bindings_list = "\n".join(f"- {b}" for b in session_bindings)
-            system_prompt += f"\n\n## Connected Channels\n\nThis session is connected to the following channels. You can send messages to any of them using the `message` tool:\n\n{bindings_list}"
+            system_prompt += f"\n\n## Connected Channels\n\nThis session is connected to the following channels. Use `switch_message_target` to select a destination before speaking there:\n\n{bindings_list}"
 
         if system_prompt_extra:
             system_prompt = f"{system_prompt}\n\n# Session Instructions\n\n{system_prompt_extra}"
