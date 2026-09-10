@@ -867,8 +867,9 @@ class AgentLoop:
         - 非用户触发（cron、subagent 汇报等 system turn，或群里没 @ 的旁听
           消息）→ 完全静默，只进日志。没人在等的消息不该让机器人在群里叫。
 
-        ``exc`` 是 LLMCallError 时给出错误类别与重试次数（不含异常类型、堆栈、
-        内部路径）；其他异常沿用固定文案。同一 session 60 秒内只发一条。
+        ``exc`` 是 LLMCallError 时给出类别、重试次数、脱敏后的接口文案及错误码
+        （不含密钥、请求正文、堆栈或内部路径）；其他异常沿用固定文案。
+        同一 session 60 秒内只发一条。
         """
         user_triggered = (
             msg.channel != "system"

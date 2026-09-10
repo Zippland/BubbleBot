@@ -19,8 +19,10 @@ from bubbles.bus.events import InboundMessage
 from bubbles.bus.queue import MessageBus
 from bubbles.cron.service import CronService
 from bubbles.cron.types import CronSchedule
-from bubbles.session.manager import CONTEXT_EXCLUDED_KEY, SessionManager, _sanitize_for_api
 from bubbles.providers.base import LLMResponse, ToolCallRequest
+from bubbles.providers.custom_provider import CustomProvider
+from bubbles.providers.litellm_provider import LiteLLMProvider
+from bubbles.session.manager import CONTEXT_EXCLUDED_KEY, SessionManager, _sanitize_for_api
 
 
 def call(name, **arguments):
@@ -483,6 +485,44 @@ async def test_reasoning_is_not_sent_but_optional_assistant_text_is(tmp_path):
     assert text_receipts(history) == [{"status": "submitted", "channel": "wechat", "chat_id": "room"}]
     assert next(m for m in history if m["role"] == "assistant")["content"] == answer.content
     assert AgentLoop._strip_think("<think>unfinished secret") is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("provider_class,method", [
+    (LiteLLMProvider, "_parse_response"), (CustomProvider, "_parse"),
+])
+@pytest.mark.parametrize("reasoning", [None, "", "raw reasoning"])
+async def test_plain_text_reasoning_survives_next_request_and_reload(tmp_path, provider_class, method, reasoning):
+    # Protocol-looking text is still model content; preserving reasoning must not rewrite it.
+    content = "原始回复</｜｜DSML｜｜parameter></｜｜DSML｜｜invoke></｜｜DSML｜｜tool_calls>"
+    raw_response = SimpleNamespace(
+        choices=[SimpleNamespace(
+            message=SimpleNamespace(content=content, tool_calls=[], reasoning_content=reasoning),
+            finish_reason="stop",
+        )],
+        usage=None,
+    )
+    provider = provider_class.__new__(provider_class)
+    answer = getattr(provider, method)(raw_response)
+    loop = make_loop(tmp_path, answer, response(call("stay_silent")))
+
+    await loop._dispatch(inbound())
+
+    assert len(loop.provider.requests) == 2
+    assert [m.content for m in drain(loop.bus)] == [content]
+    expected = {"role": "assistant", "content": content}
+    if reasoning is not None:
+        expected["reasoning_content"] = reasoning
+    request_messages = loop.provider.requests[1]["messages"]
+    assert next(m for m in request_messages if m["role"] == "assistant") == expected
+    # Check the request sanitizers as well as the live AgentLoop history.
+    sanitized = provider_class._sanitize_empty_content(request_messages)
+    if provider_class is LiteLLMProvider:
+        sanitized = provider_class._sanitize_messages(sanitized)
+    assert next(m for m in sanitized if m["role"] == "assistant") == expected
+    sessions = SessionManager(sessions_dir=tmp_path / "sessions")
+    history = sessions.get_or_create("shared").get_history()
+    assert next(m for m in history if m["role"] == "assistant") == expected
 
 
 def test_compaction_groups_include_text_receipt_but_preserve_current_target():

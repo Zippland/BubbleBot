@@ -14,6 +14,16 @@ from bubbles.providers.litellm_provider import LiteLLMProvider
 from bubbles.providers.registry import find_by_name
 
 
+def _text_response():
+    return SimpleNamespace(
+        choices=[SimpleNamespace(
+            message=SimpleNamespace(content="ok", tool_calls=[], reasoning_content=""),
+            finish_reason="stop",
+        )],
+        usage=None,
+    )
+
+
 def _cache_breakpoint_count(messages: list[dict], tools: list[dict] | None) -> int:
     message_count = sum(
         1
@@ -187,3 +197,110 @@ def test_glm_model_policy_does_not_leak_to_other_models() -> None:
     provider._apply_param_policy("zai/glm-5.3", kwargs)
 
     assert kwargs == {"temperature": 1.0}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("role", ["tool", "user"])
+@pytest.mark.parametrize("with_text", [False, True])
+async def test_deepseek_image_omission_is_reported_without_changing_history(
+    monkeypatch, role, with_text,
+):
+    from litellm.llms.deepseek.chat.transformation import DeepSeekChatConfig
+
+    captured = []
+
+    async def fake_acompletion(**kwargs):
+        request = deepcopy(kwargs)
+        # Exercise the installed SDK conversion, but never call a model API.
+        # If a future SDK preserves images, this test must flag the stale notice.
+        request["messages"] = await DeepSeekChatConfig()._transform_messages(
+            request["messages"], model=request["model"], is_async=True,
+        )
+        captured.append(request)
+        return _text_response()
+
+    monkeypatch.setattr("bubbles.providers.litellm_provider.acompletion", fake_acompletion)
+    provider = LiteLLMProvider(default_model="deepseek-v4-flash")
+    content = [
+        {"type": "image_url", "image_url": {"url": "data:image/png;base64,AAAA"}},
+        {"type": "image_url", "image_url": {"url": "data:image/png;base64,BBBB"}},
+    ]
+    if with_text:
+        content.append({"type": "text", "text": "[Image: example.png]"})
+    messages = [{"role": role, "content": content}]
+    if role == "tool":
+        messages[0].update(tool_call_id="read", name="read_file")
+    tools = [{"type": "function", "function": {"name": "read_file", "parameters": {}}}]
+    original_messages, original_tools = deepcopy(messages), deepcopy(tools)
+
+    for _ in range(2):
+        await provider.chat(messages=messages, tools=tools)
+
+    assert messages == original_messages  # Images remain available after switching models.
+    assert tools == original_tools
+    assert captured[0] == captured[1]  # Repeated requests do not accumulate notices.
+    assert captured[0]["tools"] == original_tools
+    result = captured[0]["messages"][0]
+    assert result["role"] == role
+    if role == "tool":
+        assert result["tool_call_id"] == "read"
+    assert isinstance(result["content"], str)
+    assert result["content"].count("[图片未传递]") == 1
+    assert "DeepSeek 接入路径" in result["content"]
+    assert "模型未收到图片内容" in result["content"]
+    assert "没有视觉能力" not in result["content"]
+    assert "base64" not in result["content"]
+    if with_text:
+        assert result["content"].startswith("[Image: example.png]\n\n")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("model,provider_name", [
+    ("glm-5.3-flash", None),
+    ("openai/gpt-4.1", None),
+    ("deepseek/deepseek-v4-flash", "openrouter"),
+])
+async def test_image_notice_does_not_leak_to_other_provider_routes(monkeypatch, model, provider_name):
+    captured = {}
+
+    async def fake_acompletion(**kwargs):
+        captured.update(deepcopy(kwargs))
+        return _text_response()
+
+    monkeypatch.setattr("bubbles.providers.litellm_provider.acompletion", fake_acompletion)
+    provider = LiteLLMProvider(default_model=model, provider_name=provider_name)
+    messages = [{"role": "user", "content": [
+        {"type": "image_url", "image_url": {"url": "data:image/png;base64,AAAA"}},
+        {"type": "text", "text": "Describe this image"},
+    ]}]
+    original = deepcopy(messages)
+
+    await provider.chat(messages=messages)
+
+    assert captured["messages"] == original
+    assert messages == original
+
+
+@pytest.mark.asyncio
+async def test_image_notice_follows_active_model_and_skips_text_only_requests(monkeypatch):
+    captured = []
+
+    async def fake_acompletion(**kwargs):
+        captured.append(deepcopy(kwargs))
+        return _text_response()
+
+    monkeypatch.setattr("bubbles.providers.litellm_provider.acompletion", fake_acompletion)
+    provider = LiteLLMProvider(default_model="glm-5.3-flash")
+    image_messages = [{"role": "user", "content": [
+        {"type": "image_url", "image_url": {"url": "data:image/png;base64,AAAA"}},
+        {"type": "text", "text": "Describe this image"},
+    ]}]
+    text_messages = [{"role": "tool", "tool_call_id": "read", "content": "[Image: example.png]"}]
+
+    await provider.chat(messages=image_messages, model="deepseek/deepseek-v4-flash")
+    await provider.chat(messages=image_messages)  # Switch back to the default route.
+    await provider.chat(messages=text_messages, model="deepseek/deepseek-v4-flash")
+
+    assert "[图片未传递]" in str(captured[0]["messages"])
+    assert captured[1]["messages"] == image_messages
+    assert captured[2]["messages"] == text_messages

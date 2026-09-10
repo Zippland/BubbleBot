@@ -157,7 +157,7 @@ class SubagentManager:
                         "content": response.content or "",
                         "tool_calls": tool_call_dicts,
                     }
-                    if response.reasoning_content:
+                    if response.reasoning_content is not None:
                         assistant_msg["reasoning_content"] = response.reasoning_content
                     messages.append(assistant_msg)
                     
