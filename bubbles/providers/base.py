@@ -1,9 +1,12 @@
 """Base LLM provider interface."""
 
 from abc import ABC, abstractmethod
+from collections.abc import Iterable
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any
+
+from bubbles.providers.error_details import PublicErrorDetails, extract_error_details
 
 
 class LLMErrorKind(str, Enum):
@@ -19,7 +22,7 @@ class LLMErrorKind(str, Enum):
     PERMANENT = "permanent"              # 400 / 内容策略等，重试无意义
 
 
-# 用户可见文案：给出类别，不给异常类型、堆栈、内部路径（SPEC §5.1）。
+# 用户可见标题；后附脱敏的供应商错误原因，不给堆栈或请求正文（SPEC §5.1）。
 _KIND_MESSAGES = {
     LLMErrorKind.RATE_LIMIT: "模型接口触发限流",
     LLMErrorKind.TRANSIENT: "模型接口暂时不可用",
@@ -39,11 +42,15 @@ class LLMCallError(Exception):
     由调用方决定重试与展示。
     """
 
-    def __init__(self, kind: LLMErrorKind, detail: str, retry_after: float | None = None):
+    def __init__(
+        self, kind: LLMErrorKind, detail: str, retry_after: float | None = None,
+        *, public_details: PublicErrorDetails | None = None,
+    ):
         self.kind = kind
         self.detail = detail          # 仅进日志
         self.retry_after = retry_after  # 服务端 Retry-After（秒），如果给了
         self.attempts = 1             # 实际尝试次数，由重试层回填
+        self.public_details = public_details or extract_error_details(RuntimeError(detail))
         super().__init__(f"{kind.value}: {detail}")
 
     @property
@@ -55,11 +62,13 @@ class LLMCallError(Exception):
         )
 
     def user_message(self, attempts: int) -> str:
-        """面向用户的一句话：说清是接口问题 + 试了几次，不泄露内部细节。"""
+        """说明类别、重试次数及脱敏后的接口原因，供群聊和私聊直接排错。"""
         base = _KIND_MESSAGES.get(self.kind, "模型接口调用失败")
         if attempts > 1:
-            return f"⚠️ {base}，已重试 {attempts - 1} 次仍失败，请稍后再试。"
-        return f"⚠️ {base}。"
+            summary = f"⚠️ {base}，已重试 {attempts - 1} 次仍失败，请稍后再试。"
+        else:
+            summary = f"⚠️ {base}。"
+        return f"{summary}\n{self.public_details.render()}"
 
 
 def classify_exception(exc: BaseException) -> LLMErrorKind:
@@ -85,7 +94,9 @@ def classify_exception(exc: BaseException) -> LLMErrorKind:
     except ImportError:
         pass
 
-    status = getattr(exc, "status_code", None) or getattr(exc, "code", None)
+    status = (getattr(exc, "status_code", None)
+              or getattr(getattr(exc, "response", None), "status_code", None)
+              or getattr(exc, "code", None))
     if isinstance(status, int):
         if status == 429:
             return LLMErrorKind.RATE_LIMIT
@@ -123,11 +134,17 @@ def _retry_after_of(exc: BaseException) -> float | None:
         return None
 
 
-def to_llm_call_error(exc: BaseException) -> LLMCallError:
+def to_llm_call_error(
+    exc: BaseException, *, sensitive_values: Iterable[str | None] = (),
+    messages: list[dict[str, Any]] | None = None,
+) -> LLMCallError:
     """Wrap any provider-SDK exception into a classified LLMCallError."""
     if isinstance(exc, LLMCallError):
         return exc
-    return LLMCallError(classify_exception(exc), str(exc), _retry_after_of(exc))
+    return LLMCallError(
+        classify_exception(exc), str(exc), _retry_after_of(exc),
+        public_details=extract_error_details(exc, sensitive_values=sensitive_values, messages=messages),
+    )
 
 
 def normalize_usage(usage: Any) -> dict[str, int]:
@@ -163,7 +180,8 @@ class LLMResponse:
     tool_calls: list[ToolCallRequest] = field(default_factory=list)
     finish_reason: str = "stop"
     usage: dict[str, int] = field(default_factory=dict)
-    reasoning_content: str | None = None  # Kimi, DeepSeek-R1 etc.
+    # None means absent; a reported empty string must survive API round trips.
+    reasoning_content: str | None = None
     
     @property
     def has_tool_calls(self) -> bool:

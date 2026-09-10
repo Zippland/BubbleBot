@@ -32,7 +32,7 @@ class CustomProvider(LLMProvider):
         try:
             return self._parse(await self._client.chat.completions.create(**kwargs))
         except Exception as e:
-            raise to_llm_call_error(e) from e
+            raise to_llm_call_error(e, sensitive_values=(self.api_key,), messages=messages) from e
 
     def _parse(self, response: Any) -> LLMResponse:
         choice = response.choices[0]
@@ -46,7 +46,7 @@ class CustomProvider(LLMProvider):
         return LLMResponse(
             content=msg.content, tool_calls=tool_calls, finish_reason=choice.finish_reason or "stop",
             usage=normalize_usage(u),
-            reasoning_content=getattr(msg, "reasoning_content", None) or None,
+            reasoning_content=getattr(msg, "reasoning_content", None),
         )
 
     def get_default_model(self) -> str:

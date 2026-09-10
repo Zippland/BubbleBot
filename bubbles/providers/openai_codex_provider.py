@@ -70,7 +70,7 @@ class OpenAICodexProvider(LLMProvider):
                 finish_reason=finish_reason,
             )
         except Exception as e:
-            raise to_llm_call_error(e) from e
+            raise to_llm_call_error(e, sensitive_values=(token.access,), messages=messages) from e
 
     def get_default_model(self) -> str:
         return self.default_model
@@ -104,7 +104,10 @@ async def _request_codex(
         async with client.stream("POST", url, headers=headers, json=body) as response:
             if response.status_code != 200:
                 text = await response.aread()
-                raise RuntimeError(_friendly_error(response.status_code, text.decode("utf-8", "ignore")))
+                raise httpx.HTTPStatusError(
+                    f"HTTP {response.status_code}: {text.decode('utf-8', 'ignore')}",
+                    request=response.request, response=response,
+                )
             return await _consume_sse(response)
 
 
@@ -304,7 +307,11 @@ async def _consume_sse(response: httpx.Response) -> tuple[str, list[ToolCallRequ
             status = (event.get("response") or {}).get("status")
             finish_reason = _map_finish_reason(status)
         elif event_type in {"error", "response.failed"}:
-            raise RuntimeError("Codex response failed")
+            # Preserve the error object, not the response's generated content/input.
+            error = event.get("error") or (event.get("response") or {}).get("error")
+            if error is None and event_type == "error":
+                error = event  # Keep native diagnostics, including unfamiliar error fields.
+            raise RuntimeError(f"Codex response failed: {json.dumps({'error': error}, ensure_ascii=False)}")
 
     return content, tool_calls, finish_reason
 
@@ -314,9 +321,3 @@ _FINISH_REASON_MAP = {"completed": "stop", "incomplete": "length", "failed": "er
 
 def _map_finish_reason(status: str | None) -> str:
     return _FINISH_REASON_MAP.get(status or "completed", "stop")
-
-
-def _friendly_error(status_code: int, raw: str) -> str:
-    if status_code == 429:
-        return "ChatGPT usage quota exceeded or rate limit triggered. Please try again later."
-    return f"HTTP {status_code}: {raw}"

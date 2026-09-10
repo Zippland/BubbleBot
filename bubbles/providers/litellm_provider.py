@@ -217,6 +217,36 @@ class LiteLLMProvider(LLMProvider):
             sanitized.append(clean)
         return sanitized
 
+    @staticmethod
+    def _annotate_image_omissions(
+        messages: list[dict[str, Any]], model: str,
+    ) -> list[dict[str, Any]]:
+        """Make the DeepSeek SDK route's text-only conversion visible to the model.
+
+        This describes the adapter, not a model capability blacklist. Match the
+        resolved route so gateways are unaffected, and leave stored images intact.
+        The SDK conversion test must be revisited when this route supports images.
+        """
+        if not model.startswith("deepseek/"):
+            return messages
+        annotated = []
+        for message in messages:
+            content = message.get("content")
+            if isinstance(content, list) and any(
+                isinstance(block, dict) and block.get("type") == "image_url"
+                for block in content
+            ):
+                notice = {
+                    "type": "text",
+                    "text": (
+                        "\n\n[图片未传递] 当前使用 DeepSeek 接入路径；该路径只传递文本，"
+                        "模型未收到图片内容，无法根据本次输入识图。"
+                    ),
+                }
+                message = {**message, "content": [*content, notice]}
+            annotated.append(message)
+        return annotated
+
     async def chat(
         self,
         messages: list[dict[str, Any]],
@@ -243,6 +273,8 @@ class LiteLLMProvider(LLMProvider):
 
         if self._supports_cache_control(original_model):
             messages, tools = self._apply_cache_control(messages, tools)
+
+        messages = self._annotate_image_omissions(messages, model)
 
         # Clamp max_tokens to at least 1 — negative or zero values cause
         # LiteLLM to reject the request with "max_tokens must be at least 1".
@@ -286,7 +318,10 @@ class LiteLLMProvider(LLMProvider):
         except Exception as e:
             # 分类后抛出，由 AgentLoop 决定重试与用户可见文案。
             # 绝不把错误伪装成模型回复——那会让它进历史、被 compaction 当摘要。
-            raise to_llm_call_error(e) from e
+            raise to_llm_call_error(
+                e, sensitive_values=(self.api_key, *(self.extra_headers or {}).values()),
+                messages=messages,
+            ) from e
 
     def _parse_response(self, response: Any) -> LLMResponse:
         """Parse LiteLLM response into our standard format."""
@@ -309,7 +344,7 @@ class LiteLLMProvider(LLMProvider):
 
         usage = normalize_usage(getattr(response, "usage", None))
 
-        reasoning_content = getattr(message, "reasoning_content", None) or None
+        reasoning_content = getattr(message, "reasoning_content", None)
 
         return LLMResponse(
             content=message.content,

@@ -34,3 +34,4 @@ tests/*
 !tests/test_matrix_channel_lifecycle.py
 !tests/test_agent_protocol.py
 !tests/test_prompt_cache.py
+!tests/test_error_feedback.py
