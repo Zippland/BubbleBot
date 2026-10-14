@@ -4,7 +4,10 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 from prompt_toolkit.formatted_text import HTML
 
-from bubbles.cli import commands
+# Load the public CLI entrypoint first, as in the executable; it initializes
+# the command/helper modules that have mutual imports in this legacy version.
+from bubbles.cli import commands as _cli_entrypoint  # noqa: F401
+from bubbles.cli import _interactive as commands
 
 
 @pytest.fixture
@@ -12,8 +15,8 @@ def mock_prompt_session():
     """Mock the global prompt session."""
     mock_session = MagicMock()
     mock_session.prompt_async = AsyncMock()
-    with patch("bubbles.cli.commands._PROMPT_SESSION", mock_session), \
-         patch("bubbles.cli.commands.patch_stdout"):
+    with patch("bubbles.cli._interactive._PROMPT_SESSION", mock_session), \
+         patch("bubbles.cli._interactive.patch_stdout"):
         yield mock_session
 
 
@@ -44,8 +47,8 @@ def test_init_prompt_session_creates_session():
     # Ensure global is None before test
     commands._PROMPT_SESSION = None
     
-    with patch("bubbles.cli.commands.PromptSession") as MockSession, \
-         patch("bubbles.cli.commands.FileHistory") as MockHistory, \
+    with patch("bubbles.cli._interactive.PromptSession") as MockSession, \
+         patch("bubbles.cli._interactive.FileHistory") as MockHistory, \
          patch("pathlib.Path.home") as mock_home:
         
         mock_home.return_value = MagicMock()

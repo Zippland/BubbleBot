@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from unittest.mock import MagicMock
 
+from bubbles.agent.commands import handle_config_command
 from bubbles.agent.loop import AgentLoop
 from bubbles.session.manager import SessionManager
 
@@ -92,7 +93,7 @@ def test_config_model_rejects_unconfigured_provider(tmp_path) -> None:
     session = loop.sessions.get_or_create("cli:direct")
     msg = InboundMessage(channel="cli", sender_id="user", chat_id="direct", content="/config model moonshot/x")
 
-    out = asyncio.run(loop._handle_config_command(msg, session, "model moonshot/x"))
+    out = asyncio.run(handle_config_command(loop, msg, session, "model moonshot/x"))
     assert "无法切换到" in out.content
     assert "moonshot" in out.content
     # Crucially, the bad model is NOT saved
@@ -111,7 +112,7 @@ def test_config_model_accepts_configured_provider(tmp_path) -> None:
     session = loop.sessions.get_or_create("cli:direct")
     msg = InboundMessage(channel="cli", sender_id="user", chat_id="direct", content="/config model moonshot/kimi-k2.6")
 
-    out = asyncio.run(loop._handle_config_command(msg, session, "model moonshot/kimi-k2.6"))
+    out = asyncio.run(handle_config_command(loop, msg, session, "model moonshot/kimi-k2.6"))
     assert "model = " in out.content
     assert session.config.model == "moonshot/kimi-k2.6"
 
@@ -132,7 +133,7 @@ def _make_config(*, providers: dict, forced: str = "auto") -> object:
 
 def test_strict_match_known_prefix_configured() -> None:
     """Known prefix + configured → returns provider name, no error."""
-    from bubbles.cli.commands import _strict_match_provider
+    from bubbles.cli._providers import _strict_match_provider
     config = _make_config(providers={"moonshot": "sk-test"})
     name, err = _strict_match_provider(config, "moonshot/kimi-k2.6")
     assert err is None
@@ -141,7 +142,7 @@ def test_strict_match_known_prefix_configured() -> None:
 
 def test_strict_match_known_prefix_unconfigured() -> None:
     """Known prefix but no api_key → error explaining how to configure."""
-    from bubbles.cli.commands import _strict_match_provider
+    from bubbles.cli._providers import _strict_match_provider
     # Configure ONLY openai_codex (OAuth); user types moonshot/...
     config = _make_config(providers={"openai_codex": ""})  # OAuth, no key needed
     name, err = _strict_match_provider(config, "moonshot/kimi-k2.6")
@@ -154,7 +155,7 @@ def test_strict_match_known_prefix_unconfigured() -> None:
 
 def test_strict_match_unknown_prefix_no_separate_configured_line() -> None:
     """No standalone '已配置:' enumeration in the error any more."""
-    from bubbles.cli.commands import _strict_match_provider
+    from bubbles.cli._providers import _strict_match_provider
     config = _make_config(providers={"moonshot": "sk-test"})
     _, err = _strict_match_provider(config, "qoqo/whatever")
     assert err is not None
@@ -165,7 +166,7 @@ def test_strict_match_unknown_prefix_no_separate_configured_line() -> None:
 
 def test_strict_match_suggestions_filter_to_configured() -> None:
     """Fuzzy suggestions only show providers the user has actually configured."""
-    from bubbles.cli.commands import _strict_match_provider
+    from bubbles.cli._providers import _strict_match_provider
 
     # User HAS moonshot configured. Typo 'moonshoot' → suggest 'moonshot'.
     config = _make_config(providers={"moonshot": "sk-test"})
@@ -181,7 +182,7 @@ def test_strict_match_suggestions_filter_to_configured() -> None:
 
 def test_strict_match_no_suggestion_when_none_close() -> None:
     """Far-from-anything prefix → bare error, no '可能想用'."""
-    from bubbles.cli.commands import _strict_match_provider
+    from bubbles.cli._providers import _strict_match_provider
     config = _make_config(providers={"moonshot": "sk-test"})
     _, err = _strict_match_provider(config, "xxxyyy/whatever")
     assert err is not None
@@ -192,7 +193,7 @@ def test_strict_match_no_suggestion_when_none_close() -> None:
 def test_strict_match_no_fallback() -> None:
     """The bug we're fixing: when user has only Codex but writes moonshot/...,
     must NOT silently route to Codex."""
-    from bubbles.cli.commands import _strict_match_provider
+    from bubbles.cli._providers import _strict_match_provider
     config = _make_config(providers={"openai_codex": ""})  # only Codex (OAuth)
     name, err = _strict_match_provider(config, "moonshot/kimi-k2.6")
     assert name != "openai_codex", "Bug regression: silently fell back to Codex"
@@ -201,7 +202,7 @@ def test_strict_match_no_fallback() -> None:
 
 def test_strict_match_keyword_only() -> None:
     """Bare model name (no `/`) → keyword match."""
-    from bubbles.cli.commands import _strict_match_provider
+    from bubbles.cli._providers import _strict_match_provider
     config = _make_config(providers={"openai_codex": ""})
     name, err = _strict_match_provider(config, "gpt-5.5")  # no prefix, "gpt" keyword
     # openai_codex doesn't have "gpt" keyword (it's on openai spec), so this
